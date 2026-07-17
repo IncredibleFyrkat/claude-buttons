@@ -20,6 +20,8 @@ appears only when it's in the foreground.
 - **Global or per-chat** buttons. Per-chat buttons appear only when that chat is on screen (detected from the app's own accessibility tree) and never auto-send — they insert the text so you review it first.
 - **Self-aligning**: reads the app's own bottom-row buttons via UI Automation and sits on exactly the same line, next to them. Follows resize, fullscreen, and DPI.
 - **Two-click confirm** for destructive buttons (`"confirm": true`).
+- **Icon buttons**: give a button an icon instead of text (`"icon": "mic"`) — a small round button the same size as the app's own mic button. Uses Windows' built-in Fluent icon font (Lucide-style line icons, no downloads).
+- **Toggle (on/off) buttons** (`"toggle": true`): the button stays lit while active, like the app's mic — optionally sending different text on activate/deactivate (`textOn`/`textOff`).
 - **English / Danish** UI, switchable in the menu.
 - **Resilient**: everything the app exposes (accessibility names, zones) is configurable in `buttons.json`, so an app update degrades gracefully instead of breaking.
 
@@ -63,8 +65,30 @@ never installed silently.
 - Switch to the Claude app — the strip appears in the bottom bar.
 - **Right-click the dot-grip** → *Pin new button* → pick a command (choose scope with the checkboxes at the top).
 - **Left-click** a button to type its command; global buttons also press Enter, per-chat buttons let you review first.
-- **Right-click a button** → rename, move, or remove.
+- **Right-click a button** → rename, set an icon, switch on/off (toggle) mode, move, or remove.
 - **Position** and **Language** live in the same grip menu.
+
+### Icons
+
+Right-click a button → *Set icon...* and type a name. Available names:
+
+`mic, power, play, pause, stop, refresh, check, x, trash, settings, search, save, code, bug, star, pin, send, bell, clock, sun, moon, zap, home, folder, camera, edit, plus, download, upload, user, mail, globe, lock, heart, flag, calendar, phone`
+
+You can also give any 4-digit hex codepoint from the Segoe Fluent Icons font. Icon buttons show
+their label and command in the tooltip.
+
+### Toggle buttons
+
+Right-click a button → *On/off (toggle) mode*. The button now lights up while active. In
+`buttons.json` you can give it different texts for each direction:
+
+```json
+{ "label": "Focus", "icon": "zap", "text": "enter focus mode", "textOff": "exit focus mode",
+  "toggle": true, "submit": true }
+```
+
+`textOn` (defaults to `text`) is typed when switching on, `textOff` when switching off (omit it
+to make switching off silent).
 
 ## What you're running (honesty section)
 

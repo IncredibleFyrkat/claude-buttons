@@ -53,7 +53,10 @@ public class PillButton : Control {
     public Color Fill = Color.FromArgb(48, 47, 44);
     public Color HoverFill = Color.FromArgb(60, 58, 54);
     public Color DownFill = Color.FromArgb(70, 67, 62);
+    public Color ToggleFill = Color.FromArgb(128, 90, 44); // active state for toggle buttons
     public Color Accent = Color.Empty; // border on per-chat buttons
+    bool toggled;
+    public bool Toggled { get { return toggled; } set { toggled = value; Invalidate(); } }
     bool hover, down;
     public PillButton() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
@@ -80,7 +83,9 @@ public class PillButton : Control {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var rc = new Rectangle(0, 0, Width - 1, Height - 1);
         using (var path = Pill(rc, (Height - 1) / 2)) {
-            Color f = down ? DownFill : (hover ? HoverFill : Fill);
+            Color f;
+            if (toggled) { f = down ? DownFill : ToggleFill; }
+            else { f = down ? DownFill : (hover ? HoverFill : Fill); }
             using (var b = new SolidBrush(f)) g.FillPath(b, path);
             if (Accent != Color.Empty) using (var pen = new Pen(Accent)) g.DrawPath(pen, path);
         }
@@ -312,6 +317,10 @@ $script:strings = @{
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
         firstRun = 'Right-click the dots to add buttons'
+        setIcon = 'Set icon...'; iconTitle = 'Set icon'
+        iconAsk = "Icon name (empty = show text label instead).`nAvailable: {0}"
+        toggleMode = 'On/off (toggle) mode'
+        tipToggle = 'toggle on/off'
     }
     da = @{
         rename = 'Omdøb…'; moveLeft = 'Flyt til venstre'; moveRight = 'Flyt til højre'; remove = 'Fjern denne knap'
@@ -328,6 +337,10 @@ $script:strings = @{
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
         firstRun = 'Højreklik på prikkerne for at tilføje knapper'
+        setIcon = 'Vælg ikon…'; iconTitle = 'Vælg ikon'
+        iconAsk = "Ikon-navn (tom = vis tekst i stedet).`nMulige: {0}"
+        toggleMode = 'On/off-tilstand (toggle)'
+        tipToggle = 'tænd/sluk'
     }
 }
 function L([string]$k) { $script:strings[$script:lang][$k] }
@@ -370,6 +383,30 @@ $script:btnFont = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $script:compact = $false
 $script:padX = S(10)
 
+# ---------- Icons (built-in Windows icon font - Lucide-style line icons, no downloads) ----------
+$fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
+$script:iconFontName = if ($fams -contains 'Segoe Fluent Icons') { 'Segoe Fluent Icons' }
+                       elseif ($fams -contains 'Segoe MDL2 Assets') { 'Segoe MDL2 Assets' } else { $null }
+$script:iconFont = if ($script:iconFontName) { New-Object System.Drawing.Font($script:iconFontName, 10) } else { $null }
+# Lucide-style names -> glyph codepoints (shared between Fluent Icons and MDL2 Assets)
+$script:iconMap = @{
+    'mic'='E720'; 'power'='E7E8'; 'play'='E768'; 'pause'='E769'; 'stop'='E71A'
+    'refresh'='E72C'; 'check'='E73E'; 'x'='E711'; 'trash'='E74D'; 'settings'='E713'
+    'search'='E721'; 'save'='E74E'; 'code'='E943'; 'bug'='EBE8'; 'star'='E734'
+    'pin'='E718'; 'send'='E724'; 'bell'='EA8F'; 'clock'='E823'; 'sun'='E706'
+    'moon'='E708'; 'zap'='E945'; 'home'='E80F'; 'folder'='E8B7'; 'camera'='E722'
+    'edit'='E70F'; 'plus'='E710'; 'download'='E896'; 'upload'='E898'; 'user'='E77B'
+    'mail'='E715'; 'globe'='E774'; 'lock'='E72E'; 'heart'='EB51'; 'flag'='E7C1'
+    'calendar'='E787'; 'phone'='E717'
+}
+function Get-IconGlyph([string]$name) {
+    if (-not $script:iconFont -or [string]::IsNullOrWhiteSpace($name)) { return $null }
+    $n = $name.Trim().ToLower()
+    if ($script:iconMap.ContainsKey($n)) { return [string][char][Convert]::ToInt32($script:iconMap[$n], 16) }
+    if ($n -match '^[0-9a-f]{4}$') { return [string][char][Convert]::ToInt32($n, 16) }  # raw codepoint for power users
+    return $null
+}
+
 function Escape-SendKeys([string]$s) {
     $s = $s -replace "`r`n", "`n" -replace "`r", "`n"
     $out = New-Object System.Text.StringBuilder
@@ -402,10 +439,29 @@ function Get-StripWidth([bool]$useShort) {
     $total = (S 14) + 4 * (S 2) + (S 8)  # grip + panel padding + safety margin
     foreach ($b in $script:config.buttons) {
         if (-not (Test-ChatButtonVisible $b)) { continue }
+        if ($b.icon -and (Get-IconGlyph ([string]$b.icon))) {
+            $total += $pillH + 2 * (S 2)   # icon buttons are circular: width = height
+            continue
+        }
         $label = if ($useShort) { Get-ShortLabel $b } else { [string]$b.label }
         $total += (Get-PillWidth $label) + 2 * (S 2)
     }
     return $total
+}
+
+# Set a pill's normal face (icon glyph or text label) - used at build, disarm and toggle
+function Set-PillFace($btn) {
+    $b = $btn.Tag
+    $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
+    if ($glyph) {
+        $btn.Font = $script:iconFont
+        $btn.Text = $glyph
+        $btn.Width = $pillH
+    } else {
+        $btn.Font = $script:btnFont
+        $btn.Text = Get-DisplayLabel $b
+        $btn.Width = Get-PillWidth $btn.Text
+    }
 }
 
 function Read-ActiveSession {
@@ -736,16 +792,63 @@ $btnMenu.add_Opening({
     [void][CkWin]::GetAsyncKeyState(0x01); [void][CkWin]::GetAsyncKeyState(0x02)
     if ($this.SourceControl) { $script:menuSource = $this.SourceControl }
     $miRename.Text = L 'rename'
+    $miIcon.Text = L 'setIcon'
+    $miToggle.Text = L 'toggleMode'
     $miLeft.Text = L 'moveLeft'
     $miRight.Text = L 'moveRight'
     $miRemove.Text = L 'remove'
+    $miIcon.Enabled = ($null -ne $script:iconFont)
+    if ($script:menuSource -and $script:menuSource.Tag) { $miToggle.Checked = [bool]$script:menuSource.Tag.toggle } else { $miToggle.Checked = $false }
 })
 
 $miRename = $btnMenu.Items.Add('Rename...')
+$miIcon   = $btnMenu.Items.Add('Set icon...')
+$miToggle = $btnMenu.Items.Add('On/off (toggle) mode')
 $miLeft   = $btnMenu.Items.Add('Move left')
 $miRight  = $btnMenu.Items.Add('Move right')
 [void]$btnMenu.Items.Add('-')
 $miRemove = $btnMenu.Items.Add('Remove this button')
+
+$miIcon.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $names = (@($script:iconMap.Keys) | Sort-Object) -join ', '
+        $val = [Microsoft.VisualBasic.Interaction]::InputBox(((L 'iconAsk') -f $names), (L 'iconTitle'), [string]$t.icon)
+        $val = $val.Trim()
+        if ($val -and -not (Get-IconGlyph $val)) { return }   # unknown icon name: no change
+        $ok = Update-Buttons { param($btns)
+            foreach ($b in $btns) {
+                if (Same-Button $b $t) {
+                    if ($val) { $b | Add-Member -NotePropertyName icon -NotePropertyValue $val -Force }
+                    else { $b.PSObject.Properties.Remove('icon') }
+                }
+            }
+            $btns
+        }
+        if ($ok) { Rebuild-Buttons }
+    } catch { Write-CkLog "Set icon error: $($_.Exception.Message)" }
+})
+
+$miToggle.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        $ok = Update-Buttons { param($btns)
+            foreach ($b in $btns) {
+                if (Same-Button $b $t) {
+                    if ($b.toggle) { $b.PSObject.Properties.Remove('toggle') }
+                    else { $b | Add-Member -NotePropertyName toggle -NotePropertyValue $true -Force }
+                }
+            }
+            $btns
+        }
+        if ($ok) { $script:toggleState.Remove((Get-ButtonKey $t)); Rebuild-Buttons }
+    } catch { Write-CkLog "Toggle mode error: $($_.Exception.Message)" }
+})
 
 $miRemove.add_Click({
     try {
@@ -824,6 +927,9 @@ function Test-TargetForeground {
     [CkWin]::GetForegroundWindow() -eq $script:target
 }
 
+$script:toggleState = @{}   # in-memory on/off state for toggle buttons (per panel run)
+function Get-ButtonKey($b) { "$($b.label)|$($b.text)|$($b.chat)" }
+
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
     try {
@@ -831,22 +937,33 @@ function Invoke-PillClick($btn) {
         # Two-click confirmation for destructive buttons (within 3 s)
         if ($item.confirm) {
             if ($script:armedBtn -ne $btn -or ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
-                if ($script:armedBtn) { $script:armedBtn.Text = (Get-DisplayLabel $script:armedBtn.Tag) }
+                if ($script:armedBtn) { Set-PillFace $script:armedBtn }
                 $script:armedBtn = $btn
                 $script:armedAt = Get-Date
+                $btn.Font = $script:btnFont
                 $btn.Text = L 'confirm'
                 $btn.Width = Get-PillWidth $btn.Text
                 return
             }
             $script:armedBtn = $null
-            $btn.Text = Get-DisplayLabel $item
-            $btn.Width = Get-PillWidth $btn.Text
+            Set-PillFace $btn
+        }
+        # Toggle buttons: flip state, then send textOn/textOff (off with no textOff = state only)
+        $textToSend = [string]$item.text
+        if ($item.toggle) {
+            $key = Get-ButtonKey $item
+            $on = -not ($script:toggleState[$key] -eq $true)
+            $script:toggleState[$key] = $on
+            $btn.Toggled = $on
+            $textToSend = if ($on) { if ($item.textOn) { [string]$item.textOn } else { [string]$item.text } }
+                          else { [string]$item.textOff }
+            if ([string]::IsNullOrEmpty($textToSend)) { return }
         }
         $script:sending = $true
         try {
             Start-Sleep -Milliseconds 150
             if (-not (Test-TargetForeground)) { return }   # focus moved - send nothing
-            [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys ([string]$item.text)))
+            [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             # Per-chat buttons never auto-send: the user must see the text before Enter
             if ($item.submit -and -not $item.chat) {
                 Start-Sleep -Milliseconds 400
@@ -872,11 +989,10 @@ function Rebuild-Buttons {
     foreach ($b in $script:config.buttons) {
         if (-not (Test-ChatButtonVisible $b)) { continue }
         $btn = New-Object PillButton
-        $btn.Text = Get-DisplayLabel $b
         $btn.Tag = $b
-        $btn.Font = $script:btnFont
-        $btn.Width = Get-PillWidth $btn.Text
         $btn.Height = $pillH
+        Set-PillFace $btn
+        if ($b.toggle) { $btn.Toggled = ($script:toggleState[(Get-ButtonKey $b)] -eq $true) }
         $btn.Margin = New-Object System.Windows.Forms.Padding((S(2)))
         $btn.BackColor = $colBar
         $btn.ForeColor = $colText
@@ -891,8 +1007,9 @@ function Rebuild-Buttons {
             $sl = if ($b.chatTitle) { $b.chatTitle } elseif ($b.chatLabel) { $b.chatLabel } else { $null }
             if ($sl) { (L 'tipChatIn') -f $sl } else { L 'tipChatOnly' }
         } else { L 'tipGlobal' }
-        $enter = if ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
-        $tip.SetToolTip($btn, "$($b.text)`n$scope - $enter`n$(L 'tipRemove')")
+        $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
+        $tipHead = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
+        $tip.SetToolTip($btn, "$tipHead`n$scope - $enter`n$(L 'tipRemove')")
         $panel.Controls.Add($btn)
     }
     $panel.ResumeLayout()
@@ -937,7 +1054,7 @@ $timer.add_Tick({
 
         # Reset the "Confirm?" state after 3 s
         if ($script:armedBtn -and ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
-            try { $script:armedBtn.Text = Get-DisplayLabel $script:armedBtn.Tag; $script:armedBtn.Width = Get-PillWidth $script:armedBtn.Text } catch {}
+            try { Set-PillFace $script:armedBtn } catch {}
             $script:armedBtn = $null
         }
 
