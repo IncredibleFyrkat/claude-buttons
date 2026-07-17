@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.3.4'
+$CB_VERSION = '1.4.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -363,7 +363,6 @@ $script:strings = @{
     }
 }
 function L([string]$k) { $script:strings[$script:lang][$k] }
-$script:pinScope = 'chat'  # default scope for the pin menu
 
 # Save ONLY the panel's own fields - merge against a fresh file so /pin edits are never overwritten
 function Save-PanelState {
@@ -947,8 +946,36 @@ $grip.ContextMenuStrip = $gripMenu
 # Open the grip menu on left-click too (the grip looks clickable)
 $grip.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($grip, $_.Location) } })
 
-# Keep the menu open when clicking the scope toggles
-$script:keepMenuOpen = $false
+# Fill a scope submenu ("this chat" / "global") with the whole catalog + a custom option.
+# Picking a command pins it with that scope in ONE click - no separate scope toggle.
+function Fill-PinScope($sub, [bool]$isGlobal) {
+    $sub.DropDownItems.Clear()
+    foreach ($entry in (Get-PinCatalog)) {
+        $ci = New-Object System.Windows.Forms.ToolStripMenuItem ("$($entry.label)   ($($entry.text))")
+        $ci.Tag = @{ entry = $entry; global = $isGlobal }
+        $ci.add_Click({ $t = $this.Tag; Add-PinnedButton $t.entry $t.global })
+        [void]$sub.DropDownItems.Add($ci)
+    }
+    [void]$sub.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $cust = New-Object System.Windows.Forms.ToolStripMenuItem (L 'custom')
+    $cust.Tag = $isGlobal
+    $cust.add_Click({
+        $g = [bool]$this.Tag
+        $txt = Show-TextDialog (L 'pinTitle') (L 'askText') ''
+        if ([string]::IsNullOrWhiteSpace($txt)) { return }
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $suggest = ($txt -split "`n")[0].Trim(); if ($suggest.Length -gt 30) { $suggest = $suggest.Substring(0, 30) }
+        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $suggest)
+        if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $suggest }
+        Add-PinnedButton @{ text = $txt.Trim(); label = $lbl.Trim(); short = $null } $g
+    })
+    [void]$sub.DropDownItems.Add($cust)
+}
+
+$piThis = New-Object System.Windows.Forms.ToolStripMenuItem (L 'onlyChat')
+$piGlob = New-Object System.Windows.Forms.ToolStripMenuItem (L 'globalScope')
+[void]$miPin.DropDownItems.Add($piThis)
+[void]$miPin.DropDownItems.Add($piGlob)
 
 # Rebuilt fresh every time the menu opens (reflects new skills, pinned buttons and language)
 $gripMenu.add_Opening({
@@ -963,38 +990,9 @@ $gripMenu.add_Opening({
     $posAuto.Checked = ($null -eq $script:freeX); $posFree.Checked = ($null -ne $script:freeX)
     $subEn.Checked = ($script:lang -eq 'en')
     $subDa.Checked = ($script:lang -eq 'da')
-    $miPin.DropDownItems.Clear()
-    $scChat = New-Object System.Windows.Forms.ToolStripMenuItem (L 'pinScopeChat')
-    $scChat.Checked = ($script:pinScope -ne 'global')
-    $scChat.add_Click({ $script:pinScope = 'chat'; $script:keepMenuOpen = $true })
-    $scGlob = New-Object System.Windows.Forms.ToolStripMenuItem (L 'pinScopeGlobal')
-    $scGlob.Checked = ($script:pinScope -eq 'global')
-    $scGlob.add_Click({ $script:pinScope = 'global'; $script:keepMenuOpen = $true })
-    [void]$miPin.DropDownItems.Add($scChat)
-    [void]$miPin.DropDownItems.Add($scGlob)
-    [void]$miPin.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-    foreach ($entry in (Get-PinCatalog)) {
-        $mi = New-Object System.Windows.Forms.ToolStripMenuItem ("$($entry.label)   ($($entry.text))")
-        $mi.Tag = $entry
-        $mi.add_Click({ Add-PinnedButton $this.Tag ($script:pinScope -eq 'global') })
-        [void]$miPin.DropDownItems.Add($mi)
-    }
-    [void]$miPin.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-    $miCustom = New-Object System.Windows.Forms.ToolStripMenuItem (L 'custom')
-    $miCustom.add_Click({
-        $txt = Show-TextDialog (L 'pinTitle') (L 'askText') ''
-        if ([string]::IsNullOrWhiteSpace($txt)) { return }
-        Add-Type -AssemblyName Microsoft.VisualBasic
-        $suggest = ($txt -split "`n")[0].Trim(); if ($suggest.Length -gt 30) { $suggest = $suggest.Substring(0, 30) }
-        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $suggest)
-        if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $suggest }
-        Add-PinnedButton @{ text = $txt.Trim(); label = $lbl.Trim(); short = $null } ($script:pinScope -eq 'global')
-    })
-    [void]$miPin.DropDownItems.Add($miCustom)
-})
-# Reopen the menu after a scope-toggle click so the choice doesn't dismiss it
-$gripMenu.add_Closed({
-    if ($script:keepMenuOpen) { $script:keepMenuOpen = $false; $gripMenu.Show([System.Windows.Forms.Cursor]::Position) }
+    $piThis.Text = L 'onlyChat'; $piGlob.Text = L 'globalScope'
+    Fill-PinScope $piThis $false
+    Fill-PinScope $piGlob $true
 })
 
 # No drag-and-drop: position is set via the menu, so nothing moves by accident
@@ -1432,10 +1430,14 @@ $timer.add_Tick({
         $ws = [CkWin]::WindowScale($script:target)
         if ($ws -gt 0) { $script:winScale = $ws }
 
-        # Visible only when EXACTLY the Claude window is foreground (not just the same process)
+        # Visible only when EXACTLY the Claude window is foreground (not just the same process).
+        # BUT keep the panel up while the user is interacting with our own menus/dialogs -
+        # opening a popup can momentarily take foreground away from Claude, and hiding then
+        # would make the panel vanish mid-interaction.
+        $ourUiOpen = $gripMenu.Visible -or $btnMenu.Visible -or ($null -ne $script:iconDlg) -or $script:moveMode
         $show = (-not [CkWin]::IsIconic($script:target)) -and
                 [CkWin]::IsWindowVisible($script:target) -and
-                ([CkWin]::GetForegroundWindow() -eq $script:target)
+                (([CkWin]::GetForegroundWindow() -eq $script:target) -or $ourUiOpen)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }

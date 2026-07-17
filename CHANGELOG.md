@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0 — 2026-07-17
+
+- **Reworked the pin menu.** *Pin new button* now has two submenus — **Only this chat** and
+  **Global (all chats)** — each holding the full command list. Pick scope and command in one
+  motion; no more scope toggle that closed the menu and forced you to reopen it.
+- **Fix: the panel vanished while pinning.** The old "keep menu open" trick reopened the menu
+  as an unowned popup, which stole foreground from Claude and made the panel hide until you
+  clicked back into the chat. That trick is gone, and the panel now stays visible whenever its
+  own menu or a dialog is open. Pins now show up immediately.
+
 ## 1.3.4 — 2026-07-17
 
 - **Fix: the icon picker did nothing (and could freeze the menu).** The grid's click handler
