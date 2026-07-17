@@ -401,7 +401,8 @@ $script:iconMap = @{
     'moon'='E708'; 'zap'='E945'; 'home'='E80F'; 'folder'='E8B7'; 'camera'='E722'
     'edit'='E70F'; 'plus'='E710'; 'download'='E896'; 'upload'='E898'; 'user'='E77B'
     'mail'='E715'; 'globe'='E774'; 'lock'='E72E'; 'heart'='EB51'; 'flag'='E7C1'
-    'calendar'='E787'; 'phone'='E717'
+    'calendar'='E787'; 'phone'='E717'; 'broom'='EA99'; 'terminal'='E756'; 'shield'='EA18'
+    'copy'='E8C8'; 'link'='E71B'
 }
 # Dark multiline text dialog (for long standard prompts). Returns $null on cancel.
 function Show-TextDialog([string]$title, [string]$message, [string]$default) {
@@ -988,6 +989,7 @@ $script:sending = $false
 $script:menuAway = 0
 $script:armedBtn = $null
 $script:armedAt = Get-Date '2000-01-01'
+$script:stateGlobLast = Get-Date '2000-01-01'
 
 function Test-TargetForeground {
     [CkWin]::GetForegroundWindow() -eq $script:target
@@ -996,12 +998,24 @@ function Test-TargetForeground {
 $script:toggleState = @{}   # in-memory on/off state for toggle buttons (per panel run)
 function Get-ButtonKey($b) { "$($b.label)|$($b.text)|$($b.chat)" }
 
+# A toggle button's TRUE state. With "stateGlob" set, the filesystem is the truth
+# (the button stays honest even when an agent/hook changes the state behind our back).
+function Get-ToggleState($item) {
+    if ($item.stateGlob) {
+        try { return [bool](Test-Path ([Environment]::ExpandEnvironmentVariables([string]$item.stateGlob))) } catch { return $false }
+    }
+    return ($script:toggleState[(Get-ButtonKey $item)] -eq $true)
+}
+
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
     try {
         $item = $btn.Tag
-        # Two-click confirmation for destructive buttons (within 3 s)
-        if ($item.confirm) {
+        # Two-click confirmation for destructive buttons (within 3 s).
+        # Asymmetric for toggles: confirm gates switching ON only - disarming is never gated.
+        $needConfirm = [bool]$item.confirm
+        if ($item.toggle -and (Get-ToggleState $item)) { $needConfirm = $false }
+        if ($needConfirm) {
             if ($script:armedBtn -ne $btn -or ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
                 if ($script:armedBtn) { Set-PillFace $script:armedBtn }
                 $script:armedBtn = $btn
@@ -1017,10 +1031,9 @@ function Invoke-PillClick($btn) {
         # Toggle buttons: flip state, then send textOn/textOff (off with no textOff = state only)
         $textToSend = [string]$item.text
         if ($item.toggle) {
-            $key = Get-ButtonKey $item
-            $on = -not ($script:toggleState[$key] -eq $true)
-            $script:toggleState[$key] = $on
-            $btn.Toggled = $on
+            $on = -not (Get-ToggleState $item)
+            $script:toggleState[(Get-ButtonKey $item)] = $on
+            $btn.Toggled = $on   # optimistic; the stateGlob poll corrects within ~1 s if reality disagrees
             $textToSend = if ($on) { if ($item.textOn) { [string]$item.textOn } else { [string]$item.text } }
                           else { [string]$item.textOff }
             if ([string]::IsNullOrEmpty($textToSend)) { return }
@@ -1068,7 +1081,7 @@ function Rebuild-Buttons {
         $btn.Tag = $b
         $btn.Height = $pillH
         Set-PillFace $btn
-        if ($b.toggle) { $btn.Toggled = ($script:toggleState[(Get-ButtonKey $b)] -eq $true) }
+        if ($b.toggle) { $btn.Toggled = (Get-ToggleState $b) }
         $btn.Margin = New-Object System.Windows.Forms.Padding((S(2)))
         $btn.BackColor = $colBar
         $btn.ForeColor = $colText
@@ -1134,6 +1147,18 @@ $timer.add_Tick({
         if ($script:armedBtn -and ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
             try { Set-PillFace $script:armedBtn } catch {}
             $script:armedBtn = $null
+        }
+
+        # stateGlob poll (~1 s): keep glob-backed toggle buttons truthful even when
+        # an agent, hook or another machine changes the state behind our back
+        if (((Get-Date) - $script:stateGlobLast).TotalMilliseconds -ge 1000) {
+            $script:stateGlobLast = Get-Date
+            foreach ($c in $panel.Controls) {
+                if ($c -is [PillButton] -and $c.Tag -and $c.Tag.toggle -and $c.Tag.stateGlob) {
+                    $truth = Get-ToggleState $c.Tag
+                    if ($c.Toggled -ne $truth) { $c.Toggled = $truth }
+                }
+            }
         }
 
         # Reload buttons.json on change (e.g. /pin)

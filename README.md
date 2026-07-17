@@ -91,6 +91,22 @@ Right-click a button → *On/off (toggle) mode*. The button now lights up while 
 `textOn` (defaults to `text`) is typed when switching on, `textOff` when switching off (omit it
 to make switching off silent).
 
+**Truthful state via the filesystem** (`stateGlob`): instead of remembering its own on/off state,
+a toggle button can mirror reality — it is lit if and only if a file matching a glob exists:
+
+```json
+{ "label": "Shutdown on done", "icon": "power", "toggle": true, "confirm": true,
+  "stateGlob": "%USERPROFILE%\\.claude\\shutdown-on-done\\*.request",
+  "text": "arm shutdown-on-done", "textOff": "cancel shutdown-on-done", "submit": true }
+```
+
+The panel polls the glob about once a second, so if an agent, hook or another surface changes the
+state behind your back, the button follows within a second. Clicking still flips optimistically
+for instant feedback and is corrected if reality disagrees.
+
+**Confirm is asymmetric for toggles**: `confirm: true` gates switching **on** (two clicks) but
+never switching **off** — disarming a dangerous state should always be one click.
+
 ## What you're running (honesty section)
 
 This is unsigned PowerShell + a small `.vbs` launcher. That's normal for a hobby tool, but you
