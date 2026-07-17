@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.5.1'
+$CB_VERSION = '1.6.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -54,7 +54,7 @@ public class PillButton : Control {
     public Color Fill = Color.FromArgb(48, 47, 44);
     public Color HoverFill = Color.FromArgb(60, 58, 54);
     public Color DownFill = Color.FromArgb(70, 67, 62);
-    public Color ToggleFill = Color.FromArgb(128, 90, 44); // active state for toggle buttons
+    public Color ToggleFill = Color.FromArgb(150, 108, 54); // active state for toggle buttons (brighter for state contrast)
     public Color Accent = Color.Empty; // border on per-chat buttons
     bool toggled;
     public bool Toggled { get { return toggled; } set { toggled = value; Invalidate(); } }
@@ -64,6 +64,9 @@ public class PillButton : Control {
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         SetStyle(ControlStyles.Selectable, false);
         Cursor = Cursors.Hand;
+        // Expose an accessible role so a screen reader announces "button", not "client".
+        // AccessibleName is set per-instance to the label (not the icon glyph).
+        AccessibleRole = AccessibleRole.PushButton;
     }
     protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
     protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
@@ -88,9 +91,19 @@ public class PillButton : Control {
             if (toggled) { f = down ? DownFill : ToggleFill; }
             else { f = down ? DownFill : (hover ? HoverFill : Fill); }
             using (var b = new SolidBrush(f)) g.FillPath(b, path);
-            if (Accent != Color.Empty) using (var pen = new Pen(Accent)) g.DrawPath(pen, path);
+            // Per-chat accent: brighter + 2px so it clears WCAG 1.4.11 (3:1 non-text contrast).
+            if (Accent != Color.Empty) using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
         }
-        TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), ForeColor,
+        // Toggle-on gets a NON-COLOR cue (a bright left dot) so state isn't conveyed by fill alone.
+        int textLeft = 0;
+        if (toggled) {
+            int dd = Math.Max(4, Height / 3);
+            int dx = Math.Max(3, (Height - dd) / 2);
+            using (var b = new SolidBrush(Color.FromArgb(236, 200, 130)))
+                g.FillEllipse(b, dx, (Height - dd) / 2, dd, dd);
+            textLeft = dx + dd;
+        }
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(textLeft, 0, Width - textLeft, Height), ForeColor,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
 }
@@ -102,6 +115,8 @@ public class GripHandle : Control {
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         SetStyle(ControlStyles.Selectable, false);
         Cursor = Cursors.Hand;
+        AccessibleRole = AccessibleRole.ButtonDropDown;
+        AccessibleName = "Claude Buttons menu";
     }
     protected override void OnPaint(PaintEventArgs e) {
         var g = e.Graphics;
@@ -837,7 +852,7 @@ $colHover = [System.Drawing.Color]::FromArgb(60, 58, 54)
 $colDown  = [System.Drawing.Color]::FromArgb(70, 67, 62)
 $colText  = [System.Drawing.Color]::FromArgb(214, 210, 202)
 $colGrip  = [System.Drawing.Color]::FromArgb(122, 118, 110)
-$colAccent = [System.Drawing.Color]::FromArgb(150, 110, 60)   # border on per-chat buttons
+$colAccent = [System.Drawing.Color]::FromArgb(198, 146, 78)   # border on per-chat buttons (brightened for WCAG 1.4.11)
 $pillH = S(21)
 
 # ---------- UI ----------
@@ -1401,6 +1416,11 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
         $btn.HoverFill = $colHover
         $btn.DownFill = $colDown
         if ($b.chat) { $btn.Accent = $colAccent }
+        # Accessible name for screen readers: the label (not the icon glyph), + scope + toggle state.
+        $an = [string]$b.label
+        if ($b.toggle) { $an += if ($btn.Toggled) { ', on' } else { ', off' } }
+        if ($b.chat -or $b.chatTitle) { $an += ', this chat' } else { $an += ', global' }
+        $btn.AccessibleName = $an
         $btn.ContextMenuStrip = $btnMenu
         $btn.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
         $btn.add_Click({ Invoke-PillClick $this })

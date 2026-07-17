@@ -174,6 +174,33 @@ Per-button fields:
 - **Nothing appears** → the strip only shows when the Claude window is the foreground window.
 - **Keyboard / screen-reader users:** the strip is a mouse-driven overlay that never takes focus. Use the `/pin` and `/unpin` skills (and hand-editing `buttons.json`) as the keyboard/AT path.
 
+## Accessibility
+
+The strip is a mouse-driven overlay that intentionally never takes keyboard focus (so your
+keystrokes always go to Claude). That has real limits, stated honestly:
+
+- **Screen readers**: buttons expose an accessible role and name (label + scope + on/off state);
+  the grip announces as "Claude Buttons menu".
+- **Non-color cues**: per-chat buttons have a brightened border and toggle-on buttons show a filled
+  dot — so scope and on/off aren't conveyed by color alone.
+- **Text contrast** is AAA (~8.9–10.9:1).
+- **Keyboard-only / AT users**: the strip itself is not keyboard-operable. Use the `/pin` and
+  `/unpin` skills (and hand-editing `buttons.json`) as the equivalent path.
+- **Target size**: pills match the app's own ~20px chips rather than the 24px WCAG target, a
+  deliberate trade to look native in the bottom bar.
+
+## Development & tests
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-all.ps1
+```
+
+Runs the engine tests (`node --test`, covering the shutdown logic against a throwaway
+`USERPROFILE` — nothing shuts down), the panel config-lifecycle tests (crafted `buttons.json`
+through `-SmokeTest`), and static parse checks. CI runs the same suite on `windows-latest` via
+GitHub Actions. There is no automated coverage of the live click/UIA/rendering paths (they need a
+real Claude window); `-SmokeTest` covers parse + normalize + control build.
+
 ## Uninstall
 
 ```powershell

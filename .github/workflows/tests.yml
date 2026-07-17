@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Windows PowerShell 5.1 is preinstalled on windows-latest and runs the panel exactly
+      # as end users do. No Claude window is needed - the tests use -SmokeTest and the engine's
+      # dry-run/temp-USERPROFILE modes, so nothing is installed and nothing shuts down.
+      - name: Run test suite
+        shell: powershell
+        run: .\tests\run-all.ps1

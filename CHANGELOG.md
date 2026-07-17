@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0 — 2026-07-17
+
+Final review band — accessibility + an actual test suite:
+
+- **Accessibility**: owner-drawn buttons now expose an accessible role and name (label + scope +
+  on/off state) and the grip announces as "Claude Buttons menu" (WCAG 4.1.2). Per-chat buttons get
+  a brighter, thicker border and toggle-on buttons show a filled dot, so scope/state aren't
+  color-only (1.4.11, 1.4.1). Keyboard-only limits and the native-size trade-off are documented.
+- **Tests**: a real suite under `tests/` — 12 engine tests (`node --test`, exercising the whole
+  shutdown-on-done state machine against a throwaway USERPROFILE, nothing shuts down), 10 panel
+  config-lifecycle tests through `-SmokeTest`, and static parse checks. `tests\run-all.ps1` runs
+  everything; a GitHub Actions workflow runs it on `windows-latest`.
+
 ## 1.5.1 — 2026-07-17
 
 Fixes for regressions the adversarial verification panel found in the 1.4.3–1.5.0 changes:
