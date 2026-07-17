@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.4.3'
+$CB_VERSION = '1.4.4'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -387,7 +387,11 @@ function L([string]$k) { $script:strings[$script:lang][$k] }
 
 # Save ONLY the panel's own fields - merge against a fresh file so /pin edits are never overwritten
 function Save-PanelState {
-    [void]$script:cfgLock.WaitOne(2000)
+    # M7: only release a mutex we actually acquired. WaitOne can time out (returns $false)
+    # if another process holds the config lock; releasing then would throw.
+    $held = $false
+    try { $held = $script:cfgLock.WaitOne(2000) } catch { $held = $false }
+    if (-not $held) { Write-CkLog 'Config lock busy - skipped panel-state save'; return }
     try {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return }
@@ -409,7 +413,9 @@ function Save-PanelState {
 
 # Transform the buttons array against a FRESH file (merge, don't overwrite) and update memory
 function Update-Buttons([scriptblock]$transform) {
-    [void]$script:cfgLock.WaitOne(2000)
+    $held = $false
+    try { $held = $script:cfgLock.WaitOne(2000) } catch { $held = $false }
+    if (-not $held) { Write-CkLog 'Config lock busy - button change not saved'; return $false }
     try {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return $false }
@@ -1249,34 +1255,50 @@ function Invoke-PillClick($btn) {
             $script:armedBtn = $null
             Set-PillFace $btn
         }
-        # Toggle buttons: flip state, then send textOn/textOff (off with no textOff = state only)
+        # Work out what this click WOULD send, WITHOUT mutating state yet (H7: the toggle
+        # flip must not happen if the send is aborted because Claude isn't foreground).
+        $isToggle = [bool]$item.toggle
+        $newOn = $null
         $textToSend = [string]$item.text
-        if ($item.toggle) {
-            $on = -not (Get-ToggleState $item)
-            $script:toggleState[(Get-ButtonKey $item)] = $on
-            # Optimistic; synced to clones on every strip (stateGlob poll corrects vs reality)
-            foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
-                foreach ($c in $pnl.Controls) {
-                    if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $on }
-                }
-            }
-            $textToSend = if ($on) { if ($item.textOn) { [string]$item.textOn } else { [string]$item.text } }
+        if ($isToggle) {
+            $newOn = -not (Get-ToggleState $item)
+            $textToSend = if ($newOn) { if ($item.textOn) { [string]$item.textOn } else { [string]$item.text } }
                           else { [string]$item.textOff }
-            if ([string]::IsNullOrEmpty($textToSend)) { return }
         }
         $script:sending = $true
         try {
             Start-Sleep -Milliseconds 150
-            if (-not (Test-TargetForeground)) { return }   # focus moved - send nothing
+            if (-not (Test-TargetForeground)) { return }   # focus moved - abort BEFORE any state change
+            # Now that we know we're acting, commit the optimistic toggle flip (stateGlob poll
+            # corrects vs the filesystem within ~1s; non-stateGlob toggles keep this local state).
+            if ($isToggle) {
+                $script:toggleState[(Get-ButtonKey $item)] = $newOn
+                foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+                    foreach ($c in $pnl.Controls) {
+                        if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $newOn }
+                    }
+                }
+                if ([string]::IsNullOrEmpty($textToSend)) { return }  # off with no textOff: flip only, nothing typed
+            }
             if ($textToSend.Length -gt 80 -or $textToSend -match "`n") {
-                # Long/multiline prompts: paste atomically via clipboard (fast, no typing race)
-                $hadText = [System.Windows.Forms.Clipboard]::ContainsText()
-                $oldClip = if ($hadText) { [System.Windows.Forms.Clipboard]::GetText() } else { $null }
+                # Long/multiline prompts: paste atomically via clipboard (fast, no typing race).
+                # M1: preserve the FULL prior clipboard (images/files too), not just text.
+                $backup = $null
+                try {
+                    $old = [System.Windows.Forms.Clipboard]::GetDataObject()
+                    if ($old) {
+                        $backup = New-Object System.Windows.Forms.DataObject
+                        foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} }
+                    }
+                } catch {}
                 [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                if (-not (Test-TargetForeground)) { return }   # M2: re-check right before paste
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
                 Start-Sleep -Milliseconds 300
-                if ($hadText) { try { [System.Windows.Forms.Clipboard]::SetText($oldClip) } catch {} }
+                if ($backup) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
+                else { try { [System.Windows.Forms.Clipboard]::Clear() } catch {} }
             } else {
+                if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
                 [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             }
             # Per-chat buttons never auto-send: the user must see the text before Enter

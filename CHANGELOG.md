@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.4 — 2026-07-17
+
+Second hardening band from the 8-agent review ("should fix before next release"):
+
+- **Toggle no longer desyncs on an aborted send.** The on/off flip now happens *after* the
+  foreground check, so a click that lands while Claude isn't foreground no longer leaves a
+  non-`stateGlob` toggle stuck in the wrong state.
+- **Clipboard fully preserved for long/multiline pastes.** The prior clipboard is now snapshotted
+  across all formats (images, files, rich data) and restored — not just plain text.
+- **Foreground re-checked immediately before each send/paste** (tighter TOCTOU window).
+- **Config mutex only released when actually acquired** (a busy lock no longer risks releasing a
+  mutex the panel doesn't own).
+- **Docs:** README gains a full `buttons.json` config reference (top-level + per-button fields),
+  the complete 42-icon list, `uiaPaneMatch` added to troubleshooting, and a keyboard/AT note. The
+  Danish README is rewritten to match current behavior (it still described the superseded v1
+  shutdown and omitted icons/toggles/multi-pane).
+
 ## 1.4.3 — 2026-07-17
 
 Hardening from an 8-agent code review (the "must fix before wider distribution" set):

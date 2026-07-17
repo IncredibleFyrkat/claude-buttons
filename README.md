@@ -81,7 +81,7 @@ confirm to arm, one click to cancel. It is never installed silently.
 
 Right-click a button → *Set icon...* and type a name. Available names:
 
-`mic, power, play, pause, stop, refresh, check, x, trash, settings, search, save, code, bug, star, pin, send, bell, clock, sun, moon, zap, home, folder, camera, edit, plus, download, upload, user, mail, globe, lock, heart, flag, calendar, phone`
+`mic, power, play, pause, stop, refresh, check, x, trash, settings, search, save, code, bug, star, pin, send, bell, clock, sun, moon, zap, home, folder, camera, edit, plus, download, upload, user, mail, globe, lock, heart, flag, calendar, phone, broom, terminal, shield, copy, link`
 
 You can also give any 4-digit hex codepoint from the Segoe Fluent Icons font. Icon buttons show
 their label and command in the tooltip.
@@ -127,12 +127,52 @@ should know what it does before trusting it:
 Read the source — it's a single, commented file. If Windows SmartScreen warns about the downloaded
 scripts, that's the standard "unknown publisher" notice for unsigned scripts; `git clone` avoids it.
 
+## Config reference (`buttons.json`)
+
+The file the panel reads (created from `buttons.default.json` on first install, in
+`%LOCALAPPDATA%\Programs\ClaudeButtons`). Top-level fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `schemaVersion` | `1` | Config format version. |
+| `buttons` | `[]` | The button list (see below). |
+| `targetTitle` | `"Claude"` | Substring the target window's title must contain. |
+| `targetProcess` | `"claude"` | Process name that must own the window. |
+| `uiaPaneMatch` | `" pane$"` | Regex; every Group whose accessibility name matches is treated as a chat pane (matches `Primary pane`, `Secondary pane`…). |
+| `uiaPaneName` | `"Primary pane"` | Legacy exact pane name (fallback). |
+| `uiaSidebarName` | `"Sidebar"` | Sidebar name, used to derive the chat area if no pane matches. |
+| `zoneTop` / `zoneBottom` | `45` / `55` | Logical-px zones where the chat title tab / bottom button row live. |
+| `fallbackRow` | `33` | Strip center above the window bottom when the button row can't be measured. |
+| `stripGap` | `10` | Gap (px) between the app's own buttons and the strip. |
+| `reservedW` | `380` | Width reserved for the app's own bar elements (compact-mode threshold). |
+| `relX` | `0.0` | Horizontal position within the pane (0–1). |
+| `lang` | `"en"` | UI language: `en` or `da`. |
+
+Per-button fields:
+
+| Field | Meaning |
+|---|---|
+| `label` | Display text. |
+| `short` | Short label shown in compact mode (~8 chars). |
+| `text` | Text typed into the chat on click (may be a long multi-line prompt). |
+| `submit` | `true` = press Enter after typing (**global buttons only**; per-chat never auto-send). |
+| `confirm` | `true` = two-click "Confirm?" before firing (gates ON only for toggles). |
+| `icon` | Icon name (see list above) or a raw 4-hex codepoint; renders a round icon button. |
+| `toggle` | `true` = on/off button (lit while on). |
+| `textOn` / `textOff` | Text sent when switching on / off (`textOn` defaults to `text`; omit `textOff` for silent off). |
+| `stateGlob` | Glob (env vars expanded); the toggle is lit iff a matching file exists — truthful state from the filesystem. |
+| `chat` | Session id this button is scoped to (per-chat). |
+| `chatTitle` | The displayed chat title this button binds to (preferred per-chat match). |
+| `chatLabel` | Human description shown in the tooltip for a per-chat button. |
+| `desc` | Extra explanation shown at the top of the hover tooltip. |
+
 ## Troubleshooting
 
-- **Strip sits slightly off, or per-chat buttons misbehave, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json` (`uiaPaneName`, `uiaSidebarName`, `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `reservedW`). Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
-- **App not in English?** Accessibility names like `Primary pane`/`Sidebar` may be localized — set `uiaPaneName`/`uiaSidebarName` to the localized names in `buttons.json`.
-- **`/pin` says unknown command** → restart the Claude app so the skill loads.
+- **Strip sits slightly off, or per-chat/split-view buttons misbehave, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json` (`uiaPaneMatch`, `uiaPaneName`, `uiaSidebarName`, `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `reservedW`). Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
+- **App not in English?** Accessibility names like `Primary pane`/`Sidebar` may be localized — set `uiaPaneMatch` (and `uiaSidebarName`) to the localized names in `buttons.json`.
+- **`/pin` says unknown command, or does nothing** → restart the Claude app once so the skill loads; the skill writes to the file named in `%USERPROFILE%\.claude\claude-buttons-path.txt`.
 - **Nothing appears** → the strip only shows when the Claude window is the foreground window.
+- **Keyboard / screen-reader users:** the strip is a mouse-driven overlay that never takes focus. Use the `/pin` and `/unpin` skills (and hand-editing `buttons.json`) as the keyboard/AT path.
 
 ## Uninstall
 
