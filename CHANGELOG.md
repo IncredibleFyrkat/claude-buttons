@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-07-17
+
+- **Multi-pane support (side-by-side / grid view)**: the panel now detects every chat pane and
+  shows a strip under each one. Global buttons appear in all panes simultaneously; per-chat
+  buttons appear exactly under their own pane (matched by the pane's chat title). Toggle state,
+  ordering and removal stay in sync across all strips; compact mode keys off the narrowest pane.
+
 ## 1.2.0 — 2026-07-17
 
 - **Shutdown-on-done engine** (contributed by Rasmus) replaces the v1 Stop hook: the agent

@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.2.0'
+$CB_VERSION = '1.3.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -545,14 +545,51 @@ function Read-ActiveSession {
 }
 
 # ---------- UIA: read the displayed chat + chat-area geometry from the app's own UI ----------
-$script:uiaTitle = $null      # title of the chat shown right now (from the tab at the top)
-$script:paneRect = $null      # chat area (Primary pane) relative to the window
-$script:rowCenterOff = $null  # bottom buttons' vertical center, measured from window bottom
-$script:leftEdgeOff = $null   # right edge of the app's left button cluster, from window left
+$script:uiaTitle = $null      # title of the chat shown in the FIRST pane (primary strip)
+$script:paneRect = $null      # first chat pane relative to the window
+$script:rowCenterOff = $null  # bottom buttons' vertical center, measured from the pane bottom
+$script:leftEdgeOff = $null   # right edge of the pane's left button cluster, from window left
+$script:paneBottomOff = 0     # first pane's bottom edge, measured up from the window bottom
+$script:panes = @()           # ALL chat panes (side-by-side / grid view) - one strip per pane
 $script:uiaDirty = $false
 $script:uiaLast = Get-Date '2000-01-01'
 $script:uiaInterval = 1500    # ms between UIA passes; backs off once geometry is stable
 $script:uiaStable = 0
+
+# Measure one chat pane: geometry, displayed chat title, bottom button row
+function Measure-Pane($pane, $wr, $btnCond) {
+    $pr = $pane.Current.BoundingRectangle
+    $paneBottom = $pr.Y + $pr.Height
+    $info = @{
+        OffL = [int]($pr.X - $wr.Left); OffT = [int]($pr.Y - $wr.Top); Width = [int]$pr.Width
+        BottomOff = [int][Math]::Max(0, $wr.Bottom - $paneBottom)
+        Title = $null; RowCenter = $null; LeftOff = $null
+    }
+    $btns = $pane.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+    # Chat title = leftmost named button in the pane's top strip
+    $best = $null; $bestX = [double]::MaxValue
+    foreach ($b in $btns) {
+        $br = $b.Current.BoundingRectangle
+        if ($br.Y -ge $pr.Y -and $br.Y -lt ($pr.Y + (SW $script:zoneTop)) -and $br.X -lt $bestX -and $b.Current.Name) { $best = $b; $bestX = $br.X }
+    }
+    if ($best) { $info.Title = [string]$best.Current.Name }
+    # Bottom-left button cluster within THIS pane (grid panes have their own bottom bars)
+    $sumY = 0.0; $n = 0; $rightEdge = $null
+    foreach ($b in $btns) {
+        $br = $b.Current.BoundingRectangle
+        $cy = $br.Y + $br.Height / 2
+        if ($cy -gt ($paneBottom - (SW $script:zoneBottom)) -and $cy -lt $paneBottom -and $br.X -ge $pr.X -and $br.X -lt ($pr.X + $pr.Width / 2)) {
+            $sumY += $cy; $n++
+            $re = $br.X + $br.Width
+            if ($null -eq $rightEdge -or $re -gt $rightEdge) { $rightEdge = $re }
+        }
+    }
+    if ($n -gt 0) {
+        $info.RowCenter = [int]($paneBottom - ($sumY / $n))
+        $info.LeftOff = [int]($rightEdge - $wr.Left)
+    }
+    return $info
+}
 
 function Update-UiaInfo {
     if (((Get-Date) - $script:uiaLast).TotalMilliseconds -lt $script:uiaInterval) { return }
@@ -564,75 +601,50 @@ function Update-UiaInfo {
         [void][CkWin]::GetWindowRect($script:target, [ref]$wr)
         $grpType = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
 
-        $prevRow = $script:rowCenterOff; $prevLeft = $script:leftEdgeOff
+        $prevSig = ($script:panes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.Title),$($_.RowCenter)" }) -join '|'
 
-        # Strategy 1: chat area via named pane (name configurable in buttons.json)
+        $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+
+        # Strategy 1: ALL chat panes via the named group (side-by-side / grid view = several)
         $paneCond = New-Object System.Windows.Automation.AndCondition($grpType,
             (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaPaneName)))
-        $pane = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $paneCond)
-        $searchRoot = $root
-        $paneTop = $null
-        if ($pane) {
-            $pr = $pane.Current.BoundingRectangle
-            $script:paneRect = @{ OffL = [int]($pr.X - $wr.Left); Width = [int]$pr.Width }
-            $searchRoot = $pane
-            $paneTop = $pr.Y
+        $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $paneCond)
+        $newPanes = @()
+        if ($found.Count -gt 0) {
+            foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond) }
+            # Reading order: rows top-to-bottom, then left-to-right
+            $newPanes = @($newPanes | Sort-Object @{ e = { [int]($_.OffT / 100) } }, @{ e = { $_.OffL } })
         } else {
-            # Strategy 2: derive the chat area as window minus sidebar
+            # Strategy 2: derive a single chat area as window minus sidebar
             $sbCond = New-Object System.Windows.Automation.AndCondition($grpType,
                 (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaSidebarName)))
             $sb = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $sbCond)
             if ($sb) {
                 $sr = $sb.Current.BoundingRectangle
-                $script:paneRect = @{ OffL = [int]($sr.X + $sr.Width - $wr.Left); Width = [int]($wr.Right - ($sr.X + $sr.Width)) }
-            } else {
-                $script:paneRect = $null
+                $newPanes = @(@{ OffL = [int]($sr.X + $sr.Width - $wr.Left); OffT = 0; Width = [int]($wr.Right - ($sr.X + $sr.Width)); BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null })
             }
             Write-CkLog "UIA: '$($script:uiaPaneName)' not found - the app may have updated (running on fallback). Adjust uiaPaneName in buttons.json."
         }
+        $script:panes = $newPanes
 
-        $areaOffL = 0; $areaW = [int]($wr.Right - $wr.Left)
-        if ($script:paneRect) { $areaOffL = $script:paneRect.OffL; $areaW = $script:paneRect.Width }
-
-        $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-        $btns = $searchRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
-
-        # The displayed chat's title = the leftmost button in the pane's top bar (requires the pane)
-        $t = $null
-        if ($null -ne $paneTop) {
-            $best = $null; $bestX = [double]::MaxValue
-            foreach ($b in $btns) {
-                $br = $b.Current.BoundingRectangle
-                if ($br.Y -ge $paneTop -and $br.Y -lt ($paneTop + (SW $script:zoneTop)) -and $br.X -lt $bestX -and $b.Current.Name) { $best = $b; $bestX = $br.X }
-            }
-            if ($best) { $t = [string]$best.Current.Name }
-        }
-        if ($t -ne $script:uiaTitle) { $script:uiaTitle = $t; $script:uiaDirty = $true }
-
-        # The bottom-bar left cluster within the chat area: precise height + left start edge
-        $sumY = 0.0; $n = 0; $rightEdge = $null
-        $chatL = $wr.Left + $areaOffL
-        foreach ($b in $btns) {
-            $br = $b.Current.BoundingRectangle
-            $cy = $br.Y + $br.Height / 2
-            if ($cy -gt ($wr.Bottom - (SW $script:zoneBottom)) -and $cy -lt $wr.Bottom -and $br.X -ge $chatL -and $br.X -lt ($chatL + $areaW / 2)) {
-                $sumY += $cy; $n++
-                $re = $br.X + $br.Width
-                if ($null -eq $rightEdge -or $re -gt $rightEdge) { $rightEdge = $re }
-            }
-        }
-        if ($n -gt 0) {
-            $script:rowCenterOff = [int]($wr.Bottom - ($sumY / $n))
-            $script:leftEdgeOff = [int]($rightEdge - $wr.Left)
+        # Primary aliases = first pane (kept for the main strip and pinning)
+        if ($newPanes.Count -gt 0) {
+            $p0 = $newPanes[0]
+            $script:paneRect = @{ OffL = $p0.OffL; Width = $p0.Width }
+            $script:rowCenterOff = $p0.RowCenter
+            $script:leftEdgeOff = $p0.LeftOff
+            $script:paneBottomOff = $p0.BottomOff
+            if ($p0.Title -ne $script:uiaTitle) { $script:uiaTitle = $p0.Title; $script:uiaDirty = $true }
         } else {
-            $script:rowCenterOff = $null
-            $script:leftEdgeOff = $null
+            $script:paneRect = $null; $script:rowCenterOff = $null; $script:leftEdgeOff = $null; $script:paneBottomOff = 0
+            if ($null -ne $script:uiaTitle) { $script:uiaTitle = $null; $script:uiaDirty = $true }
         }
 
-        # Back off polling once geometry is stable; resume fast polling on any change
-        if ($script:rowCenterOff -eq $prevRow -and $script:leftEdgeOff -eq $prevLeft) {
+        # Back off polling once geometry is stable; any pane change resumes fast polling
+        $newSig = ($newPanes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.Title),$($_.RowCenter)" }) -join '|'
+        if ($newSig -eq $prevSig) {
             if ($script:uiaStable -lt 6) { $script:uiaStable++ }
-        } else { $script:uiaStable = 0 }
+        } else { $script:uiaStable = 0; $script:uiaDirty = $true }
         $script:uiaInterval = if ($script:uiaStable -ge 6) { 5000 } else { 1500 }
     } catch {
         if ($null -ne $script:uiaTitle) { $script:uiaDirty = $true }
@@ -640,6 +652,8 @@ function Update-UiaInfo {
         $script:paneRect = $null
         $script:rowCenterOff = $null
         $script:leftEdgeOff = $null
+        $script:paneBottomOff = 0
+        $script:panes = @()
         $script:uiaInterval = 1500; $script:uiaStable = 0
     }
 }
@@ -720,9 +734,11 @@ function Show-TipForm([string]$text, $anchorCtrl) {
     try {
         $tipLbl.Text = $text
         $p = $anchorCtrl.PointToScreen([System.Drawing.Point]::Empty)
+        $af = $anchorCtrl.FindForm()
+        if (-not $af) { $af = $form }
         $x = $p.X
-        $y = $form.Top - $tipForm.Height - (S 7)   # over strimlen (den ligger typisk nederst)
-        if ($y -lt 0) { $y = $form.Bottom + (S 7) }
+        $y = $af.Top - $tipForm.Height - (S 7)   # over den strimmel kontrollen sidder i
+        if ($y -lt 0) { $y = $af.Bottom + (S 7) }
         $tipForm.Location = New-Object System.Drawing.Point($x, $y)
         if (-not $tipForm.Visible) { $tipForm.Show() }
     } catch {}
@@ -998,11 +1014,7 @@ $miRemove.add_Click({
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
         if (Update-Buttons { param($btns) $btns | Where-Object { -not (Same-Button $_ $t) } }) {
-            if ($script:armedBtn -eq $src) { $script:armedBtn = $null }
-            if ($script:hoverCtrl -eq $src) { $script:hoverCtrl = $null }
-            $panel.Controls.Remove($src)
-            $src.Dispose()
-            $script:menuSource = $null
+            Rebuild-Buttons   # fjerner ogsaa kloner paa spejl-strimlerne
         }
     } catch { Write-CkLog "Remove error: $($_.Exception.Message)" }
 })
@@ -1025,10 +1037,11 @@ function Move-PinButton([int]$dir) {
     try {
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
-        $idx = $panel.Controls.IndexOf($src)
+        $host = $src.Parent   # den strimmel der blev hoejreklikket i (primaer eller spejl)
+        $idx = $host.Controls.IndexOf($src)
         $nyIdx = $idx + $dir
-        if ($nyIdx -lt 1 -or $nyIdx -ge $panel.Controls.Count) { return }  # index 0 is the grip
-        $neighbor = $panel.Controls[$nyIdx].Tag
+        if ($nyIdx -lt 1 -or $nyIdx -ge $host.Controls.Count) { return }  # index 0 is the grip
+        $neighbor = $host.Controls[$nyIdx].Tag
         $t = $src.Tag
         $ok = Update-Buttons {
             param($btns)
@@ -1041,7 +1054,7 @@ function Move-PinButton([int]$dir) {
             if ($i1 -ge 0 -and $i2 -ge 0) { $tmp = $btns[$i1]; $btns[$i1] = $btns[$i2]; $btns[$i2] = $tmp }
             $btns
         }
-        if ($ok) { $panel.Controls.SetChildIndex($src, $nyIdx) }
+        if ($ok) { Rebuild-Buttons }   # synkroniser raekkefoelgen paa alle strimler
     } catch { Write-CkLog "Move error: $($_.Exception.Message)" }
 }
 $miLeft.add_Click({ Move-PinButton -1 })
@@ -1112,7 +1125,12 @@ function Invoke-PillClick($btn) {
         if ($item.toggle) {
             $on = -not (Get-ToggleState $item)
             $script:toggleState[(Get-ButtonKey $item)] = $on
-            $btn.Toggled = $on   # optimistic; the stateGlob poll corrects within ~1 s if reality disagrees
+            # Optimistic; synced to clones on every strip (stateGlob poll corrects vs reality)
+            foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+                foreach ($c in $pnl.Controls) {
+                    if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $on }
+                }
+            }
             $textToSend = if ($on) { if ($item.textOn) { [string]$item.textOn } else { [string]$item.text } }
                           else { [string]$item.textOff }
             if ([string]::IsNullOrEmpty($textToSend)) { return }
@@ -1144,18 +1162,53 @@ function Invoke-PillClick($btn) {
     } catch { $script:sending = $false; Write-CkLog "Click error: $($_.Exception.Message)" }
 }
 
-function Rebuild-Buttons {
-    $form.SuspendLayout()
-    $panel.SuspendLayout()
-    $old = @($panel.Controls | Where-Object { $_ -ne $grip })
-    $script:armedBtn = $null
-    $script:menuSource = $null
-    $script:hoverCtrl = $null
-    if ($tipForm.Visible) { $tipForm.Hide() }
-    $panel.Controls.Clear()
-    $panel.Controls.Add($grip)
+# Mirror strips: one extra strip per additional chat pane in side-by-side/grid view
+$script:mirrors = @()
+
+function New-MirrorStrip {
+    $mf = New-Object NoActivateForm
+    $mf.Text = 'Claude Buttons'
+    $mf.TopMost = $true
+    $mf.FormBorderStyle = 'None'
+    $mf.ShowInTaskbar = $false
+    $mf.AutoSize = $true
+    $mf.AutoSizeMode = 'GrowAndShrink'
+    $mf.StartPosition = 'Manual'
+    $mf.Location = New-Object System.Drawing.Point(-4000, -4000)
+    $mf.BackColor = $colBar
+    $mp = New-Object System.Windows.Forms.FlowLayoutPanel
+    $mp.FlowDirection = 'LeftToRight'
+    $mp.WrapContents = $false
+    $mp.AutoSize = $true
+    $mp.AutoSizeMode = 'GrowAndShrink'
+    $mp.Padding = New-Object System.Windows.Forms.Padding((S(3)), (S(2)), (S(3)), (S(2)))
+    [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($mp, $true, $null)
+    $mf.Controls.Add($mp)
+    $mg = New-Object GripHandle
+    $mg.DotColor = $colGrip
+    $mg.BackColor = $colBar
+    $mg.Width = S(14)
+    $mg.Height = $pillH
+    $mg.Margin = New-Object System.Windows.Forms.Padding((S(2)), (S(2)), (S(2)), (S(2)))
+    $mg.ContextMenuStrip = $gripMenu
+    $mg.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($this, $_.Location) } })
+    $mg.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+    $mg.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+    @{ Form = $mf; Panel = $mp; Grip = $mg }
+}
+
+# Fill one strip panel with the buttons visible for a given pane
+function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPrimary) {
+    $destPanel.SuspendLayout()
+    $old = @($destPanel.Controls | Where-Object { $_ -ne $destGrip })
+    $destPanel.Controls.Clear()
+    $destPanel.Controls.Add($destGrip)
     foreach ($b in $script:config.buttons) {
-        if (-not (Test-ChatButtonVisible $b)) { continue }
+        $visible = if (-not $b.chat -and -not $b.chatTitle) { $true }                 # global: every pane
+                   elseif ($b.chatTitle) { $paneTitle -and ($b.chatTitle -eq $paneTitle) }
+                   elseif ($isPrimary) { Test-ChatButtonVisible $b }                  # session-id fallback: primary only
+                   else { $false }
+        if (-not $visible) { continue }
         $btn = New-Object PillButton
         $btn.Tag = $b
         $btn.Height = $pillH
@@ -1173,11 +1226,26 @@ function Rebuild-Buttons {
         $btn.add_Click({ Invoke-PillClick $this })
         $btn.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
         $btn.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
-        $panel.Controls.Add($btn)
+        $destPanel.Controls.Add($btn)
     }
-    $panel.ResumeLayout()
-    $form.ResumeLayout()
+    $destPanel.ResumeLayout()
     foreach ($o in $old) { $o.Dispose() }
+}
+
+function Rebuild-Buttons {
+    $script:armedBtn = $null
+    $script:menuSource = $null
+    $script:hoverCtrl = $null
+    if ($tipForm.Visible) { $tipForm.Hide() }
+    $form.SuspendLayout()
+    Build-StripPanel $panel $grip $script:uiaTitle $true
+    $form.ResumeLayout()
+    for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
+        $mTitle = if (($i + 1) -lt $script:panes.Count) { $script:panes[$i + 1].Title } else { $null }
+        $script:mirrors[$i].Form.SuspendLayout()
+        Build-StripPanel $script:mirrors[$i].Panel $script:mirrors[$i].Grip $mTitle $false
+        $script:mirrors[$i].Form.ResumeLayout()
+    }
 }
 [void](Read-ActiveSession)
 Rebuild-Buttons
@@ -1198,6 +1266,9 @@ $timer.add_Tick({
         if ($menusOpen.Count -gt 0) {
             $p = [System.Windows.Forms.Cursor]::Position
             $inside = $form.Bounds.Contains($p)
+            if (-not $inside) {
+                foreach ($ms in $script:mirrors) { if ($ms.Form.Bounds.Contains($p)) { $inside = $true; break } }
+            }
             if (-not $inside) {
                 foreach ($m in $menusOpen) { if (Test-CursorInDropDown $m) { $inside = $true; break } }
             }
@@ -1225,10 +1296,13 @@ $timer.add_Tick({
         # an agent, hook or another machine changes the state behind our back
         if (((Get-Date) - $script:stateGlobLast).TotalMilliseconds -ge 1000) {
             $script:stateGlobLast = Get-Date
-            foreach ($c in $panel.Controls) {
-                if ($c -is [PillButton] -and $c.Tag -and $c.Tag.toggle -and $c.Tag.stateGlob) {
-                    $truth = Get-ToggleState $c.Tag
-                    if ($c.Toggled -ne $truth) { $c.Toggled = $truth }
+            $allPanels = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel })
+            foreach ($pnl in $allPanels) {
+                foreach ($c in $pnl.Controls) {
+                    if ($c -is [PillButton] -and $c.Tag -and $c.Tag.toggle -and $c.Tag.stateGlob) {
+                        $truth = Get-ToggleState $c.Tag
+                        if ($c.Toggled -ne $truth) { $c.Toggled = $truth }
+                    }
                 }
             }
         }
@@ -1250,6 +1324,19 @@ $timer.add_Tick({
         # Read the displayed chat + chat area from the app's UI (cached, backs off when stable)
         Update-UiaInfo
         if ($script:uiaDirty) { $script:uiaDirty = $false; $dirty = $true }
+
+        # One mirror strip per ADDITIONAL pane (side-by-side / grid view)
+        $wantMirrors = [Math]::Max(0, $script:panes.Count - 1)
+        while ($script:mirrors.Count -lt $wantMirrors) {
+            $script:mirrors = @($script:mirrors) + (New-MirrorStrip)
+            $dirty = $true
+        }
+        while ($script:mirrors.Count -gt $wantMirrors) {
+            $m = $script:mirrors[$script:mirrors.Count - 1]
+            $script:mirrors = @($script:mirrors | Select-Object -First ($script:mirrors.Count - 1))
+            try { $m.Form.Close(); $m.Form.Dispose() } catch {}
+            $dirty = $true
+        }
         if ($dirty) { Rebuild-Buttons }
 
         # Find/validate the Claude window (HWND can be reused - check PID still matches)
@@ -1280,6 +1367,7 @@ $timer.add_Tick({
                 ([CkWin]::GetForegroundWindow() -eq $script:target)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
+            foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
             if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
@@ -1298,8 +1386,10 @@ $timer.add_Tick({
             $areaW = $script:paneRect.Width
         }
 
-        # Compact mode with hysteresis
-        $avail = $areaW - (S $script:reservedW)
+        # Compact mode with hysteresis (measured against the NARROWEST pane in grid view)
+        $minPaneW = $areaW
+        foreach ($pn in $script:panes) { if ($pn.Width -lt $minPaneW) { $minPaneW = $pn.Width } }
+        $avail = $minPaneW - (S $script:reservedW)
         $newCompact = $script:compact
         if (-not $script:compact -and (Get-StripWidth $false) -gt $avail) { $newCompact = $true }
         elseif ($script:compact -and (Get-StripWidth $false) -lt ($avail - (S(60)))) { $newCompact = $false }
@@ -1326,14 +1416,15 @@ $timer.add_Tick({
                 $y = $r.Top + $script:freeY
             } else {
                 # Horizontal: after the app's own left cluster (relX nudges within the remaining space).
-                # Vertical: locked to the app's bottom button row (self-calibrating).
+                # Vertical: locked to the pane's bottom button row (self-calibrating, grid-aware).
+                $paneBottom = $r.Bottom - $script:paneBottomOff
                 $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
                 $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
                 $x = $startX + [int]($script:relX * $room)
                 if ($null -ne $script:rowCenterOff) {
-                    $y = $r.Bottom - $script:rowCenterOff - [int]($form.Height / 2)
+                    $y = $paneBottom - $script:rowCenterOff - [int]($form.Height / 2)
                 } else {
-                    $y = $r.Bottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
+                    $y = $paneBottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
                 }
             }
             $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
@@ -1347,6 +1438,25 @@ $timer.add_Tick({
         }
         if (-not $form.Visible) { $form.Show() }
         if ($form.Opacity -lt 1) { $form.Opacity = 1 }
+
+        # Mirror strips: dock each under its own pane
+        for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
+            $mForm = $script:mirrors[$i].Form
+            if (($i + 1) -ge $script:panes.Count) { if ($mForm.Visible) { $mForm.Hide() }; continue }
+            $pi = $script:panes[$i + 1]
+            $paneL = $r.Left + $pi.OffL
+            $paneBottom = $r.Bottom - $pi.BottomOff
+            $startX = if ($null -ne $pi.LeftOff) { $r.Left + $pi.LeftOff + (SW $script:stripGap) } else { $paneL }
+            $room = [Math]::Max(1, ($paneL + $pi.Width) - $startX - $mForm.Width)
+            $mx = $startX + [int]($script:relX * $room)
+            $my = if ($null -ne $pi.RowCenter) { $paneBottom - $pi.RowCenter - [int]($mForm.Height / 2) }
+                  else { $paneBottom - (SW $script:fallbackRow) - [int]($mForm.Height / 2) }
+            $mx = [Math]::Max($r.Left + 4, [Math]::Min($mx, $r.Right - $mForm.Width - 4))
+            $my = [Math]::Max($r.Top + 4, [Math]::Min($my, $r.Bottom - $mForm.Height - 2))
+            $mDesired = New-Object System.Drawing.Point($mx, $my)
+            if ($mForm.Location -ne $mDesired) { $mForm.Location = $mDesired }
+            if (-not $mForm.Visible) { $mForm.Show() }
+        }
 
         # Hover-tooltip + engangs foerstegangs-hint (egen tip-boks - indbygget ToolTip
         # viser sig ikke paalideligt paa et vindue uden fokus)
