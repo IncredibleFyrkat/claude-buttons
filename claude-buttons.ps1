@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.3.3'
+$CB_VERSION = '1.3.4'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -463,6 +463,7 @@ function Show-TextDialog([string]$title, [string]$message, [string]$default) {
     $dlg.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
     $dlg.AcceptButton = $null   # Enter inserts a newline in the textbox; click OK to accept
     $dlg.CancelButton = $cancel
+    $dlg.add_Shown({ $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $tb.Text } else { $null }
     $dlg.Dispose()
@@ -482,6 +483,7 @@ function Get-IconGlyph([string]$name) {
 function Show-IconPicker([string]$current) {
     if (-not $script:iconFont) { return $null }
     $dlg = New-Object System.Windows.Forms.Form
+    $script:iconDlg = $dlg
     $dlg.Text = L 'iconTitle'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
@@ -507,7 +509,9 @@ function Show-IconPicker([string]$current) {
         if ($e.glyph) { $ib.Font = $bigIcon; $ib.Text = $e.glyph }
         else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
         $ib.Tag = $e.name
-        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $dlg.DialogResult = 'OK'; $dlg.Close() }.GetNewClosure())
+        # No GetNewClosure: $this must resolve to the clicked button at event time,
+        # and each button's own name is stored in its Tag.
+        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
         $tt = New-Object System.Windows.Forms.ToolTip
         $tt.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
         [void]$flow.Controls.Add($ib)
@@ -519,9 +523,13 @@ function Show-IconPicker([string]$current) {
     $cancel.Location = New-Object System.Drawing.Point((S 300), (S 284)); $cancel.Size = New-Object System.Drawing.Size((S 92), (S 28))
     $dlg.Controls.AddRange(@($flow, $cancel))
     $dlg.CancelButton = $cancel
+    # Make sure the dialog appears in front and takes focus (the panel window never activates,
+    # so a child dialog can otherwise open behind and block the panel modally out of sight).
+    $dlg.add_Shown({ $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
     $dlg.Dispose()
+    $script:iconDlg = $null
     return $out
 }
 

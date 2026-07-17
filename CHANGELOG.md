@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.4 — 2026-07-17
+
+- **Fix: the icon picker did nothing (and could freeze the menu).** The grid's click handler
+  used `.GetNewClosure()`, which captured `$this` as `$null`, so clicking any icon cleared the
+  icon instead of setting it. The picker (and the text/prompt dialog) now also activate and come
+  to the front, so they can't open behind another window and block the panel modally out of sight.
+
 ## 1.3.3 — 2026-07-17
 
 - **Fix: strips reloaded on every pane while dragging a chat in/around.** Pane geometry and
