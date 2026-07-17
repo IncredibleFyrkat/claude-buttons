@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.3 — 2026-07-17
+
+Hardening from an 8-agent code review (the "must fix before wider distribution" set):
+
+- **Corrupt buttons.json no longer kills the panel.** An unreadable/locked config now falls
+  back to the shipped defaults (then an empty config), logs it, and keeps running instead of
+  throwing — previously the hidden-launched panel just never appeared. The bad file is left
+  untouched on disk.
+- **`install.ps1 -Update` now refreshes the shutdown engine + skill** if the feature is already
+  installed (it was silently left stale before).
+- **settings.json is written without a BOM** (plain UTF-8) for maximum JSON-reader compatibility.
+- **Shutdown allow-rules are scoped to the exact subcommands** the skill runs (request-on,
+  request-off, on --this-turn, off, status) instead of a blanket `toggle *` wildcard.
+- **Stale machine-wide switch is ignored.** The shutdown engine now ignores (and clears) a
+  `MACHINE-ARMED` file older than 12 h, so a forgotten switch can't power off an unrelated
+  session later. Shutdown fires and machine-wake events are logged to
+  `~/.claude/shutdown-on-done/shutdown-on-done.log`; a leading BOM on the hook payload is stripped.
+- **The install smoke test now gates**: install aborts (without launching) if the panel doesn't
+  print `SMOKE-OK`.
+
 ## 1.4.2 — 2026-07-17
 
 - **Dark scrollbars.** The multiline prompt editor and the icon grid showed a white classic

@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.4.2'
+$CB_VERSION = '1.4.3'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -282,8 +282,19 @@ function Write-ConfigAtomic($cfg) {
 }
 
 $script:config = Read-FreshConfig
-if (-not $script:config) { throw 'buttons.json could not be read' }
-$script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc
+if (-not $script:config) {
+    # H3: a corrupt/locked buttons.json must not kill the panel (launched hidden, the
+    # user would just see nothing). Fall back to the shipped defaults, else an empty
+    # in-memory config, log it, and carry on. The bad file is left untouched on disk.
+    Write-CkLog 'buttons.json unreadable at startup - falling back to defaults (file left untouched)'
+    $defPath = Join-Path $PSScriptRoot 'buttons.default.json'
+    try { $script:config = Get-Content $defPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $script:config = $null }
+    if (-not $script:config) {
+        $script:config = [pscustomobject]@{ schemaVersion = 1; buttons = @() }
+    }
+    if ($null -eq $script:config.buttons) { $script:config | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
+}
+try { $script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc } catch { $script:cfgTime = Get-Date '2000-01-01' }
 $script:activeSession = ''
 $script:activeTime = $null
 $script:activeTs = $null        # timestamp from the hook (UTC)

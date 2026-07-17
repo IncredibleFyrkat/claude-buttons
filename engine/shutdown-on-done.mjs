@@ -13,7 +13,7 @@
 //     starts a 60s-grace shutdown (abort with `shutdown -a`).
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +25,25 @@ const FLAG_DIR = join(homedir(), '.claude', 'shutdown-on-done');
 // external trigger (e.g. a physical/custom button) to use completion-judged mode.
 const MACHINE_FLAG = join(FLAG_DIR, 'MACHINE-ARMED');
 const GRACE_SECONDS = 60;
+// A forgotten machine-wide switch must not power off some unrelated session days
+// later. Ignore (and clear) MACHINE-ARMED once it is older than this.
+const MACHINE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+const LOG_FILE = join(FLAG_DIR, 'shutdown-on-done.log');
+const logLine = (msg) => {
+  try { appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`); } catch {}
+};
+// True only if MACHINE-ARMED exists AND is fresh; a stale switch is cleared.
+const machineArmedFresh = () => {
+  if (!existsSync(MACHINE_FLAG)) return false;
+  try {
+    if (Date.now() - statSync(MACHINE_FLAG).mtimeMs > MACHINE_MAX_AGE_MS) {
+      rmSync(MACHINE_FLAG, { force: true });
+      logLine('MACHINE-ARMED ignored and cleared (stale, older than 12h)');
+      return false;
+    }
+  } catch { return false; }
+  return true;
+};
 
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // Standing-request marker: exists from the moment the user asks until disarm or
@@ -79,7 +98,9 @@ if (mode === 'toggle') {
 // Stop-hook mode.
 let input = {};
 try {
-  input = JSON.parse(readFileSync(0, 'utf8'));
+  // Strip a leading UTF-8 BOM if some upstream added one, else JSON.parse throws
+  // and the hook silently disarms the turn (QA F8).
+  input = JSON.parse(readFileSync(0, 'utf8').replace(/^﻿/, ''));
 } catch {
   process.exit(0);
 }
@@ -88,7 +109,8 @@ if (!id || !existsSync(flagPath(id))) {
   // Machine-wide switch: no file heuristic can know whether a session is truly
   // finished (background shells, pending wakeups), so wake the model at turn-end
   // and let it judge; it arms the real per-session flag when everything is done.
-  if (existsSync(MACHINE_FLAG) && !input.stop_hook_active) {
+  if (machineArmedFresh() && !input.stop_hook_active) {
+    logLine(`MACHINE-ARMED wake sent to session ${id ?? '(none)'}`);
     emit({
       decision: 'block',
       reason:
@@ -133,8 +155,10 @@ const res = spawnSync(
   { stdio: 'pipe' },
 );
 if (res.status === 0) {
+  logLine(`SHUTDOWN started (${GRACE_SECONDS}s grace) for session ${id}`);
   emit({ systemMessage: `Chat done: PC shutting down in ${GRACE_SECONDS} seconds. Abort with: shutdown -a` });
 } else {
   const err = (res.stderr ?? '').toString().trim() || (res.error ? String(res.error) : 'unknown error');
+  logLine(`SHUTDOWN failed for session ${id}: ${err}`);
   emit({ systemMessage: `Shutdown-on-done: failed to start shutdown (${err}).` });
 }

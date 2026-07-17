@@ -40,6 +40,12 @@ function Write-Utf8Bom([string]$path, [string]$text) {
     $enc = New-Object System.Text.UTF8Encoding($true)
     [IO.File]::WriteAllText($path, $text, $enc)
 }
+# settings.json must be plain UTF-8 (no BOM): a leading BOM breaks strict JSON
+# readers. PS 5.1 reads the .ps1 fine either way, so only JSON files use this.
+function Write-Utf8NoBom([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($path, $text, $enc)
+}
 
 function Stop-Panel {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
@@ -56,7 +62,7 @@ function Get-Settings {
 }
 function Save-Settings($obj) {
     if (Test-Path $settingsPath) { Copy-Item $settingsPath "$settingsPath.bak" -Force }
-    Write-Utf8Bom $settingsPath ($obj | ConvertTo-Json -Depth 20)
+    Write-Utf8NoBom $settingsPath ($obj | ConvertTo-Json -Depth 20)
 }
 function Ensure-HookArray($settings, [string]$event) {
     if (-not $settings.PSObject.Properties['hooks']) { $settings | Add-Member hooks (New-Object psobject) -Force }
@@ -158,8 +164,13 @@ if (-not (Hook-Exists $settings 'UserPromptSubmit' 'active-session.json')) {
     Write-Host "  + Added UserPromptSubmit hook (tracks which chat is active - no side effects)." -ForegroundColor DarkGray
 }
 
-# 6) OPTIONAL shutdown feature - opt-in only, loudly disclosed
+# 6) OPTIONAL shutdown feature - opt-in only, loudly disclosed.
+# On -Update, refresh the engine + skill if the feature is already installed (H4).
 $wantShutdown = $Shutdown
+if ($Update -and (Test-Path (Join-Path $claudeDir 'hooks\shutdown-on-done.mjs'))) {
+    $wantShutdown = $true
+    Write-Host "  Refreshing the already-installed shutdown-on-done engine." -ForegroundColor DarkGray
+}
 if (-not $Shutdown -and -not $Update) {
     Write-Host ""
     Write-Host "Optional feature: 'Shutdown on done' (requires Node.js)." -ForegroundColor Yellow
@@ -183,7 +194,7 @@ if ($wantShutdown) {
         $tpl = Get-Content (Join-Path $src 'skills-optional\shutdown-on-done\SKILL.md') -Raw -Encoding UTF8
         Write-Utf8Bom (Join-Path $dst 'SKILL.md') ($tpl -replace '\{\{SCRIPT\}\}', $scriptFwd)
         # Settings: migrate off the legacy hook, add engine hook + the allow rules the
-        # agent needs to arm the shutdown unattended
+        # agent needs to run the shutdown flow unattended.
         $settings = Get-Settings
         Remove-Hook $settings 'Stop' 'close-pc-on-done.flag'   # legacy v1 hook, superseded
         if (-not (Hook-Exists $settings 'Stop' 'shutdown-on-done.mjs')) {
@@ -191,8 +202,13 @@ if ($wantShutdown) {
             $grp = [pscustomobject]@{ hooks = @([pscustomobject]@{ type='command'; command="node `"$scriptFwd`""; timeout=15 }) }
             $settings.hooks.Stop = @($settings.hooks.Stop) + $grp
         }
-        Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle *)"
-        Ensure-AllowRule $settings "Bash(node $scriptFwd toggle *)"
+        # H1: scope the allow-rules to the exact subcommands the skill runs instead of a
+        # blanket `toggle *` wildcard (which pre-authorized any future/unexpected subcommand).
+        Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
+        foreach ($verb in @('request-on', 'request-off', 'on --this-turn', 'off', 'status')) {
+            Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
+            Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
+        }
         Save-Settings $settings
         # Legacy skills out (superseded by /shutdown-on-done)
         foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
@@ -234,9 +250,16 @@ if ($wantAuto) {
     Write-Host "  + Autostart shortcut created." -ForegroundColor DarkGray
 }
 
-# 8) Verify + launch
+# 8) Verify + launch. M4: the smoke test must actually gate - only launch and
+# report success if it prints SMOKE-OK.
 $smoke = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir $panelName) -SmokeTest 2>&1
 Write-Host "  $smoke" -ForegroundColor DarkGray
+if ("$smoke" -notmatch 'SMOKE-OK') {
+    Write-Host ""
+    Write-Host "Install verification FAILED - the panel did not load cleanly (no SMOKE-OK above)." -ForegroundColor Red
+    Write-Host "Files are in place but the panel was NOT started. Check the output above and %LOCALAPPDATA%\claude-buttons.log." -ForegroundColor Red
+    exit 1
+}
 Start-Process wscript.exe -ArgumentList "`"$(Join-Path $InstallDir 'Launch.vbs')`""
 
 Write-Host ""
