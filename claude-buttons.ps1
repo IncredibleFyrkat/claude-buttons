@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.5.0'
+$CB_VERSION = '1.5.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -293,12 +293,12 @@ if (-not $script:config) {
         $script:config = [pscustomobject]@{ schemaVersion = 1; buttons = @() }
     }
     if ($null -eq $script:config.buttons) { $script:config | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
-    # Force the tick's mtime check to reload: if this fallback was a transient lock, the real
-    # buttons.json (unchanged mtime) must still be picked up on the next successful read.
-    $script:cfgFallback = $true
+    # If this was a transient lock, keep retrying the real file (unchanged mtime) for a short
+    # window so it self-heals; after that, stop hammering (a permanently bad file would otherwise
+    # burn ~360ms on every 200ms tick). A later real edit changes the mtime and reloads normally.
+    $script:cfgHealUntil = (Get-Date).AddSeconds(5)
 }
 try { $script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc } catch { $script:cfgTime = Get-Date '2000-01-01' }
-if ($script:cfgFallback) { $script:cfgTime = Get-Date '2000-01-01' }
 $script:activeSession = ''
 $script:activeTime = $null
 $script:activeTs = $null        # timestamp from the hook (UTC)
@@ -389,10 +389,13 @@ function L([string]$k) { $script:strings[$script:lang][$k] }
 
 # Save ONLY the panel's own fields - merge against a fresh file so /pin edits are never overwritten
 function Save-PanelState {
-    # M7: only release a mutex we actually acquired. WaitOne can time out (returns $false)
-    # if another process holds the config lock; releasing then would throw.
+    # M7: only release a mutex we actually acquired. WaitOne returns $false on timeout (releasing
+    # then would throw). AbandonedMutexException is thrown WHILE granting ownership (a prior holder
+    # died without releasing) - we DO own it in that case, so treat it as held.
     $held = $false
-    try { $held = $script:cfgLock.WaitOne(2000) } catch { $held = $false }
+    try { $held = $script:cfgLock.WaitOne(2000) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    catch { $held = $false }
     if (-not $held) { Write-CkLog 'Config lock busy - skipped panel-state save'; return }
     try {
         $fresh = Read-FreshConfig
@@ -416,7 +419,9 @@ function Save-PanelState {
 # Transform the buttons array against a FRESH file (merge, don't overwrite) and update memory
 function Update-Buttons([scriptblock]$transform) {
     $held = $false
-    try { $held = $script:cfgLock.WaitOne(2000) } catch { $held = $false }
+    try { $held = $script:cfgLock.WaitOne(2000) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    catch { $held = $false }
     if (-not $held) { Write-CkLog 'Config lock busy - button change not saved'; return $false }
     try {
         $fresh = Read-FreshConfig
@@ -1247,6 +1252,17 @@ function Get-ToggleState($item) {
     return ($script:toggleState[(Get-ButtonKey $item)] -eq $true)
 }
 
+# Commit a toggle's on/off state to memory + every clone across all strips. Called immediately
+# before the actual send so an aborted click never flips state (H7 - no residual desync window).
+function Set-ToggleFace($item, [bool]$on) {
+    $script:toggleState[(Get-ButtonKey $item)] = $on
+    foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+        foreach ($c in $pnl.Controls) {
+            if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $on }
+        }
+    }
+}
+
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
     if ($script:moveMode) { return }  # the drop click must never fire a button
@@ -1284,36 +1300,34 @@ function Invoke-PillClick($btn) {
         try {
             Start-Sleep -Milliseconds 150
             if (-not (Test-TargetForeground)) { return }   # focus moved - abort BEFORE any state change
-            # Now that we know we're acting, commit the optimistic toggle flip (stateGlob poll
-            # corrects vs the filesystem within ~1s; non-stateGlob toggles keep this local state).
-            if ($isToggle) {
-                $script:toggleState[(Get-ButtonKey $item)] = $newOn
-                foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
-                    foreach ($c in $pnl.Controls) {
-                        if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $newOn }
-                    }
-                }
-                if ([string]::IsNullOrEmpty($textToSend)) { return }  # off with no textOff: flip only, nothing typed
-            }
+            # Toggle with nothing to send (off, no textOff): flip only, we're foreground.
+            if ($isToggle -and [string]::IsNullOrEmpty($textToSend)) { Set-ToggleFace $item $newOn; return }
+
             if ($textToSend.Length -gt 80 -or $textToSend -match "`n") {
                 # Long/multiline prompts: paste atomically via clipboard (fast, no typing race).
-                # M1: preserve the FULL prior clipboard (images/files too), not just text.
-                $backup = $null
+                # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
+                # it clobbered, and restore in finally so it's restored even on an exception.
+                if (-not (Test-TargetForeground)) { return }
+                if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
+                $backup = $null; $snapOk = $false
                 try {
                     $old = [System.Windows.Forms.Clipboard]::GetDataObject()
-                    if ($old) {
-                        $backup = New-Object System.Windows.Forms.DataObject
-                        foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} }
-                    }
-                } catch {}
-                [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
-                if (-not (Test-TargetForeground)) { return }   # M2: re-check right before paste
-                [System.Windows.Forms.SendKeys]::SendWait('^v')
-                Start-Sleep -Milliseconds 300
-                if ($backup) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
-                else { try { [System.Windows.Forms.Clipboard]::Clear() } catch {} }
+                    $backup = New-Object System.Windows.Forms.DataObject
+                    if ($old) { foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} } }
+                    $snapOk = $true   # empty snapshot = "was empty"; restoring it re-empties correctly
+                } catch { $snapOk = $false }
+                try {
+                    [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                    [System.Windows.Forms.SendKeys]::SendWait('^v')
+                    Start-Sleep -Milliseconds 300
+                } finally {
+                    # M1: always restore the full prior clipboard. If the snapshot itself failed we
+                    # leave our text rather than guess (can't safely reconstruct unknown content).
+                    if ($snapOk) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
+                }
             } else {
                 if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
+                if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
                 [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             }
             # Per-chat buttons never auto-send: the user must see the text before Enter
@@ -1510,13 +1524,16 @@ $timer.add_Tick({
             }
         }
 
-        # Reload buttons.json on change (e.g. /pin)
+        # Reload buttons.json on change (e.g. /pin), or keep retrying during the self-heal window
+        # after a startup fallback (real file may be unchanged after a transient lock).
         $wt = (Get-Item $configPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
         $dirty = $false
-        if ($wt -and $wt -ne $script:cfgTime) {
+        $healing = $script:cfgHealUntil -and ((Get-Date) -lt $script:cfgHealUntil)
+        if ($wt -and ($wt -ne $script:cfgTime -or $healing)) {
             $ny = Read-FreshConfig
-            if ($ny) { $script:config = $ny; $script:cfgTime = $wt; $dirty = $true }
+            if ($ny) { $script:config = $ny; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true }
         }
+        if ($script:cfgHealUntil -and (Get-Date) -ge $script:cfgHealUntil) { $script:cfgHealUntil = $null }  # give up healing
         if (Read-ActiveSession) { $dirty = $true }
         # Hide chat buttons when the "active chat" signal is older than 10 min
         $exp = $false

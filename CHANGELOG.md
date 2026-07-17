@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.1 — 2026-07-17
+
+Fixes for regressions the adversarial verification panel found in the 1.4.3–1.5.0 changes:
+
+- **Clipboard clobber fixed.** The long/multiline paste checked the foreground *after* it had
+  already overwritten the clipboard, so an aborted paste discarded the user's clipboard. It now
+  checks foreground before touching the clipboard and restores in a `finally`.
+- **Toggle desync window closed.** The on/off flip now happens immediately before each actual
+  send (after the per-path foreground re-check), so no abort can leave a non-`stateGlob` toggle
+  showing the wrong state.
+- **Abandoned-mutex handled.** `AbandonedMutexException` (a prior lock holder died) is now treated
+  as "acquired" so the lock is released, instead of being leaked.
+- **Config self-heal is time-bounded.** A transient startup lock still self-heals, but a
+  permanently corrupt `buttons.json` no longer makes every tick re-read the file forever.
+- **Machine-wide shutdown wake path** now emits a forward-slash script path so it matches the
+  scoped allow-rules (was a latent slash mismatch).
+
 ## 1.5.0 — 2026-07-17
 
 Technical-debt band from the 8-agent review — mostly performance:

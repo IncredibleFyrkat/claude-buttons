@@ -19,7 +19,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SELF = fileURLToPath(import.meta.url);
+// Forward-slash form so a command built from it matches the installer's allow-rules
+// (which use forward slashes); Node/Windows accept either in a path.
+const SELF = fileURLToPath(import.meta.url).replace(/\\/g, '/');
 const FLAG_DIR = join(homedir(), '.claude', 'shutdown-on-done');
 // Machine-wide switch: create/delete a MACHINE-ARMED file in FLAG_DIR from any
 // external trigger (e.g. a physical/custom button) to use completion-judged mode.
