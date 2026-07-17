@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.3.2'
+$CB_VERSION = '1.3.3'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -655,7 +655,10 @@ function Update-UiaInfo {
         [void][CkWin]::GetWindowRect($script:target, [ref]$wr)
         $grpType = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
 
-        $prevSig = ($script:panes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.Title),$($_.RowCenter)" }) -join '|'
+        # Two signatures: CONTENT (which buttons each strip shows) vs GEOMETRY (where they sit).
+        # Only a content change rebuilds buttons; geometry changes just reposition (no flicker).
+        $prevContentSig = "$($script:panes.Count)|" + (($script:panes | ForEach-Object { $_.Title }) -join '|')
+        $prevGeoSig = ($script:panes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.RowCenter)" }) -join '|'
 
         $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
 
@@ -698,11 +701,16 @@ function Update-UiaInfo {
             if ($null -ne $script:uiaTitle) { $script:uiaTitle = $null; $script:uiaDirty = $true }
         }
 
-        # Back off polling once geometry is stable; any pane change resumes fast polling
-        $newSig = ($newPanes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.Title),$($_.RowCenter)" }) -join '|'
-        if ($newSig -eq $prevSig) {
+        # Rebuild buttons ONLY when content changes (pane count or a pane's chat title).
+        # Geometry drift (dragging, resizing) must NOT rebuild - the tick repositions instead.
+        $newContentSig = "$($newPanes.Count)|" + (($newPanes | ForEach-Object { $_.Title }) -join '|')
+        if ($newContentSig -ne $prevContentSig) { $script:uiaDirty = $true }
+
+        # Back off polling once geometry is fully stable; any change resumes fast polling
+        $newGeoSig = ($newPanes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.RowCenter)" }) -join '|'
+        if ($newGeoSig -eq $prevGeoSig -and $newContentSig -eq $prevContentSig) {
             if ($script:uiaStable -lt 6) { $script:uiaStable++ }
-        } else { $script:uiaStable = 0; $script:uiaDirty = $true }
+        } else { $script:uiaStable = 0 }
         $script:uiaInterval = if ($script:uiaStable -ge 6) { 5000 } else { 1500 }
     } catch {
         if ($null -ne $script:uiaTitle) { $script:uiaDirty = $true }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.3 — 2026-07-17
+
+- **Fix: strips reloaded on every pane while dragging a chat in/around.** Pane geometry and
+  pane content are now tracked separately — moving or resizing panes only repositions the
+  strips; buttons are rebuilt only when a pane is added/removed or a pane's chat changes. No
+  more flicker across all panes during a drag.
+
 ## 1.3.2 — 2026-07-17
 
 - **Fix: `/pin` wrote to the wrong file.** The panel rewrote the skills' path marker on every
