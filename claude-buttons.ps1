@@ -10,6 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
+$CB_VERSION = '1.2.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -849,6 +850,9 @@ $subDa.add_Click({ Set-CkLang 'da' })
 [void]$gripMenu.Items.Add('-')
 $miClose = $gripMenu.Items.Add('Close panel')
 $miClose.add_Click({ $form.Close() })
+[void]$gripMenu.Items.Add('-')
+$miVer = $gripMenu.Items.Add("Claude Buttons v$CB_VERSION")
+$miVer.Enabled = $false
 $grip.ContextMenuStrip = $gripMenu
 # Open the grip menu on left-click too (the grip looks clickable)
 $grip.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($grip, $_.Location) } })
@@ -1369,7 +1373,7 @@ $timer.add_Tick({
 $form.add_FormClosing({ Save-PanelState })
 
 if ($SmokeTest) {
-    Write-Output "SMOKE-OK: $($panel.Controls.Count - 1) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
+    Write-Output "SMOKE-OK v$CB_VERSION`: $($panel.Controls.Count - 1) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
     exit 0
 }
 
