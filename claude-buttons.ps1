@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.4.0'
+$CB_VERSION = '1.4.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -170,6 +170,13 @@ public class CkWin {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
+
+    // Dark title bar for dialog windows (DWMWA_USE_IMMERSIVE_DARK_MODE = 20, or 19 on older Win10)
+    public static void DarkTitle(IntPtr h) {
+        int on = 1;
+        try { if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); } catch {}
+    }
 
     // Per-window DPI scale (1.0 = 96 dpi). Falls back to 1.0 on older Windows.
     public static double WindowScale(IntPtr h) {
@@ -424,6 +431,46 @@ $script:iconMap = @{
     'calendar'='E787'; 'phone'='E717'; 'broom'='EA99'; 'terminal'='E756'; 'shield'='EA18'
     'copy'='E8C8'; 'link'='E71B'
 }
+# Dark single-line input dialog (replaces the plain white VB InputBox). Returns $null on cancel.
+function Show-InputDialog([string]$title, [string]$message, [string]$default) {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $title
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterScreen'; $dlg.TopMost = $true
+    $dlg.BackColor = [System.Drawing.Color]::FromArgb(40, 39, 37)
+    $dlg.ClientSize = New-Object System.Drawing.Size((S 420), (S 122))
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $message
+    $lbl.ForeColor = [System.Drawing.Color]::FromArgb(214, 210, 202)
+    $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $lbl.Location = New-Object System.Drawing.Point((S 12), (S 12))
+    $lbl.AutoSize = $true; $lbl.MaximumSize = New-Object System.Drawing.Size((S 396), 0)
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Text = $default
+    $tb.BackColor = [System.Drawing.Color]::FromArgb(30, 29, 28)
+    $tb.ForeColor = [System.Drawing.Color]::FromArgb(220, 216, 208)
+    $tb.BorderStyle = 'FixedSingle'
+    $tb.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $tb.Location = New-Object System.Drawing.Point((S 12), (S 52))
+    $tb.Size = New-Object System.Drawing.Size((S 396), (S 24))
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = L 'dlgOk'; $ok.DialogResult = 'OK'
+    $ok.FlatStyle = 'Flat'; $ok.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56); $ok.ForeColor = $tb.ForeColor
+    $ok.Location = New-Object System.Drawing.Point((S 230), (S 86)); $ok.Size = New-Object System.Drawing.Size((S 85), (S 28))
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
+    $cancel.FlatStyle = 'Flat'; $cancel.BackColor = $ok.BackColor; $cancel.ForeColor = $tb.ForeColor
+    $cancel.Location = New-Object System.Drawing.Point((S 323), (S 86)); $cancel.Size = New-Object System.Drawing.Size((S 85), (S 28))
+    $dlg.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); $this.Activate(); $this.BringToFront(); $tb.SelectAll(); $tb.Focus() })
+    $res = $dlg.ShowDialog()
+    $out = if ($res -eq 'OK') { $tb.Text } else { $null }
+    $dlg.Dispose()
+    return $out
+}
+
 # Dark multiline text dialog (for long standard prompts). Returns $null on cancel.
 function Show-TextDialog([string]$title, [string]$message, [string]$default) {
     $dlg = New-Object System.Windows.Forms.Form
@@ -462,7 +509,7 @@ function Show-TextDialog([string]$title, [string]$message, [string]$default) {
     $dlg.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
     $dlg.AcceptButton = $null   # Enter inserts a newline in the textbox; click OK to accept
     $dlg.CancelButton = $cancel
-    $dlg.add_Shown({ $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $tb.Text } else { $null }
     $dlg.Dispose()
@@ -524,7 +571,7 @@ function Show-IconPicker([string]$current) {
     $dlg.CancelButton = $cancel
     # Make sure the dialog appears in front and takes focus (the panel window never activates,
     # so a child dialog can otherwise open behind and block the panel modally out of sight).
-    $dlg.add_Shown({ $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
     $dlg.Dispose()
@@ -963,9 +1010,9 @@ function Fill-PinScope($sub, [bool]$isGlobal) {
         $g = [bool]$this.Tag
         $txt = Show-TextDialog (L 'pinTitle') (L 'askText') ''
         if ([string]::IsNullOrWhiteSpace($txt)) { return }
-        Add-Type -AssemblyName Microsoft.VisualBasic
         $suggest = ($txt -split "`n")[0].Trim(); if ($suggest.Length -gt 30) { $suggest = $suggest.Substring(0, 30) }
-        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $suggest)
+        $lbl = Show-InputDialog (L 'pinTitle') (L 'askLabel') $suggest
+        if ($null -eq $lbl) { return }   # cancelled
         if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $suggest }
         Add-PinnedButton @{ text = $txt.Trim(); label = $lbl.Trim(); short = $null } $g
     })
@@ -1093,8 +1140,7 @@ $miRename.add_Click({
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
-        Add-Type -AssemblyName Microsoft.VisualBasic
-        $ny = [Microsoft.VisualBasic.Interaction]::InputBox((L 'renameAsk'), (L 'renameTitle'), [string]$t.label)
+        $ny = Show-InputDialog (L 'renameTitle') (L 'renameAsk') ([string]$t.label)
         if ([string]::IsNullOrWhiteSpace($ny)) { return }
         if (Update-Buttons { param($btns) foreach ($b in $btns) { if (Same-Button $b $t) { $b.label = $ny } }; $btns }) {
             Rebuild-Buttons

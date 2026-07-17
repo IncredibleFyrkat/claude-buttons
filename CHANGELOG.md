@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — 2026-07-17
+
+- **Dark dialogs.** The "type your own command" and rename flows used the plain white Windows
+  `InputBox`. Replaced with a dark themed single-line dialog, and gave all dialogs (icon picker,
+  prompt editor, input) a dark title bar via DWM. No more white boxes.
+
 ## 1.4.0 — 2026-07-17
 
 - **Reworked the pin menu.** *Pin new button* now has two submenus — **Only this chat** and
