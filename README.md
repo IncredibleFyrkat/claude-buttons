@@ -6,7 +6,7 @@ commands as one-click buttons — globally or scoped to a specific chat.
 
 *(Dansk vejledning: se [README.da.md](README.da.md).)*
 
-![placeholder — add a screenshot of the strip in the Claude bottom bar](docs/screenshot.png)
+![The Claude Buttons strip docked in the Claude desktop app's bottom bar, showing Code review, Simplify and Continue pills next to the app's own controls](docs/screenshot.png)
 
 ## Why
 
