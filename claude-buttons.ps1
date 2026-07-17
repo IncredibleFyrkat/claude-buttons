@@ -1,0 +1,1059 @@
+﻿param([switch]$SmokeTest)
+# Claude Buttons - a slim button strip that docks onto the Claude desktop app's bottom bar.
+# - Visible only when the Claude window itself is in the foreground
+# - Right-click the dot-grip for the menu (pin / position / language / close)
+# - Global buttons + buttons pinned to the currently displayed chat
+# - buttons.json auto-reloads; all writes merge against a fresh file (atomic + retry, locked)
+# - Buttons with "confirm": true require two clicks (Confirm?)
+# - Per-chat buttons never auto-send (they only insert text)
+# Errors are logged to %LOCALAPPDATA%\claude-buttons.log
+# Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
+
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# All C# in one compile (faster startup):
+# - CkDpi: per-monitor DPI awareness (set BEFORE any window is created)
+# - NoActivateForm: never takes focus, so keystrokes land in Claude
+# - PillButton/GripHandle: owner-drawn with antialiasing (smooth pill corners)
+# - CkWin: win32 helpers
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+public static class CkDpi {
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    public static void Enable() {
+        // powershell.exe's manifest may already declare system-DPI awareness, in which case
+        // these calls fail harmlessly. We compute the real scale per-window at runtime anyway.
+        try { if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) SetProcessDPIAware(); }
+        catch { try { SetProcessDPIAware(); } catch {} }
+    }
+}
+
+public class NoActivateForm : Form {
+    public NoActivateForm() { this.DoubleBuffered = true; }
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams p = base.CreateParams;
+            p.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+            return p;
+        }
+    }
+}
+
+public class PillButton : Control {
+    public Color Fill = Color.FromArgb(48, 47, 44);
+    public Color HoverFill = Color.FromArgb(60, 58, 54);
+    public Color DownFill = Color.FromArgb(70, 67, 62);
+    public Color Accent = Color.Empty; // border on per-chat buttons
+    bool hover, down;
+    public PillButton() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false);
+        Cursor = Cursors.Hand;
+    }
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { down = true; Invalidate(); } base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+    static GraphicsPath Pill(Rectangle r, int rad) {
+        int d = rad * 2;
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 90, 180);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+        p.CloseFigure();
+        return p;
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(BackColor);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var rc = new Rectangle(0, 0, Width - 1, Height - 1);
+        using (var path = Pill(rc, (Height - 1) / 2)) {
+            Color f = down ? DownFill : (hover ? HoverFill : Fill);
+            using (var b = new SolidBrush(f)) g.FillPath(b, path);
+            if (Accent != Color.Empty) using (var pen = new Pen(Accent)) g.DrawPath(pen, path);
+        }
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), ForeColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+    }
+}
+
+public class GripHandle : Control {
+    public Color DotColor = Color.FromArgb(122, 118, 110);
+    public GripHandle() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false);
+        Cursor = Cursors.Hand;
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(BackColor);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        int d = Math.Max(2, Height / 9);
+        int cx = Width / 2, cy = Height / 2, gap = d + 2;
+        using (var b = new SolidBrush(DotColor)) {
+            for (int col = -1; col <= 0; col++)
+                for (int row = -1; row <= 1; row++)
+                    g.FillEllipse(b, cx + col * gap + (gap / 2) - d, cy + row * gap - (d / 2), d, d);
+        }
+    }
+}
+
+// Dark menu theme in the app's warm colors
+public class CkColors : ProfessionalColorTable {
+    static Color bg = Color.FromArgb(40, 39, 37);
+    static Color hi = Color.FromArgb(62, 60, 56);
+    public override Color ToolStripDropDownBackground { get { return bg; } }
+    public override Color ImageMarginGradientBegin { get { return bg; } }
+    public override Color ImageMarginGradientMiddle { get { return bg; } }
+    public override Color ImageMarginGradientEnd { get { return bg; } }
+    public override Color MenuItemSelected { get { return hi; } }
+    public override Color MenuItemSelectedGradientBegin { get { return hi; } }
+    public override Color MenuItemSelectedGradientEnd { get { return hi; } }
+    public override Color MenuItemPressedGradientBegin { get { return hi; } }
+    public override Color MenuItemPressedGradientMiddle { get { return hi; } }
+    public override Color MenuItemPressedGradientEnd { get { return hi; } }
+    public override Color MenuItemBorder { get { return hi; } }
+    public override Color MenuBorder { get { return Color.FromArgb(78, 75, 70); } }
+    public override Color SeparatorDark { get { return Color.FromArgb(72, 69, 64); } }
+    public override Color SeparatorLight { get { return bg; } }
+    public override Color CheckBackground { get { return hi; } }
+    public override Color CheckSelectedBackground { get { return hi; } }
+    public override Color CheckPressedBackground { get { return hi; } }
+}
+public class CkRenderer : ToolStripProfessionalRenderer {
+    public CkRenderer() : base(new CkColors()) {}
+    // Paint the background ourselves - the color table is not always honored for open/selected items
+    protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
+        Color f = (e.Item.Selected || e.Item.Pressed) ? Color.FromArgb(62, 60, 56) : Color.FromArgb(40, 39, 37);
+        using (var b = new SolidBrush(f))
+            e.Graphics.FillRectangle(b, new Rectangle(Point.Empty, e.Item.Size));
+    }
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
+        e.TextColor = e.Item.Enabled ? Color.FromArgb(214, 210, 202) : Color.FromArgb(130, 127, 120);
+        base.OnRenderItemText(e);
+    }
+    protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) {
+        e.ArrowColor = Color.FromArgb(214, 210, 202);
+        base.OnRenderArrow(e);
+    }
+}
+
+public class CkWin {
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    delegate bool EnumProc(IntPtr h, IntPtr lp);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+
+    // Per-window DPI scale (1.0 = 96 dpi). Falls back to 1.0 on older Windows.
+    public static double WindowScale(IntPtr h) {
+        try { uint d = GetDpiForWindow(h); if (d >= 48 && d <= 960) return d / 96.0; } catch {}
+        return 0.0; // caller keeps its previous scale
+    }
+
+    public static IntPtr FindTarget(string titlePart, string procName) {
+        IntPtr found = IntPtr.Zero;
+        uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        EnumWindows((h, lp) => {
+            if (!IsWindowVisible(h)) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (pid == myPid) return true;
+            var sb = new StringBuilder(512);
+            GetWindowText(h, sb, 512);
+            if (!sb.ToString().Contains(titlePart)) return true;
+            if (!string.IsNullOrEmpty(procName)) {
+                try {
+                    string pn = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName;
+                    if (!pn.Equals(procName, StringComparison.OrdinalIgnoreCase)) return true;
+                } catch { return true; }
+            }
+            found = h; return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+"@
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+[CkDpi]::Enable()
+# Startup scale from the primary monitor; updated per-window once the target is found.
+$g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+$script:scale = $g.DpiX / 96.0
+$g.Dispose()
+$script:winScale = $script:scale   # scale of the monitor the Claude window is on
+function S([double]$v) { [int][Math]::Round($v * $script:scale) }        # control sizing (startup scale)
+function SW([double]$v) { [int][Math]::Round($v * $script:winScale) }    # positioning vs the target window
+
+# ---------- Logging ----------
+$script:logPath = Join-Path $env:LOCALAPPDATA 'claude-buttons.log'
+$script:lastLogMsg = ''
+$script:lastLogAt = Get-Date '2000-01-01'
+function Write-CkLog([string]$msg) {
+    try {
+        if ($script:lastLogMsg -eq $msg -and ((Get-Date) - $script:lastLogAt).TotalSeconds -lt 60) { return }
+        $script:lastLogMsg = $msg; $script:lastLogAt = Get-Date
+        Add-Content -Path $script:logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8
+    } catch {}
+}
+
+# ---------- Config ----------
+$configPath = Join-Path $PSScriptRoot 'buttons.json'
+$activePath = Join-Path $env:USERPROFILE '.claude\active-session.json'
+
+# Marker file so the /pin and /unpin skills know where this install keeps buttons.json,
+# without hardcoding any username or path.
+try {
+    $markerDir = Join-Path $env:USERPROFILE '.claude'
+    if (Test-Path $markerDir) {
+        Set-Content -Path (Join-Path $markerDir 'claude-buttons-path.txt') -Value $configPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+# Cross-process lock so panel writes and /pin edits never clobber each other
+$script:cfgLock = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
+
+function Read-FreshConfig {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $c = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            # Normalize: a valid JSON file missing the buttons array must not crash callers
+            if ($null -eq $c.buttons) { $c | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
+            return $c
+        }
+        catch { Start-Sleep -Milliseconds 120 }
+    }
+    Write-CkLog 'Could not read buttons.json (locked/invalid after 3 attempts)'
+    return $null
+}
+
+function Write-ConfigAtomic($cfg) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $tmp = "$configPath." + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp'
+            $cfg | ConvertTo-Json -Depth 6 | Set-Content $tmp -Encoding UTF8
+            Move-Item -Path $tmp -Destination $configPath -Force
+            $script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc
+            return $true
+        } catch { Start-Sleep -Milliseconds 150 }
+    }
+    Write-CkLog 'Could not write buttons.json (3 attempts)'
+    return $false
+}
+
+$script:config = Read-FreshConfig
+if (-not $script:config) { throw 'buttons.json could not be read' }
+$script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc
+$script:activeSession = ''
+$script:activeTime = $null
+$script:activeTs = $null        # timestamp from the hook (UTC)
+$script:activeExpired = $false  # signal older than 10 min -> hide chat buttons
+
+$targetTitle = 'Claude'
+if ($script:config.targetTitle) { $targetTitle = [string]$script:config.targetTitle }
+$targetProcess = 'claude'
+if ($null -ne $script:config.targetProcess) { $targetProcess = [string]$script:config.targetProcess }
+
+# App-dependent names/measures - editable in buttons.json without code changes if the app updates
+$script:uiaPaneName = 'Primary pane'    # accessibility name of the chat area
+if ($script:config.uiaPaneName) { $script:uiaPaneName = [string]$script:config.uiaPaneName }
+$script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
+if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
+$script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
+if ($script:config.zoneTop) { $script:zoneTop = [int]$script:config.zoneTop }
+$script:zoneBottom = 55                 # height of the bottom zone holding the app's own buttons
+if ($script:config.zoneBottom) { $script:zoneBottom = [int]$script:config.zoneBottom }
+$script:fallbackRow = 33                # fallback: strip center above the window bottom
+if ($script:config.fallbackRow) { $script:fallbackRow = [int]$script:config.fallbackRow }
+$script:stripGap = 10                   # gap between the app's buttons and the strip
+if ($script:config.stripGap) { $script:stripGap = [int]$script:config.stripGap }
+$script:reservedW = 380                 # width reserved for the app's own bar elements (compact threshold)
+if ($script:config.reservedW) { $script:reservedW = [int]$script:config.reservedW }
+$script:relX = 0.0
+if ($null -ne $script:config.relX) { $script:relX = [double]$script:config.relX }
+
+# ---------- Language (default: English; switch in the grip menu) ----------
+$script:lang = 'en'
+if ($script:config.lang) { $script:lang = [string]$script:config.lang }
+$script:strings = @{
+    en = @{
+        rename = 'Rename...'; moveLeft = 'Move left'; moveRight = 'Move right'; remove = 'Remove this button'
+        pinNew = 'Pin new button'; custom = 'Other: type your own...'; onlyChat = 'Only this chat'; globalScope = 'Global (all chats)'
+        closePanel = 'Close panel'; language = 'Language'
+        confirm = 'Confirm?'; gripTip = 'Right-click: menu'
+        position = 'Position'; posLeft = 'Left'; posCenter = 'Center'; posRight = 'Right'
+        nudgeL = 'Nudge left'; nudgeR = 'Nudge right'
+        pinScopeChat = 'Pin to: only this chat'; pinScopeGlobal = 'Pin to: global (all chats)'
+        dupPin = 'That command is already pinned in this scope.'
+        tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
+        tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
+        noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
+        pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
+        askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
+        firstRun = 'Right-click the dots to add buttons'
+    }
+    da = @{
+        rename = 'Omdøb…'; moveLeft = 'Flyt til venstre'; moveRight = 'Flyt til højre'; remove = 'Fjern denne knap'
+        pinNew = 'Pin ny knap'; custom = 'Andet: skriv selv…'; onlyChat = 'Kun denne chat'; globalScope = 'Global (alle chats)'
+        closePanel = 'Luk panelet'; language = 'Sprog'
+        confirm = 'Bekræft?'; gripTip = 'Højreklik: menu'
+        position = 'Position'; posLeft = 'Venstre'; posCenter = 'Centreret'; posRight = 'Højre'
+        nudgeL = 'Skub til venstre'; nudgeR = 'Skub til højre'
+        pinScopeChat = 'Pin til: kun denne chat'; pinScopeGlobal = 'Pin til: global (alle chats)'
+        dupPin = 'Kommandoen er allerede pinnet i dette scope.'
+        tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
+        tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
+        noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
+        pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
+        askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
+        firstRun = 'Højreklik på prikkerne for at tilføje knapper'
+    }
+}
+function L([string]$k) { $script:strings[$script:lang][$k] }
+$script:pinScope = 'chat'  # default scope for the pin menu
+
+# Save ONLY the panel's own fields - merge against a fresh file so /pin edits are never overwritten
+function Save-PanelState {
+    [void]$script:cfgLock.WaitOne(2000)
+    try {
+        $fresh = Read-FreshConfig
+        if (-not $fresh) { return }
+        $fresh | Add-Member -NotePropertyName schemaVersion -NotePropertyValue 1 -Force
+        $fresh | Add-Member -NotePropertyName targetTitle -NotePropertyValue $targetTitle -Force
+        $fresh | Add-Member -NotePropertyName targetProcess -NotePropertyValue $targetProcess -Force
+        $fresh | Add-Member -NotePropertyName lang -NotePropertyValue $script:lang -Force
+        $fresh | Add-Member -NotePropertyName relX -NotePropertyValue ([Math]::Round($script:relX, 4)) -Force
+        foreach ($legacy in @('x', 'y', 'offsetX', 'offsetY', 'offsetBottom')) { $fresh.PSObject.Properties.Remove($legacy) }
+        [void](Write-ConfigAtomic $fresh)
+    } finally { [void]$script:cfgLock.ReleaseMutex() }
+}
+
+# Transform the buttons array against a FRESH file (merge, don't overwrite) and update memory
+function Update-Buttons([scriptblock]$transform) {
+    [void]$script:cfgLock.WaitOne(2000)
+    try {
+        $fresh = Read-FreshConfig
+        if (-not $fresh) { return $false }
+        $fresh.buttons = @(& $transform @($fresh.buttons))
+        if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
+        return $false
+    } finally { [void]$script:cfgLock.ReleaseMutex() }
+}
+
+function Same-Button($a, $b) {
+    ($a.label -eq $b.label) -and ($a.text -eq $b.text) -and ([string]$a.chat -eq [string]$b.chat)
+}
+
+# ---------- Text helpers ----------
+$script:btnFont = New-Object System.Drawing.Font('Segoe UI', 8.5)
+$script:compact = $false
+$script:padX = S(10)
+
+function Escape-SendKeys([string]$s) {
+    $s = $s -replace "`r`n", "`n" -replace "`r", "`n"
+    $out = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        if ($ch -eq "`n") { [void]$out.Append('+{ENTER}') }  # Shift+Enter = newline without sending
+        elseif ('+^%~(){}[]'.Contains([string]$ch)) { [void]$out.Append('{' + $ch + '}') }
+        else { [void]$out.Append($ch) }
+    }
+    $out.ToString()
+}
+
+function Get-ShortLabel($b) {
+    if ($b.short) { return [string]$b.short }
+    $l = [string]$b.label
+    $first = ($l -split ' ')[0]
+    if ($first.Length -le 8) { return $first }
+    return $l.Substring(0, 8) + [char]0x2026
+}
+
+function Get-DisplayLabel($b) {
+    if ($script:compact) { Get-ShortLabel $b } else { [string]$b.label }
+}
+
+function Get-PillWidth([string]$label) {
+    ([System.Windows.Forms.TextRenderer]::MeasureText($label, $script:btnFont)).Width + 2 * $script:padX
+}
+
+# Same formula Rebuild-Buttons uses, so the compact switch triggers precisely
+function Get-StripWidth([bool]$useShort) {
+    $total = (S 14) + 4 * (S 2) + (S 8)  # grip + panel padding + safety margin
+    foreach ($b in $script:config.buttons) {
+        if (-not (Test-ChatButtonVisible $b)) { continue }
+        $label = if ($useShort) { Get-ShortLabel $b } else { [string]$b.label }
+        $total += (Get-PillWidth $label) + 2 * (S 2)
+    }
+    return $total
+}
+
+function Read-ActiveSession {
+    try {
+        $item = Get-Item $activePath -ErrorAction SilentlyContinue
+        if (-not $item) { return $false }
+        if ($item.LastWriteTimeUtc -eq $script:activeTime) { return $false }
+        $data = Get-Content $activePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:activeTime = $item.LastWriteTimeUtc
+        try { $script:activeTs = [DateTime]::Parse([string]$data.ts).ToUniversalTime() } catch { $script:activeTs = $item.LastWriteTimeUtc }
+        if ($data.session_id -and $data.session_id -ne $script:activeSession) {
+            $script:activeSession = [string]$data.session_id
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+# ---------- UIA: read the displayed chat + chat-area geometry from the app's own UI ----------
+$script:uiaTitle = $null      # title of the chat shown right now (from the tab at the top)
+$script:paneRect = $null      # chat area (Primary pane) relative to the window
+$script:rowCenterOff = $null  # bottom buttons' vertical center, measured from window bottom
+$script:leftEdgeOff = $null   # right edge of the app's left button cluster, from window left
+$script:uiaDirty = $false
+$script:uiaLast = Get-Date '2000-01-01'
+$script:uiaInterval = 1500    # ms between UIA passes; backs off once geometry is stable
+$script:uiaStable = 0
+
+function Update-UiaInfo {
+    if (((Get-Date) - $script:uiaLast).TotalMilliseconds -lt $script:uiaInterval) { return }
+    $script:uiaLast = Get-Date
+    try {
+        if ($script:target -eq [IntPtr]::Zero) { throw 'no window' }
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($script:target)
+        $wr = New-Object CkWin+RECT
+        [void][CkWin]::GetWindowRect($script:target, [ref]$wr)
+        $grpType = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
+
+        $prevRow = $script:rowCenterOff; $prevLeft = $script:leftEdgeOff
+
+        # Strategy 1: chat area via named pane (name configurable in buttons.json)
+        $paneCond = New-Object System.Windows.Automation.AndCondition($grpType,
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaPaneName)))
+        $pane = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $paneCond)
+        $searchRoot = $root
+        $paneTop = $null
+        if ($pane) {
+            $pr = $pane.Current.BoundingRectangle
+            $script:paneRect = @{ OffL = [int]($pr.X - $wr.Left); Width = [int]$pr.Width }
+            $searchRoot = $pane
+            $paneTop = $pr.Y
+        } else {
+            # Strategy 2: derive the chat area as window minus sidebar
+            $sbCond = New-Object System.Windows.Automation.AndCondition($grpType,
+                (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaSidebarName)))
+            $sb = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $sbCond)
+            if ($sb) {
+                $sr = $sb.Current.BoundingRectangle
+                $script:paneRect = @{ OffL = [int]($sr.X + $sr.Width - $wr.Left); Width = [int]($wr.Right - ($sr.X + $sr.Width)) }
+            } else {
+                $script:paneRect = $null
+            }
+            Write-CkLog "UIA: '$($script:uiaPaneName)' not found - the app may have updated (running on fallback). Adjust uiaPaneName in buttons.json."
+        }
+
+        $areaOffL = 0; $areaW = [int]($wr.Right - $wr.Left)
+        if ($script:paneRect) { $areaOffL = $script:paneRect.OffL; $areaW = $script:paneRect.Width }
+
+        $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+        $btns = $searchRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+
+        # The displayed chat's title = the leftmost button in the pane's top bar (requires the pane)
+        $t = $null
+        if ($null -ne $paneTop) {
+            $best = $null; $bestX = [double]::MaxValue
+            foreach ($b in $btns) {
+                $br = $b.Current.BoundingRectangle
+                if ($br.Y -ge $paneTop -and $br.Y -lt ($paneTop + (SW $script:zoneTop)) -and $br.X -lt $bestX -and $b.Current.Name) { $best = $b; $bestX = $br.X }
+            }
+            if ($best) { $t = [string]$best.Current.Name }
+        }
+        if ($t -ne $script:uiaTitle) { $script:uiaTitle = $t; $script:uiaDirty = $true }
+
+        # The bottom-bar left cluster within the chat area: precise height + left start edge
+        $sumY = 0.0; $n = 0; $rightEdge = $null
+        $chatL = $wr.Left + $areaOffL
+        foreach ($b in $btns) {
+            $br = $b.Current.BoundingRectangle
+            $cy = $br.Y + $br.Height / 2
+            if ($cy -gt ($wr.Bottom - (SW $script:zoneBottom)) -and $cy -lt $wr.Bottom -and $br.X -ge $chatL -and $br.X -lt ($chatL + $areaW / 2)) {
+                $sumY += $cy; $n++
+                $re = $br.X + $br.Width
+                if ($null -eq $rightEdge -or $re -gt $rightEdge) { $rightEdge = $re }
+            }
+        }
+        if ($n -gt 0) {
+            $script:rowCenterOff = [int]($wr.Bottom - ($sumY / $n))
+            $script:leftEdgeOff = [int]($rightEdge - $wr.Left)
+        } else {
+            $script:rowCenterOff = $null
+            $script:leftEdgeOff = $null
+        }
+
+        # Back off polling once geometry is stable; resume fast polling on any change
+        if ($script:rowCenterOff -eq $prevRow -and $script:leftEdgeOff -eq $prevLeft) {
+            if ($script:uiaStable -lt 6) { $script:uiaStable++ }
+        } else { $script:uiaStable = 0 }
+        $script:uiaInterval = if ($script:uiaStable -ge 6) { 5000 } else { 1500 }
+    } catch {
+        if ($null -ne $script:uiaTitle) { $script:uiaDirty = $true }
+        $script:uiaTitle = $null
+        $script:paneRect = $null
+        $script:rowCenterOff = $null
+        $script:leftEdgeOff = $null
+        $script:uiaInterval = 1500; $script:uiaStable = 0
+    }
+}
+
+function Test-ChatButtonVisible($b) {
+    if (-not $b.chat -and -not $b.chatTitle) { return $true }        # global
+    if ($b.chatTitle -and $script:uiaTitle) {
+        return ($b.chatTitle -eq $script:uiaTitle)                    # precise: the chat being displayed
+    }
+    if ($b.chat) {
+        if ($script:activeExpired) { return $false }                  # fallback: last chat messaged
+        return ($b.chat -eq $script:activeSession)
+    }
+    return $false
+}
+
+# ---------- Warm color palette (matches the app's dark theme) ----------
+$colBar   = [System.Drawing.Color]::FromArgb(32, 31, 30)
+$colFill  = [System.Drawing.Color]::FromArgb(48, 47, 44)
+$colHover = [System.Drawing.Color]::FromArgb(60, 58, 54)
+$colDown  = [System.Drawing.Color]::FromArgb(70, 67, 62)
+$colText  = [System.Drawing.Color]::FromArgb(214, 210, 202)
+$colGrip  = [System.Drawing.Color]::FromArgb(122, 118, 110)
+$colAccent = [System.Drawing.Color]::FromArgb(150, 110, 60)   # border on per-chat buttons
+$pillH = S(21)
+
+# ---------- UI ----------
+$form = New-Object NoActivateForm
+$form.Text = 'Claude Buttons'
+$form.TopMost = $true
+$form.FormBorderStyle = 'None'
+$form.ShowInTaskbar = $false
+$form.AutoSize = $true
+$form.AutoSizeMode = 'GrowAndShrink'
+$form.StartPosition = 'Manual'
+$form.Location = New-Object System.Drawing.Point(-4000, -4000)
+$form.Opacity = 0
+$form.BackColor = $colBar
+
+$panel = New-Object System.Windows.Forms.FlowLayoutPanel
+$panel.FlowDirection = 'LeftToRight'
+$panel.WrapContents = $false
+$panel.AutoSize = $true
+$panel.AutoSizeMode = 'GrowAndShrink'
+$panel.Padding = New-Object System.Windows.Forms.Padding((S(3)), (S(2)), (S(3)), (S(2)))
+[System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($panel, $true, $null)
+$form.Controls.Add($panel)
+
+# Dark theme on all menus (applies to the whole process)
+[System.Windows.Forms.ToolStripManager]::Renderer = New-Object CkRenderer
+
+$tip = New-Object System.Windows.Forms.ToolTip
+$tip.InitialDelay = 400
+$tip.AutoPopDelay = 8000
+
+# First-run onboarding balloon (shown once when there are no visible buttons)
+$balloon = New-Object System.Windows.Forms.ToolTip
+$balloon.IsBalloon = $true
+$script:balloonShown = $false
+
+# Grip
+$grip = New-Object GripHandle
+$grip.DotColor = $colGrip
+$grip.BackColor = $colBar
+$grip.Width = S(14)
+$grip.Height = $pillH
+$grip.Margin = New-Object System.Windows.Forms.Padding((S(2)), (S(2)), (S(2)), (S(2)))
+
+# ---------- Instant pin menu (no Claude involved) ----------
+function Get-PinCatalog {
+    $cat = if ($script:lang -eq 'da') { @(
+        @{ text = '/code-review'; label = 'Code review'; short = 'Review' },
+        @{ text = '/simplify'; label = 'Forenkl koden'; short = 'Forenkl' },
+        @{ text = '/verify'; label = 'Verificér ændring'; short = 'Verify' },
+        @{ text = 'fortsæt'; label = 'Fortsæt'; short = 'Fortsæt' }
+    ) } else { @(
+        @{ text = '/code-review'; label = 'Code review'; short = 'Review' },
+        @{ text = '/simplify'; label = 'Simplify code'; short = 'Simplify' },
+        @{ text = '/verify'; label = 'Verify change'; short = 'Verify' },
+        @{ text = 'continue'; label = 'Continue'; short = 'Cont.' }
+    ) }
+    $known = @($cat | ForEach-Object { $_.text })
+    # Your own skills under ~/.claude/skills appear in the menu automatically
+    try {
+        Get-ChildItem (Join-Path $env:USERPROFILE '.claude\skills') -Directory -ErrorAction Stop | ForEach-Object {
+            $t = "/$($_.Name)"
+            $confirm = ($_.Name -match 'close-pc|shutdown|delete|deploy')
+            if ($known -notcontains $t) { $cat += @{ text = $t; label = $_.Name; short = $null; confirm = $confirm } }
+        }
+    } catch {}
+    return $cat
+}
+
+function Add-PinnedButton($entry, [bool]$global) {
+    try {
+        $chatId = ''
+        if (-not $global) {
+            if ($script:uiaTitle) {
+                if ($script:activeSession -and -not $script:activeExpired) { $chatId = $script:activeSession }
+            } elseif ($script:activeSession -and -not $script:activeExpired) {
+                $chatId = $script:activeSession
+            } else {
+                [void][System.Windows.Forms.MessageBox]::Show((L 'noActive'), 'Claude Buttons', 'OK', 'Warning')
+                return
+            }
+        }
+        foreach ($b in $script:config.buttons) {
+            if ($b.text -eq $entry.text -and ([string]$b.chat -eq $chatId)) {
+                [void][System.Windows.Forms.MessageBox]::Show((L 'dupPin'), 'Claude Buttons', 'OK', 'Information')
+                return
+            }
+        }
+        Write-CkLog "Pinning button: label='$($entry.label)' global=$global chatScoped=$([bool]$chatId)"
+        $ny = [ordered]@{ label = [string]$entry.label; text = [string]$entry.text; submit = $true }
+        if ($entry.short) { $ny.short = [string]$entry.short }
+        if ($entry.confirm) { $ny.confirm = $true }
+        if ($chatId) { $ny.chat = $chatId }
+        if (-not $global -and $script:uiaTitle) { $ny.chatTitle = $script:uiaTitle }  # bind to the DISPLAYED chat
+        $nyObj = [pscustomobject]$ny
+        if (Update-Buttons { param($btns) @($btns) + $nyObj }) { Rebuild-Buttons }
+    } catch { Write-CkLog "Add-PinnedButton error: $($_.Exception.Message)" }
+}
+
+function Set-CkLang([string]$l) {
+    try { $script:lang = $l; Save-PanelState; Rebuild-Buttons } catch { Write-CkLog "Set-CkLang error: $($_.Exception.Message)" }
+}
+
+function Set-CkRelX([double]$v) {
+    try { $script:relX = [Math]::Max(0.0, [Math]::Min(1.0, $v)); Save-PanelState } catch { Write-CkLog "Set-CkRelX error: $($_.Exception.Message)" }
+}
+
+$gripMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$miPin = New-Object System.Windows.Forms.ToolStripMenuItem 'Pin new button'
+[void]$gripMenu.Items.Add($miPin)
+$miPos = New-Object System.Windows.Forms.ToolStripMenuItem 'Position'
+$posL = New-Object System.Windows.Forms.ToolStripMenuItem 'Left';       $posL.add_Click({ Set-CkRelX 0.03 })
+$posC = New-Object System.Windows.Forms.ToolStripMenuItem 'Center';     $posC.add_Click({ Set-CkRelX 0.5 })
+$posR = New-Object System.Windows.Forms.ToolStripMenuItem 'Right';      $posR.add_Click({ Set-CkRelX 0.97 })
+$posNL = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge left';  $posNL.add_Click({ Set-CkRelX ($script:relX - 0.05) })
+$posNR = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge right'; $posNR.add_Click({ Set-CkRelX ($script:relX + 0.05) })
+foreach ($mi in @($posL, $posC, $posR)) { [void]$miPos.DropDownItems.Add($mi) }
+[void]$miPos.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+foreach ($mi in @($posNL, $posNR)) { [void]$miPos.DropDownItems.Add($mi) }
+[void]$gripMenu.Items.Add($miPos)
+$miLang = New-Object System.Windows.Forms.ToolStripMenuItem 'Language'
+$subEn = New-Object System.Windows.Forms.ToolStripMenuItem 'English'
+$subEn.add_Click({ Set-CkLang 'en' })
+$subDa = New-Object System.Windows.Forms.ToolStripMenuItem 'Dansk'
+$subDa.add_Click({ Set-CkLang 'da' })
+[void]$miLang.DropDownItems.Add($subEn)
+[void]$miLang.DropDownItems.Add($subDa)
+[void]$gripMenu.Items.Add($miLang)
+[void]$gripMenu.Items.Add('-')
+$miClose = $gripMenu.Items.Add('Close panel')
+$miClose.add_Click({ $form.Close() })
+$grip.ContextMenuStrip = $gripMenu
+# Open the grip menu on left-click too (the grip looks clickable)
+$grip.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($grip, $_.Location) } })
+
+# Keep the menu open when clicking the scope toggles
+$script:keepMenuOpen = $false
+
+# Rebuilt fresh every time the menu opens (reflects new skills, pinned buttons and language)
+$gripMenu.add_Opening({
+    [void][CkWin]::GetAsyncKeyState(0x01); [void][CkWin]::GetAsyncKeyState(0x02)
+    $miPin.Text = L 'pinNew'
+    $miClose.Text = L 'closePanel'
+    $miLang.Text = L 'language'
+    $miPos.Text = L 'position'
+    $posL.Text = L 'posLeft'; $posC.Text = L 'posCenter'; $posR.Text = L 'posRight'
+    $posNL.Text = L 'nudgeL'; $posNR.Text = L 'nudgeR'
+    $subEn.Checked = ($script:lang -eq 'en')
+    $subDa.Checked = ($script:lang -eq 'da')
+    $miPin.DropDownItems.Clear()
+    $scChat = New-Object System.Windows.Forms.ToolStripMenuItem (L 'pinScopeChat')
+    $scChat.Checked = ($script:pinScope -ne 'global')
+    $scChat.add_Click({ $script:pinScope = 'chat'; $script:keepMenuOpen = $true })
+    $scGlob = New-Object System.Windows.Forms.ToolStripMenuItem (L 'pinScopeGlobal')
+    $scGlob.Checked = ($script:pinScope -eq 'global')
+    $scGlob.add_Click({ $script:pinScope = 'global'; $script:keepMenuOpen = $true })
+    [void]$miPin.DropDownItems.Add($scChat)
+    [void]$miPin.DropDownItems.Add($scGlob)
+    [void]$miPin.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    foreach ($entry in (Get-PinCatalog)) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem ("$($entry.label)   ($($entry.text))")
+        $mi.Tag = $entry
+        $mi.add_Click({ Add-PinnedButton $this.Tag ($script:pinScope -eq 'global') })
+        [void]$miPin.DropDownItems.Add($mi)
+    }
+    [void]$miPin.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miCustom = New-Object System.Windows.Forms.ToolStripMenuItem (L 'custom')
+    $miCustom.add_Click({
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $txt = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askText'), (L 'pinTitle'), '')
+        if ([string]::IsNullOrWhiteSpace($txt)) { return }
+        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $txt)
+        if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $txt }
+        Add-PinnedButton @{ text = $txt.Trim(); label = $lbl.Trim(); short = $null } ($script:pinScope -eq 'global')
+    })
+    [void]$miPin.DropDownItems.Add($miCustom)
+})
+# Reopen the menu after a scope-toggle click so the choice doesn't dismiss it
+$gripMenu.add_Closed({
+    if ($script:keepMenuOpen) { $script:keepMenuOpen = $false; $gripMenu.Show([System.Windows.Forms.Cursor]::Position) }
+})
+
+# No drag-and-drop: position is set via the menu, so nothing moves by accident
+$script:dragging = $false
+
+# ---------- Button context menu (capture source on right mouse-down) ----------
+$script:menuSource = $null
+$btnMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$btnMenu.add_Opening({
+    [void][CkWin]::GetAsyncKeyState(0x01); [void][CkWin]::GetAsyncKeyState(0x02)
+    if ($this.SourceControl) { $script:menuSource = $this.SourceControl }
+    $miRename.Text = L 'rename'
+    $miLeft.Text = L 'moveLeft'
+    $miRight.Text = L 'moveRight'
+    $miRemove.Text = L 'remove'
+})
+
+$miRename = $btnMenu.Items.Add('Rename...')
+$miLeft   = $btnMenu.Items.Add('Move left')
+$miRight  = $btnMenu.Items.Add('Move right')
+[void]$btnMenu.Items.Add('-')
+$miRemove = $btnMenu.Items.Add('Remove this button')
+
+$miRemove.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        if (Update-Buttons { param($btns) $btns | Where-Object { -not (Same-Button $_ $t) } }) {
+            if ($script:armedBtn -eq $src) { $script:armedBtn = $null }
+            $tip.SetToolTip($src, $null)
+            $panel.Controls.Remove($src)
+            $src.Dispose()
+            $script:menuSource = $null
+        }
+    } catch { Write-CkLog "Remove error: $($_.Exception.Message)" }
+})
+
+$miRename.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $ny = [Microsoft.VisualBasic.Interaction]::InputBox((L 'renameAsk'), (L 'renameTitle'), [string]$t.label)
+        if ([string]::IsNullOrWhiteSpace($ny)) { return }
+        if (Update-Buttons { param($btns) foreach ($b in $btns) { if (Same-Button $b $t) { $b.label = $ny } }; $btns }) {
+            Rebuild-Buttons
+        }
+    } catch { Write-CkLog "Rename error: $($_.Exception.Message)" }
+})
+
+function Move-PinButton([int]$dir) {
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $idx = $panel.Controls.IndexOf($src)
+        $nyIdx = $idx + $dir
+        if ($nyIdx -lt 1 -or $nyIdx -ge $panel.Controls.Count) { return }  # index 0 is the grip
+        $neighbor = $panel.Controls[$nyIdx].Tag
+        $t = $src.Tag
+        $ok = Update-Buttons {
+            param($btns)
+            $btns = @($btns)
+            $i1 = -1; $i2 = -1
+            for ($i = 0; $i -lt $btns.Count; $i++) {
+                if (Same-Button $btns[$i] $t) { $i1 = $i }
+                elseif (Same-Button $btns[$i] $neighbor) { $i2 = $i }
+            }
+            if ($i1 -ge 0 -and $i2 -ge 0) { $tmp = $btns[$i1]; $btns[$i1] = $btns[$i2]; $btns[$i2] = $tmp }
+            $btns
+        }
+        if ($ok) { $panel.Controls.SetChildIndex($src, $nyIdx) }
+    } catch { Write-CkLog "Move error: $($_.Exception.Message)" }
+}
+$miLeft.add_Click({ Move-PinButton -1 })
+$miRight.add_Click({ Move-PinButton 1 })
+
+# ---------- Click behavior ----------
+function Test-CursorInDropDown($dd) {
+    if (-not $dd.Visible) { return $false }
+    $p = [System.Windows.Forms.Cursor]::Position
+    if ($dd.Bounds.Contains($p)) { return $true }
+    foreach ($it in $dd.Items) {
+        if ($it -is [System.Windows.Forms.ToolStripMenuItem] -and $it.DropDown -and $it.DropDown.Visible) {
+            if (Test-CursorInDropDown $it.DropDown) { return $true }
+        }
+    }
+    return $false
+}
+
+$script:sending = $false
+$script:menuAway = 0
+$script:armedBtn = $null
+$script:armedAt = Get-Date '2000-01-01'
+
+function Test-TargetForeground {
+    [CkWin]::GetForegroundWindow() -eq $script:target
+}
+
+function Invoke-PillClick($btn) {
+    if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    try {
+        $item = $btn.Tag
+        # Two-click confirmation for destructive buttons (within 3 s)
+        if ($item.confirm) {
+            if ($script:armedBtn -ne $btn -or ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
+                if ($script:armedBtn) { $script:armedBtn.Text = (Get-DisplayLabel $script:armedBtn.Tag) }
+                $script:armedBtn = $btn
+                $script:armedAt = Get-Date
+                $btn.Text = L 'confirm'
+                $btn.Width = Get-PillWidth $btn.Text
+                return
+            }
+            $script:armedBtn = $null
+            $btn.Text = Get-DisplayLabel $item
+            $btn.Width = Get-PillWidth $btn.Text
+        }
+        $script:sending = $true
+        try {
+            Start-Sleep -Milliseconds 150
+            if (-not (Test-TargetForeground)) { return }   # focus moved - send nothing
+            [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys ([string]$item.text)))
+            # Per-chat buttons never auto-send: the user must see the text before Enter
+            if ($item.submit -and -not $item.chat) {
+                Start-Sleep -Milliseconds 400
+                if (-not (Test-TargetForeground)) { return }
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            }
+        } finally {
+            $script:sending = $false
+        }
+    } catch { $script:sending = $false; Write-CkLog "Click error: $($_.Exception.Message)" }
+}
+
+function Rebuild-Buttons {
+    $form.SuspendLayout()
+    $panel.SuspendLayout()
+    $old = @($panel.Controls | Where-Object { $_ -ne $grip })
+    foreach ($o in $old) { $tip.SetToolTip($o, $null) }  # drop tooltip registrations for disposed controls
+    $script:armedBtn = $null
+    $script:menuSource = $null
+    $panel.Controls.Clear()
+    $panel.Controls.Add($grip)
+    $tip.SetToolTip($grip, (L 'gripTip'))
+    foreach ($b in $script:config.buttons) {
+        if (-not (Test-ChatButtonVisible $b)) { continue }
+        $btn = New-Object PillButton
+        $btn.Text = Get-DisplayLabel $b
+        $btn.Tag = $b
+        $btn.Font = $script:btnFont
+        $btn.Width = Get-PillWidth $btn.Text
+        $btn.Height = $pillH
+        $btn.Margin = New-Object System.Windows.Forms.Padding((S(2)))
+        $btn.BackColor = $colBar
+        $btn.ForeColor = $colText
+        $btn.Fill = $colFill
+        $btn.HoverFill = $colHover
+        $btn.DownFill = $colDown
+        if ($b.chat) { $btn.Accent = $colAccent }
+        $btn.ContextMenuStrip = $btnMenu
+        $btn.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
+        $btn.add_Click({ Invoke-PillClick $this })
+        $scope = if ($b.chat -or $b.chatTitle) {
+            $sl = if ($b.chatTitle) { $b.chatTitle } elseif ($b.chatLabel) { $b.chatLabel } else { $null }
+            if ($sl) { (L 'tipChatIn') -f $sl } else { L 'tipChatOnly' }
+        } else { L 'tipGlobal' }
+        $enter = if ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
+        $tip.SetToolTip($btn, "$($b.text)`n$scope - $enter`n$(L 'tipRemove')")
+        $panel.Controls.Add($btn)
+    }
+    $panel.ResumeLayout()
+    $form.ResumeLayout()
+    foreach ($o in $old) { $o.Dispose() }
+}
+[void](Read-ActiveSession)
+Rebuild-Buttons
+
+# ---------- Window tracking ----------
+$script:target = [IntPtr]::Zero
+$script:targetPid = [uint32]0
+$script:autoMove = $false
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 200
+$timer.add_Tick({
+    if ($script:sending) { return }   # don't touch the UI mid-send
+    try {
+        # Close open menus when the mouse leaves them (the window never takes focus,
+        # so Windows' own click-outside dismissal is unreliable here)
+        $menusOpen = @(@($gripMenu, $btnMenu) | Where-Object { $_.Visible })
+        if ($menusOpen.Count -gt 0) {
+            $p = [System.Windows.Forms.Cursor]::Position
+            $inside = $form.Bounds.Contains($p)
+            if (-not $inside) {
+                foreach ($m in $menusOpen) { if (Test-CursorInDropDown $m) { $inside = $true; break } }
+            }
+            $click = (([CkWin]::GetAsyncKeyState(0x01) -band 0x8001) -ne 0) -or (([CkWin]::GetAsyncKeyState(0x02) -band 0x8001) -ne 0)
+            if ($inside) {
+                $script:menuAway = 0
+            } else {
+                $script:menuAway++
+                if ($click -or $script:menuAway -ge 10) {   # click outside OR ~2 s away
+                    foreach ($m in $menusOpen) { $m.Close() }
+                    $script:menuAway = 0
+                }
+            }
+        } else {
+            $script:menuAway = 0
+        }
+
+        # Reset the "Confirm?" state after 3 s
+        if ($script:armedBtn -and ((Get-Date) - $script:armedAt).TotalSeconds -gt 3) {
+            try { $script:armedBtn.Text = Get-DisplayLabel $script:armedBtn.Tag; $script:armedBtn.Width = Get-PillWidth $script:armedBtn.Text } catch {}
+            $script:armedBtn = $null
+        }
+
+        # Reload buttons.json on change (e.g. /pin)
+        $wt = (Get-Item $configPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+        $dirty = $false
+        if ($wt -and $wt -ne $script:cfgTime) {
+            $ny = Read-FreshConfig
+            if ($ny) { $script:config = $ny; $script:cfgTime = $wt; $dirty = $true }
+        }
+        if (Read-ActiveSession) { $dirty = $true }
+        # Hide chat buttons when the "active chat" signal is older than 10 min
+        $exp = $false
+        if ($script:activeSession -and $script:activeTs) {
+            $exp = ([DateTime]::UtcNow - $script:activeTs).TotalMinutes -gt 10
+        }
+        if ($exp -ne $script:activeExpired) { $script:activeExpired = $exp; $dirty = $true }
+        # Read the displayed chat + chat area from the app's UI (cached, backs off when stable)
+        Update-UiaInfo
+        if ($script:uiaDirty) { $script:uiaDirty = $false; $dirty = $true }
+        if ($dirty) { Rebuild-Buttons }
+
+        # Find/validate the Claude window (HWND can be reused - check PID still matches)
+        if ($script:target -ne [IntPtr]::Zero) {
+            $p = [uint32]0
+            [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
+            if (-not [CkWin]::IsWindow($script:target) -or $p -ne $script:targetPid) { $script:target = [IntPtr]::Zero }
+        }
+        if ($script:target -eq [IntPtr]::Zero) {
+            $script:target = [CkWin]::FindTarget($targetTitle, $targetProcess)
+            if ($script:target -ne [IntPtr]::Zero) {
+                $p = [uint32]0
+                [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
+                $script:targetPid = $p
+                $ws = [CkWin]::WindowScale($script:target)
+                if ($ws -gt 0) { $script:winScale = $ws }
+            }
+        }
+        if ($script:target -eq [IntPtr]::Zero) { if ($form.Visible) { $form.Hide() }; return }
+
+        # Keep per-window scale current (the window may move between monitors)
+        $ws = [CkWin]::WindowScale($script:target)
+        if ($ws -gt 0) { $script:winScale = $ws }
+
+        # Visible only when EXACTLY the Claude window is foreground (not just the same process)
+        $show = (-not [CkWin]::IsIconic($script:target)) -and
+                [CkWin]::IsWindowVisible($script:target) -and
+                ([CkWin]::GetForegroundWindow() -eq $script:target)
+        if (-not $show) {
+            if ($form.Visible) { $form.Hide() }
+            if ($gripMenu.Visible) { $gripMenu.Close() }
+            if ($btnMenu.Visible) { $btnMenu.Close() }
+            return
+        }
+
+        $r = New-Object CkWin+RECT
+        if (-not [CkWin]::GetWindowRect($script:target, [ref]$r)) { return }
+        $winW = $r.Right - $r.Left
+
+        # Center over the chat area (Primary pane), not the whole window, when known
+        $areaL = $r.Left; $areaW = $winW
+        if ($script:paneRect) {
+            $areaL = $r.Left + $script:paneRect.OffL
+            $areaW = $script:paneRect.Width
+        }
+
+        # Compact mode with hysteresis
+        $avail = $areaW - (S $script:reservedW)
+        $newCompact = $script:compact
+        if (-not $script:compact -and (Get-StripWidth $false) -gt $avail) { $newCompact = $true }
+        elseif ($script:compact -and (Get-StripWidth $false) -lt ($avail - (S(60)))) { $newCompact = $false }
+        if ($newCompact -ne $script:compact) { $script:compact = $newCompact; Rebuild-Buttons }
+
+        # Horizontal: after the app's own left cluster (relX nudges within the remaining space).
+        # Vertical: locked to the app's bottom button row (self-calibrating).
+        $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
+        $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
+        $x = $startX + [int]($script:relX * $room)
+        if ($null -ne $script:rowCenterOff) {
+            $y = $r.Bottom - $script:rowCenterOff - [int]($form.Height / 2)
+        } else {
+            $y = $r.Bottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
+        }
+        $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
+        $y = [Math]::Max($r.Top + 4, [Math]::Min($y, $r.Bottom - $form.Height - 2))
+        $desired = New-Object System.Drawing.Point($x, $y)
+        if ($form.Location -ne $desired) {
+            $script:autoMove = $true
+            $form.Location = $desired
+            $script:autoMove = $false
+        }
+        if (-not $form.Visible) { $form.Show() }
+        if ($form.Opacity -lt 1) { $form.Opacity = 1 }
+
+        # First-run hint: no visible buttons yet -> show a one-time balloon on the grip
+        if (-not $script:balloonShown -and ($panel.Controls.Count -le 1)) {
+            $script:balloonShown = $true
+            try { $balloon.Show((L 'firstRun'), $grip, 0, -($grip.Height), 6000) } catch {}
+        }
+    } catch {
+        Write-CkLog "Tick error: $($_.Exception.Message)"
+    }
+})
+
+$form.add_FormClosing({ Save-PanelState })
+
+if ($SmokeTest) {
+    Write-Output "SMOKE-OK: $($panel.Controls.Count - 1) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
+    exit 0
+}
+
+# Single instance (acquired before the message loop; a crash releases it via the OS)
+$created = $false
+$script:mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeButtonsPanel', [ref]$created)
+if (-not $created) { Write-CkLog 'Another instance is already running - exiting' ; exit 0 }
+
+$timer.Start()
+[System.Windows.Forms.Application]::Run($form)
+$timer.Stop()

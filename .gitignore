@@ -1,0 +1,9 @@
+# User runtime files - never commit
+buttons.json
+*.tmp
+*.bak
+*.log
+
+# OS cruft
+Thumbs.db
+desktop.ini

@@ -1,0 +1,15 @@
+{
+    "schemaVersion": 1,
+    "buttons": [],
+    "targetTitle": "Claude",
+    "targetProcess": "claude",
+    "uiaPaneName": "Primary pane",
+    "uiaSidebarName": "Sidebar",
+    "zoneTop": 45,
+    "zoneBottom": 55,
+    "fallbackRow": 33,
+    "stripGap": 10,
+    "reservedW": 380,
+    "lang": "en",
+    "relX": 0.0
+}
