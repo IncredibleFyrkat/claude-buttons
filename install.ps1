@@ -61,7 +61,14 @@ function Get-Settings {
     return (New-Object psobject)
 }
 function Save-Settings($obj) {
-    if (Test-Path $settingsPath) { Copy-Item $settingsPath "$settingsPath.bak" -Force }
+    if (Test-Path $settingsPath) {
+        # Preserve the PRISTINE original once, write-once: a full install calls
+        # Save-Settings more than once, so the rolling .bak is an already-modified
+        # copy by the second call. The .orig.bak is the user's settings from before
+        # this tool ever touched them, which is what restoring from backup wants.
+        if (-not (Test-Path "$settingsPath.orig.bak")) { Copy-Item $settingsPath "$settingsPath.orig.bak" -Force }
+        Copy-Item $settingsPath "$settingsPath.bak" -Force
+    }
     Write-Utf8NoBom $settingsPath ($obj | ConvertTo-Json -Depth 20)
 }
 function Ensure-HookArray($settings, [string]$event) {
