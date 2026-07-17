@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.0 — 2026-07-17
+
+Technical-debt band from the 8-agent review — mostly performance:
+
+- **The expensive UI Automation pass is skipped entirely while the panel is hidden.** The window
+  find + foreground gate now runs before the UIA walk, so when Claude is backgrounded the panel
+  does no accessibility-tree work at all (previously it kept polling ~every 1.5–5 s, burning
+  battery for no visible benefit).
+- **UIA reads are cached.** Pane/button geometry and names are fetched in one batched cross-process
+  request (`CacheRequest`) instead of a round-trip per property.
+- **A transient config-lock at startup now self-heals**: if `buttons.json` was momentarily locked
+  and the panel fell back to defaults, it now reliably reloads the real file on the next tick.
+- **Icon-picker resource leak fixed**: one shared tooltip instead of ~40, and the large icon font
+  is disposed.
+- Removed dead code (leftover scope-toggle localization strings).
+
+Deliberately **not** done (documented as accepted debt): the full decomposition of the timer tick
+and the ~40 script-scope globals into state objects, and per-button GUID ids. On a working
+single-file tool these are high-churn/low-user-value refactors whose regression risk outweighs the
+maintainability gain — the targeted fixes above capture the real wins.
+
 ## 1.4.4 — 2026-07-17
 
 Second hardening band from the 8-agent review ("should fix before next release"):

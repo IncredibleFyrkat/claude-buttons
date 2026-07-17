@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.4.4'
+$CB_VERSION = '1.5.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -293,8 +293,12 @@ if (-not $script:config) {
         $script:config = [pscustomobject]@{ schemaVersion = 1; buttons = @() }
     }
     if ($null -eq $script:config.buttons) { $script:config | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
+    # Force the tick's mtime check to reload: if this fallback was a transient lock, the real
+    # buttons.json (unchanged mtime) must still be picked up on the next successful read.
+    $script:cfgFallback = $true
 }
 try { $script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc } catch { $script:cfgTime = Get-Date '2000-01-01' }
+if ($script:cfgFallback) { $script:cfgTime = Get-Date '2000-01-01' }
 $script:activeSession = ''
 $script:activeTime = $null
 $script:activeTs = $null        # timestamp from the hook (UTC)
@@ -344,7 +348,6 @@ $script:strings = @{
         position = 'Position'; posLeft = 'Left'; posCenter = 'Center'; posRight = 'Right'
         nudgeL = 'Nudge left'; nudgeR = 'Nudge right'
         posFree = 'Free placement (move with mouse, click to drop)'; posAuto = 'Auto (dock to the bottom bar)'
-        pinScopeChat = 'Pin to: only this chat'; pinScopeGlobal = 'Pin to: global (all chats)'
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
@@ -367,7 +370,6 @@ $script:strings = @{
         position = 'Position'; posLeft = 'Venstre'; posCenter = 'Centreret'; posRight = 'Højre'
         nudgeL = 'Skub til venstre'; nudgeR = 'Skub til højre'
         posFree = 'Fri placering (flyt med musen, klik for at slippe)'; posAuto = 'Auto (dock i bundbjælken)'
-        pinScopeChat = 'Pin til: kun denne chat'; pinScopeGlobal = 'Pin til: global (alle chats)'
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
@@ -563,6 +565,7 @@ function Show-IconPicker([string]$current) {
     $flow.BackColor = $dlg.BackColor
     $script:iconPick = $null
     $bigIcon = New-Object System.Drawing.Font($script:iconFontName, 15)
+    $pickTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
     # "No icon" first, then all mapped icons
     $entries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
     foreach ($e in $entries) {
@@ -578,8 +581,7 @@ function Show-IconPicker([string]$current) {
         # No GetNewClosure: $this must resolve to the clicked button at event time,
         # and each button's own name is stored in its Tag.
         $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
-        $tt = New-Object System.Windows.Forms.ToolTip
-        $tt.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
+        $pickTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
         [void]$flow.Controls.Add($ib)
     }
     $cancel = New-Object System.Windows.Forms.Button
@@ -594,6 +596,7 @@ function Show-IconPicker([string]$current) {
     $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($flow.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
+    $pickTip.Dispose(); $bigIcon.Dispose()
     $dlg.Dispose()
     $script:iconDlg = $null
     return $out
@@ -684,9 +687,17 @@ $script:uiaLast = Get-Date '2000-01-01'
 $script:uiaInterval = 1500    # ms between UIA passes; backs off once geometry is stable
 $script:uiaStable = 0
 
-# Measure one chat pane: geometry, displayed chat title, bottom button row
+# One reusable UIA cache: FindAll/FindFirst under this request populate each element's
+# .Cached Name + BoundingRectangle in a single cross-process batch, instead of a round-trip
+# per .Current.* read (the FindAll over the app's a11y tree was the panel's biggest cost).
+$script:uiaCache = New-Object System.Windows.Automation.CacheRequest
+$script:uiaCache.Add([System.Windows.Automation.AutomationElement]::NameProperty)
+$script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRectangleProperty)
+
+# Measure one chat pane: geometry, displayed chat title, bottom button row.
+# Must run inside an active $script:uiaCache scope (reads .Cached.*).
 function Measure-Pane($pane, $wr, $btnCond) {
-    $pr = $pane.Current.BoundingRectangle
+    $pr = $pane.Cached.BoundingRectangle
     $paneBottom = $pr.Y + $pr.Height
     $info = @{
         OffL = [int]($pr.X - $wr.Left); OffT = [int]($pr.Y - $wr.Top); Width = [int]$pr.Width
@@ -697,14 +708,14 @@ function Measure-Pane($pane, $wr, $btnCond) {
     # Chat title = leftmost named button in the pane's top strip
     $best = $null; $bestX = [double]::MaxValue
     foreach ($b in $btns) {
-        $br = $b.Current.BoundingRectangle
-        if ($br.Y -ge $pr.Y -and $br.Y -lt ($pr.Y + (SW $script:zoneTop)) -and $br.X -lt $bestX -and $b.Current.Name) { $best = $b; $bestX = $br.X }
+        $br = $b.Cached.BoundingRectangle
+        if ($br.Y -ge $pr.Y -and $br.Y -lt ($pr.Y + (SW $script:zoneTop)) -and $br.X -lt $bestX -and $b.Cached.Name) { $best = $b; $bestX = $br.X }
     }
-    if ($best) { $info.Title = [string]$best.Current.Name }
+    if ($best) { $info.Title = [string]$best.Cached.Name }
     # Bottom-left button cluster within THIS pane (grid panes have their own bottom bars)
     $sumY = 0.0; $n = 0; $rightEdge = $null
     foreach ($b in $btns) {
-        $br = $b.Current.BoundingRectangle
+        $br = $b.Cached.BoundingRectangle
         $cy = $br.Y + $br.Height / 2
         if ($cy -gt ($paneBottom - (SW $script:zoneBottom)) -and $cy -lt $paneBottom -and $br.X -ge $pr.X -and $br.X -lt ($pr.X + $pr.Width / 2)) {
             $sumY += $cy; $n++
@@ -736,13 +747,16 @@ function Update-UiaInfo {
 
         $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
 
+        # Activate the property cache for every UIA query below (root, panes, buttons).
+        $cacheScope = $script:uiaCache.Activate()
+        try {
         # Strategy 1: EVERY chat pane. The app names them "Primary pane", "Secondary pane",
         # "Tertiary pane"... in split/grid view - match all Groups whose name ends with "pane".
         $allGroups = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)
         $found = @()
         foreach ($gp in $allGroups) {
-            $gn = $gp.Current.Name
-            if ($gn -and ($gn -match $script:uiaPaneMatch) -and $gp.Current.BoundingRectangle.Width -gt (SW 250)) { $found += $gp }
+            $gn = $gp.Cached.Name
+            if ($gn -and ($gn -match $script:uiaPaneMatch) -and $gp.Cached.BoundingRectangle.Width -gt (SW 250)) { $found += $gp }
         }
         $newPanes = @()
         if ($found.Count -gt 0) {
@@ -755,11 +769,12 @@ function Update-UiaInfo {
                 (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaSidebarName)))
             $sb = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $sbCond)
             if ($sb) {
-                $sr = $sb.Current.BoundingRectangle
+                $sr = $sb.Cached.BoundingRectangle
                 $newPanes = @(@{ OffL = [int]($sr.X + $sr.Width - $wr.Left); OffT = 0; Width = [int]($wr.Right - ($sr.X + $sr.Width)); BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null })
             }
             Write-CkLog "UIA: no pane matching '$($script:uiaPaneMatch)' found - the app may have updated (running on fallback). Adjust uiaPaneMatch in buttons.json."
         }
+        } finally { $cacheScope.Dispose() }
         $script:panes = $newPanes
 
         # Primary aliases = first pane (kept for the main strip and pinning)
@@ -1443,6 +1458,43 @@ $timer.add_Tick({
             $script:armedBtn = $null
         }
 
+        # Find/validate the Claude window FIRST (HWND can be reused - check PID still matches).
+        # Doing the visibility gate up here means the expensive UIA pass below is skipped
+        # entirely while the panel is hidden (Claude backgrounded) - big battery/CPU win.
+        if ($script:target -ne [IntPtr]::Zero) {
+            $p = [uint32]0
+            [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
+            if (-not [CkWin]::IsWindow($script:target) -or $p -ne $script:targetPid) { $script:target = [IntPtr]::Zero }
+        }
+        if ($script:target -eq [IntPtr]::Zero) {
+            $script:target = [CkWin]::FindTarget($targetTitle, $targetProcess)
+            if ($script:target -ne [IntPtr]::Zero) {
+                $p = [uint32]0
+                [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
+                $script:targetPid = $p
+            }
+        }
+        $ourUiOpen = $gripMenu.Visible -or $btnMenu.Visible -or ($null -ne $script:iconDlg) -or $script:moveMode
+        $show = ($script:target -ne [IntPtr]::Zero) -and
+                (-not [CkWin]::IsIconic($script:target)) -and
+                [CkWin]::IsWindowVisible($script:target) -and
+                (([CkWin]::GetForegroundWindow() -eq $script:target) -or $ourUiOpen)
+        if (-not $show) {
+            if ($form.Visible) { $form.Hide() }
+            foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
+            if ($tipForm.Visible) { $tipForm.Hide() }
+            if ($gripMenu.Visible) { $gripMenu.Close() }
+            if ($btnMenu.Visible) { $btnMenu.Close() }
+            $script:moveMode = $false
+            return
+        }
+
+        # --- from here the panel IS showing; the per-tick work below only runs then ---
+
+        # Keep per-window scale current (the window may move between monitors)
+        $ws = [CkWin]::WindowScale($script:target)
+        if ($ws -gt 0) { $script:winScale = $ws }
+
         # stateGlob poll (~1 s): keep glob-backed toggle buttons truthful even when
         # an agent, hook or another machine changes the state behind our back
         if (((Get-Date) - $script:stateGlobLast).TotalMilliseconds -ge 1000) {
@@ -1489,46 +1541,6 @@ $timer.add_Tick({
             $dirty = $true
         }
         if ($dirty) { Rebuild-Buttons }
-
-        # Find/validate the Claude window (HWND can be reused - check PID still matches)
-        if ($script:target -ne [IntPtr]::Zero) {
-            $p = [uint32]0
-            [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
-            if (-not [CkWin]::IsWindow($script:target) -or $p -ne $script:targetPid) { $script:target = [IntPtr]::Zero }
-        }
-        if ($script:target -eq [IntPtr]::Zero) {
-            $script:target = [CkWin]::FindTarget($targetTitle, $targetProcess)
-            if ($script:target -ne [IntPtr]::Zero) {
-                $p = [uint32]0
-                [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
-                $script:targetPid = $p
-                $ws = [CkWin]::WindowScale($script:target)
-                if ($ws -gt 0) { $script:winScale = $ws }
-            }
-        }
-        if ($script:target -eq [IntPtr]::Zero) { if ($form.Visible) { $form.Hide() }; return }
-
-        # Keep per-window scale current (the window may move between monitors)
-        $ws = [CkWin]::WindowScale($script:target)
-        if ($ws -gt 0) { $script:winScale = $ws }
-
-        # Visible only when EXACTLY the Claude window is foreground (not just the same process).
-        # BUT keep the panel up while the user is interacting with our own menus/dialogs -
-        # opening a popup can momentarily take foreground away from Claude, and hiding then
-        # would make the panel vanish mid-interaction.
-        $ourUiOpen = $gripMenu.Visible -or $btnMenu.Visible -or ($null -ne $script:iconDlg) -or $script:moveMode
-        $show = (-not [CkWin]::IsIconic($script:target)) -and
-                [CkWin]::IsWindowVisible($script:target) -and
-                (([CkWin]::GetForegroundWindow() -eq $script:target) -or $ourUiOpen)
-        if (-not $show) {
-            if ($form.Visible) { $form.Hide() }
-            foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
-            if ($tipForm.Visible) { $tipForm.Hide() }
-            if ($gripMenu.Visible) { $gripMenu.Close() }
-            if ($btnMenu.Visible) { $btnMenu.Close() }
-            $script:moveMode = $false
-            return
-        }
 
         $r = New-Object CkWin+RECT
         if (-not [CkWin]::GetWindowRect($script:target, [ref]$r)) { return }
