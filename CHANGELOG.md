@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1 — 2026-07-17
+
+- **Fix multi-pane detection**: the app names split panes "Primary pane", "Secondary pane",
+  "Tertiary pane"… — the panel only matched "Primary pane", so extra panes got no strip. Now
+  matches every Group whose name ends with "pane" (configurable via `uiaPaneMatch`).
+
 ## 1.3.0 — 2026-07-17
 
 - **Multi-pane support (side-by-side / grid view)**: the panel now detects every chat pane and

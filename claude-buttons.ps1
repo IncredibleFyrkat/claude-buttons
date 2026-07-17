@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.3.0'
+$CB_VERSION = '1.3.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -282,8 +282,11 @@ $targetProcess = 'claude'
 if ($null -ne $script:config.targetProcess) { $targetProcess = [string]$script:config.targetProcess }
 
 # App-dependent names/measures - editable in buttons.json without code changes if the app updates
-$script:uiaPaneName = 'Primary pane'    # accessibility name of the chat area
+$script:uiaPaneName = 'Primary pane'    # accessibility name of the (first) chat area
 if ($script:config.uiaPaneName) { $script:uiaPaneName = [string]$script:config.uiaPaneName }
+# Matches EVERY chat pane in split/grid view: "Primary pane", "Secondary pane", "Tertiary pane"...
+$script:uiaPaneMatch = ' pane$'
+if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config.uiaPaneMatch }
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
@@ -605,10 +608,14 @@ function Update-UiaInfo {
 
         $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
 
-        # Strategy 1: ALL chat panes via the named group (side-by-side / grid view = several)
-        $paneCond = New-Object System.Windows.Automation.AndCondition($grpType,
-            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaPaneName)))
-        $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $paneCond)
+        # Strategy 1: EVERY chat pane. The app names them "Primary pane", "Secondary pane",
+        # "Tertiary pane"... in split/grid view - match all Groups whose name ends with "pane".
+        $allGroups = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)
+        $found = @()
+        foreach ($gp in $allGroups) {
+            $gn = $gp.Current.Name
+            if ($gn -and ($gn -match $script:uiaPaneMatch) -and $gp.Current.BoundingRectangle.Width -gt (SW 250)) { $found += $gp }
+        }
         $newPanes = @()
         if ($found.Count -gt 0) {
             foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond) }
@@ -623,7 +630,7 @@ function Update-UiaInfo {
                 $sr = $sb.Current.BoundingRectangle
                 $newPanes = @(@{ OffL = [int]($sr.X + $sr.Width - $wr.Left); OffT = 0; Width = [int]($wr.Right - ($sr.X + $sr.Width)); BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null })
             }
-            Write-CkLog "UIA: '$($script:uiaPaneName)' not found - the app may have updated (running on fallback). Adjust uiaPaneName in buttons.json."
+            Write-CkLog "UIA: no pane matching '$($script:uiaPaneMatch)' found - the app may have updated (running on fallback). Adjust uiaPaneMatch in buttons.json."
         }
         $script:panes = $newPanes
 

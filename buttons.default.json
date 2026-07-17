@@ -4,6 +4,7 @@
     "targetTitle": "Claude",
     "targetProcess": "claude",
     "uiaPaneName": "Primary pane",
+    "uiaPaneMatch": " pane$",
     "uiaSidebarName": "Sidebar",
     "zoneTop": 45,
     "zoneBottom": 55,
