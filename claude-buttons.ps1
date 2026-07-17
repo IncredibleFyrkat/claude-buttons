@@ -321,6 +321,8 @@ $script:strings = @{
         iconAsk = "Icon name (empty = show text label instead).`nAvailable: {0}"
         toggleMode = 'On/off (toggle) mode'
         tipToggle = 'toggle on/off'
+        editText = 'Edit text/prompt...'; editTextTitle = 'Edit button text'
+        dlgOk = 'OK'; dlgCancel = 'Cancel'
     }
     da = @{
         rename = 'Omdøb…'; moveLeft = 'Flyt til venstre'; moveRight = 'Flyt til højre'; remove = 'Fjern denne knap'
@@ -341,6 +343,8 @@ $script:strings = @{
         iconAsk = "Ikon-navn (tom = vis tekst i stedet).`nMulige: {0}"
         toggleMode = 'On/off-tilstand (toggle)'
         tipToggle = 'tænd/sluk'
+        editText = 'Redigér tekst/prompt…'; editTextTitle = 'Redigér knappens tekst'
+        dlgOk = 'OK'; dlgCancel = 'Annuller'
     }
 }
 function L([string]$k) { $script:strings[$script:lang][$k] }
@@ -399,6 +403,50 @@ $script:iconMap = @{
     'mail'='E715'; 'globe'='E774'; 'lock'='E72E'; 'heart'='EB51'; 'flag'='E7C1'
     'calendar'='E787'; 'phone'='E717'
 }
+# Dark multiline text dialog (for long standard prompts). Returns $null on cancel.
+function Show-TextDialog([string]$title, [string]$message, [string]$default) {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $title
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterScreen'
+    $dlg.TopMost = $true
+    $dlg.BackColor = [System.Drawing.Color]::FromArgb(40, 39, 37)
+    $dlg.ClientSize = New-Object System.Drawing.Size((S 460), (S 250))
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $message
+    $lbl.ForeColor = [System.Drawing.Color]::FromArgb(214, 210, 202)
+    $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $lbl.Location = New-Object System.Drawing.Point((S 12), (S 10))
+    $lbl.Size = New-Object System.Drawing.Size((S 436), (S 20))
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true
+    $tb.AcceptsReturn = $true
+    $tb.ScrollBars = 'Vertical'
+    $tb.Text = $default
+    $tb.BackColor = [System.Drawing.Color]::FromArgb(30, 29, 28)
+    $tb.ForeColor = [System.Drawing.Color]::FromArgb(220, 216, 208)
+    $tb.BorderStyle = 'FixedSingle'
+    $tb.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $tb.Location = New-Object System.Drawing.Point((S 12), (S 34))
+    $tb.Size = New-Object System.Drawing.Size((S 436), (S 168))
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = L 'dlgOk'; $ok.DialogResult = 'OK'
+    $ok.FlatStyle = 'Flat'; $ok.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56); $ok.ForeColor = $tb.ForeColor
+    $ok.Location = New-Object System.Drawing.Point((S 270), (S 212)); $ok.Size = New-Object System.Drawing.Size((S 85), (S 28))
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
+    $cancel.FlatStyle = 'Flat'; $cancel.BackColor = $ok.BackColor; $cancel.ForeColor = $tb.ForeColor
+    $cancel.Location = New-Object System.Drawing.Point((S 363), (S 212)); $cancel.Size = New-Object System.Drawing.Size((S 85), (S 28))
+    $dlg.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
+    $dlg.AcceptButton = $null   # Enter inserts a newline in the textbox; click OK to accept
+    $dlg.CancelButton = $cancel
+    $res = $dlg.ShowDialog()
+    $out = if ($res -eq 'OK') { $tb.Text } else { $null }
+    $dlg.Dispose()
+    return $out
+}
+
 function Get-IconGlyph([string]$name) {
     if (-not $script:iconFont -or [string]::IsNullOrWhiteSpace($name)) { return $null }
     $n = $name.Trim().ToLower()
@@ -768,11 +816,12 @@ $gripMenu.add_Opening({
     [void]$miPin.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $miCustom = New-Object System.Windows.Forms.ToolStripMenuItem (L 'custom')
     $miCustom.add_Click({
-        Add-Type -AssemblyName Microsoft.VisualBasic
-        $txt = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askText'), (L 'pinTitle'), '')
+        $txt = Show-TextDialog (L 'pinTitle') (L 'askText') ''
         if ([string]::IsNullOrWhiteSpace($txt)) { return }
-        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $txt)
-        if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $txt }
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $suggest = ($txt -split "`n")[0].Trim(); if ($suggest.Length -gt 30) { $suggest = $suggest.Substring(0, 30) }
+        $lbl = [Microsoft.VisualBasic.Interaction]::InputBox((L 'askLabel'), (L 'pinTitle'), $suggest)
+        if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = $suggest }
         Add-PinnedButton @{ text = $txt.Trim(); label = $lbl.Trim(); short = $null } ($script:pinScope -eq 'global')
     })
     [void]$miPin.DropDownItems.Add($miCustom)
@@ -792,6 +841,7 @@ $btnMenu.add_Opening({
     [void][CkWin]::GetAsyncKeyState(0x01); [void][CkWin]::GetAsyncKeyState(0x02)
     if ($this.SourceControl) { $script:menuSource = $this.SourceControl }
     $miRename.Text = L 'rename'
+    $miEdit.Text = L 'editText'
     $miIcon.Text = L 'setIcon'
     $miToggle.Text = L 'toggleMode'
     $miLeft.Text = L 'moveLeft'
@@ -802,7 +852,23 @@ $btnMenu.add_Opening({
 })
 
 $miRename = $btnMenu.Items.Add('Rename...')
+$miEdit   = $btnMenu.Items.Add('Edit text/prompt...')
 $miIcon   = $btnMenu.Items.Add('Set icon...')
+
+$miEdit.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        $val = Show-TextDialog (L 'editTextTitle') (L 'askText') ([string]$t.text)
+        if ($null -eq $val -or [string]::IsNullOrWhiteSpace($val)) { return }
+        $ok = Update-Buttons { param($btns)
+            foreach ($b in $btns) { if (Same-Button $b $t) { $b.text = $val.Trim() } }
+            $btns
+        }
+        if ($ok) { Rebuild-Buttons }
+    } catch { Write-CkLog "Edit text error: $($_.Exception.Message)" }
+})
 $miToggle = $btnMenu.Items.Add('On/off (toggle) mode')
 $miLeft   = $btnMenu.Items.Add('Move left')
 $miRight  = $btnMenu.Items.Add('Move right')
@@ -963,7 +1029,17 @@ function Invoke-PillClick($btn) {
         try {
             Start-Sleep -Milliseconds 150
             if (-not (Test-TargetForeground)) { return }   # focus moved - send nothing
-            [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
+            if ($textToSend.Length -gt 80 -or $textToSend -match "`n") {
+                # Long/multiline prompts: paste atomically via clipboard (fast, no typing race)
+                $hadText = [System.Windows.Forms.Clipboard]::ContainsText()
+                $oldClip = if ($hadText) { [System.Windows.Forms.Clipboard]::GetText() } else { $null }
+                [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                [System.Windows.Forms.SendKeys]::SendWait('^v')
+                Start-Sleep -Milliseconds 300
+                if ($hadText) { try { [System.Windows.Forms.Clipboard]::SetText($oldClip) } catch {} }
+            } else {
+                [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
+            }
             # Per-chat buttons never auto-send: the user must see the text before Enter
             if ($item.submit -and -not $item.chat) {
                 Start-Sleep -Milliseconds 400
@@ -1009,6 +1085,8 @@ function Rebuild-Buttons {
         } else { L 'tipGlobal' }
         $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
         $tipHead = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
+        $tipHead = $tipHead -replace "`r`n", ' ' -replace "`n", ' '
+        if ($tipHead.Length -gt 140) { $tipHead = $tipHead.Substring(0, 140) + [char]0x2026 }
         $tip.SetToolTip($btn, "$tipHead`n$scope - $enter`n$(L 'tipRemove')")
         $panel.Controls.Add($btn)
     }
