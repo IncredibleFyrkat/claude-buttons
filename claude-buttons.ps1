@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.4.1'
+$CB_VERSION = '1.4.2'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -177,6 +177,9 @@ public class CkWin {
         int on = 1;
         try { if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); } catch {}
     }
+    // Dark scrollbars for a scrollable control (textbox, panel)
+    [DllImport("uxtheme.dll", CharSet=CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string sub, string list);
+    public static void DarkScroll(IntPtr h) { try { SetWindowTheme(h, "DarkMode_Explorer", null); } catch {} }
 
     // Per-window DPI scale (1.0 = 96 dpi). Falls back to 1.0 on older Windows.
     public static double WindowScale(IntPtr h) {
@@ -509,7 +512,7 @@ function Show-TextDialog([string]$title, [string]$message, [string]$default) {
     $dlg.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
     $dlg.AcceptButton = $null   # Enter inserts a newline in the textbox; click OK to accept
     $dlg.CancelButton = $cancel
-    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($tb.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $tb.Text } else { $null }
     $dlg.Dispose()
@@ -571,7 +574,7 @@ function Show-IconPicker([string]$current) {
     $dlg.CancelButton = $cancel
     # Make sure the dialog appears in front and takes focus (the panel window never activates,
     # so a child dialog can otherwise open behind and block the panel modally out of sight).
-    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($flow.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
     $dlg.Dispose()

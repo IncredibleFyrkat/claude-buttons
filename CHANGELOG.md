@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2 — 2026-07-17
+
+- **Dark scrollbars.** The multiline prompt editor and the icon grid showed a white classic
+  scrollbar; they now use the dark Explorer scrollbar theme (`SetWindowTheme DarkMode_Explorer`).
+
 ## 1.4.1 — 2026-07-17
 
 - **Dark dialogs.** The "type your own command" and rename flows used the plain white Windows
