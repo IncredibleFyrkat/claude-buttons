@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.2 — 2026-07-17
+
+- **Fix: `/pin` wrote to the wrong file.** The panel rewrote the skills' path marker on every
+  start — including `-SmokeTest` runs from a dev/repo folder — so a live install's marker could
+  point at a non-existent buttons.json and pins silently went nowhere. The marker is now written
+  only by the real running instance.
+- **Visual icon picker**: *Set icon...* now shows a grid of the actual glyphs to click, instead
+  of a text field of names.
+- Fix: `Move left/right` used `$host`, clobbering PowerShell's automatic `$Host` variable.
+
 ## 1.3.1 — 2026-07-17
 
 - **Fix multi-pane detection**: the app names split panes "Primary pane", "Secondary pane",

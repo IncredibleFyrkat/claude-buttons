@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.3.1'
+$CB_VERSION = '1.3.2'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -229,13 +229,16 @@ $configPath = Join-Path $PSScriptRoot 'buttons.json'
 $activePath = Join-Path $env:USERPROFILE '.claude\active-session.json'
 
 # Marker file so the /pin and /unpin skills know where this install keeps buttons.json,
-# without hardcoding any username or path.
-try {
-    $markerDir = Join-Path $env:USERPROFILE '.claude'
-    if (Test-Path $markerDir) {
-        Set-Content -Path (Join-Path $markerDir 'claude-buttons-path.txt') -Value $configPath -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-} catch {}
+# without hardcoding any username or path. NOT written during -SmokeTest, so running a
+# smoke test from a dev/repo folder never repoints a live install's marker.
+if (-not $SmokeTest) {
+    try {
+        $markerDir = Join-Path $env:USERPROFILE '.claude'
+        if (Test-Path $markerDir) {
+            Set-Content -Path (Join-Path $markerDir 'claude-buttons-path.txt') -Value $configPath -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
 
 # Cross-process lock so panel writes and /pin edits never clobber each other
 $script:cfgLock = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
@@ -472,6 +475,54 @@ function Get-IconGlyph([string]$name) {
     if ($script:iconMap.ContainsKey($n)) { return [string][char][Convert]::ToInt32($script:iconMap[$n], 16) }
     if ($n -match '^[0-9a-f]{4}$') { return [string][char][Convert]::ToInt32($n, 16) }  # raw codepoint for power users
     return $null
+}
+
+# Visual icon picker: a grid of the actual glyphs. Returns the chosen name,
+# '' for "no icon (text label)", or $null on cancel.
+function Show-IconPicker([string]$current) {
+    if (-not $script:iconFont) { return $null }
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = L 'iconTitle'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterScreen'; $dlg.TopMost = $true
+    $dlg.BackColor = [System.Drawing.Color]::FromArgb(40, 39, 37)
+    $dlg.ClientSize = New-Object System.Drawing.Size((S 400), (S 320))
+    $flow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $flow.Location = New-Object System.Drawing.Point((S 8), (S 8))
+    $flow.Size = New-Object System.Drawing.Size((S 384), (S 268))
+    $flow.AutoScroll = $true
+    $flow.BackColor = $dlg.BackColor
+    $script:iconPick = $null
+    $bigIcon = New-Object System.Drawing.Font($script:iconFontName, 15)
+    # "No icon" first, then all mapped icons
+    $entries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
+    foreach ($e in $entries) {
+        $ib = New-Object System.Windows.Forms.Button
+        $ib.Width = S 46; $ib.Height = S 46
+        $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
+        $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
+        $ib.BackColor = if ($e.name -eq $current) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
+        $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
+        if ($e.glyph) { $ib.Font = $bigIcon; $ib.Text = $e.glyph }
+        else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
+        $ib.Tag = $e.name
+        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $dlg.DialogResult = 'OK'; $dlg.Close() }.GetNewClosure())
+        $tt = New-Object System.Windows.Forms.ToolTip
+        $tt.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
+        [void]$flow.Controls.Add($ib)
+    }
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
+    $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56)
+    $cancel.ForeColor = [System.Drawing.Color]::FromArgb(220, 216, 208)
+    $cancel.Location = New-Object System.Drawing.Point((S 300), (S 284)); $cancel.Size = New-Object System.Drawing.Size((S 92), (S 28))
+    $dlg.Controls.AddRange(@($flow, $cancel))
+    $dlg.CancelButton = $cancel
+    $res = $dlg.ShowDialog()
+    $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
+    $dlg.Dispose()
+    return $out
 }
 
 function Escape-SendKeys([string]$s) {
@@ -979,11 +1030,8 @@ $miIcon.add_Click({
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
-        Add-Type -AssemblyName Microsoft.VisualBasic
-        $names = (@($script:iconMap.Keys) | Sort-Object) -join ', '
-        $val = [Microsoft.VisualBasic.Interaction]::InputBox(((L 'iconAsk') -f $names), (L 'iconTitle'), [string]$t.icon)
-        $val = $val.Trim()
-        if ($val -and -not (Get-IconGlyph $val)) { return }   # unknown icon name: no change
+        $val = Show-IconPicker ([string]$t.icon)
+        if ($null -eq $val) { return }   # cancelled
         $ok = Update-Buttons { param($btns)
             foreach ($b in $btns) {
                 if (Same-Button $b $t) {
@@ -1044,11 +1092,11 @@ function Move-PinButton([int]$dir) {
     try {
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
-        $host = $src.Parent   # den strimmel der blev hoejreklikket i (primaer eller spejl)
-        $idx = $host.Controls.IndexOf($src)
+        $hostPanel = $src.Parent   # den strimmel der blev hoejreklikket i (primaer eller spejl)
+        $idx = $hostPanel.Controls.IndexOf($src)
         $nyIdx = $idx + $dir
-        if ($nyIdx -lt 1 -or $nyIdx -ge $host.Controls.Count) { return }  # index 0 is the grip
-        $neighbor = $host.Controls[$nyIdx].Tag
+        if ($nyIdx -lt 1 -or $nyIdx -ge $hostPanel.Controls.Count) { return }  # index 0 is the grip
+        $neighbor = $hostPanel.Controls[$nyIdx].Tag
         $t = $src.Tag
         $ok = Update-Buttons {
             param($btns)
