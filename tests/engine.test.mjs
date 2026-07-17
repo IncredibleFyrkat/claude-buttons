@@ -47,22 +47,46 @@ test('request-on creates the .request marker (panel toggle state)', () => {
 });
 
 test('toggle on --this-turn arms the current turn (skip 0)', () => {
+  toggle('toggle request-on', 'sArm');       // arming now requires a standing request
   toggle('toggle on --this-turn', 'sArm');
   const flag = JSON.parse(readFileSync(join(flagDir(), 'sArm.json'), 'utf8'));
   assert.equal(flag.skip, 0);
 });
 
 test('toggle on (no flag) arms the NEXT turn (skip 1)', () => {
+  toggle('toggle request-on', 'sNext');      // arming now requires a standing request
   toggle('toggle on', 'sNext');
   assert.equal(JSON.parse(readFileSync(join(flagDir(), 'sNext.json'), 'utf8')).skip, 1);
 });
 
+test('toggle on is REFUSED without a standing request (arm gate)', () => {
+  const { out } = toggle('toggle on --this-turn', 'sInj');
+  assert.match(out, /Refused: no standing shutdown request/);
+  assert.ok(!existsSync(join(flagDir(), 'sInj.json')), 'no flag written when refused');
+});
+
+test('toggle on is allowed when a fresh machine switch is set (arm gate)', () => {
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  toggle('toggle on --this-turn', 'sMach');
+  assert.equal(JSON.parse(readFileSync(join(flagDir(), 'sMach.json'), 'utf8')).skip, 0);
+});
+
 test('toggle off clears the flag and the request', () => {
-  toggle('toggle on --this-turn', 'sOff');
   toggle('toggle request-on', 'sOff');
+  toggle('toggle on --this-turn', 'sOff');
   toggle('toggle off', 'sOff');
   assert.ok(!existsSync(join(flagDir(), 'sOff.json')));
   assert.ok(!existsSync(join(flagDir(), 'sOff.request')));
+});
+
+test("toggle off clears EVERY session's flags, not just this chat (global disarm)", () => {
+  // Arm chat A, then disarm from chat B: A must not survive to shut the PC down.
+  toggle('toggle request-on', 'chatA');
+  toggle('toggle on --this-turn', 'chatA');
+  assert.ok(existsSync(join(flagDir(), 'chatA.json')), 'chatA armed');
+  toggle('toggle off', 'chatB');
+  assert.ok(!existsSync(join(flagDir(), 'chatA.json')), 'chatA flag cleared by chatB off');
+  assert.ok(!existsSync(join(flagDir(), 'chatA.request')), 'chatA request cleared by chatB off');
 });
 
 test('Stop hook: skip counter decrements without firing', () => {
