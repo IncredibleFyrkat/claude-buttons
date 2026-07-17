@@ -54,12 +54,19 @@ The installer:
 
 **Restart the Claude app once** after installing so the `/pin` and `/unpin` skills load.
 
-### Optional: the shutdown feature
+### Optional: shutdown-on-done
 
-The installer offers — **off by default, always asks first** — a "Shut down PC when done" feature:
-two extra skills and a `Stop` hook that can run `shutdown /s /t 60` (a 60-second, cancellable
-shutdown) when a session *you explicitly armed* finishes. Decline it if you don't want it; it is
-never installed silently.
+The installer offers — **off by default, always asks first, requires Node.js** — the
+*shutdown-on-done* engine (contributed by Rasmus): shut the PC down when a chat is COMPLETELY
+done with its work. The agent judges "done" (background tasks, subagents and all) and arms the
+real shutdown only as the final action of its final wrap-up — so the PC never powers off
+mid-task. 60-second grace on every shutdown; `shutdown -a` aborts.
+
+Installing it adds a `/shutdown-on-done on|off|status` command, a completion-judged `Stop` hook,
+two permission allow-rules (so the agent can arm the shutdown while you sleep), and a stateful
+**power toggle button** in the panel: lit exactly while a standing shutdown request exists
+(mirrored from `%USERPROFILE%\.claude\shutdown-on-done\*.request` via `stateGlob`), two-click
+confirm to arm, one click to cancel. It is never installed silently.
 
 ## Usage
 

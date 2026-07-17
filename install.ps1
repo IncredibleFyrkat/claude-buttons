@@ -13,8 +13,9 @@
     - Installs the /pin and /unpin skills into ~/.claude/skills
     - Merges ONE hook (UserPromptSubmit) into ~/.claude/settings.json (backed up first)
   Optional (only if you opt in):
-    - The shutdown feature: /close-pc-on-done + /cancel-close-pc skills and a Stop hook
-      that can run `shutdown /s /t 60`. This is OFF by default and always asks first.
+    - The shutdown feature (requires Node.js): the shutdown-on-done engine - a
+      /shutdown-on-done skill, a completion-judged Stop hook and a stateful power
+      button in the panel. OFF by default and always asks first.
 #>
 [CmdletBinding()]
 param(
@@ -79,22 +80,35 @@ function Remove-Hook($settings, [string]$event, [string]$marker) {
 }
 
 $activeHookCmd = "`$i=[Console]::In.ReadToEnd()|ConvertFrom-Json; @{session_id=`$i.session_id; ts=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress|Set-Content -Path (Join-Path `$env:USERPROFILE '.claude\active-session.json') -Encoding UTF8"
-$shutdownHookCmd = "`$i=[Console]::In.ReadToEnd()|ConvertFrom-Json; `$f = Join-Path `$env:USERPROFILE '.claude\close-pc-on-done.flag'; if (Test-Path `$f) { `$sid=''; try { `$sid=(Get-Content `$f -Raw -ErrorAction Stop).Trim() } catch {}; if (`$sid -and `$sid -eq `$i.session_id) { shutdown /s /t 60; if (`$LASTEXITCODE -eq 0) { Remove-Item `$f -Force } } }"
+
+function Ensure-AllowRule($settings, [string]$rule) {
+    if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member permissions (New-Object psobject) -Force }
+    if (-not $settings.permissions.PSObject.Properties['allow']) { $settings.permissions | Add-Member allow @() -Force }
+    if (@($settings.permissions.allow) -notcontains $rule) { $settings.permissions.allow = @($settings.permissions.allow) + $rule }
+}
+function Remove-AllowRules($settings, [string]$marker) {
+    if ($settings.PSObject.Properties['permissions'] -and $settings.permissions.PSObject.Properties['allow']) {
+        $settings.permissions.allow = @($settings.permissions.allow | Where-Object { $_ -notlike "*$marker*" })
+    }
+}
 
 # =================== UNINSTALL ===================
 if ($Uninstall) {
     Write-Host "Uninstalling Claude Buttons..." -ForegroundColor Cyan
     Stop-Panel
     if (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
-    foreach ($s in @('pin','unpin','close-pc-on-done','cancel-close-pc')) {
+    foreach ($s in @('pin','unpin','close-pc-on-done','cancel-close-pc','shutdown-on-done')) {
         $d = Join-Path $skillsDir $s
         if (Test-Path $d) { Remove-Item $d -Recurse -Force }
     }
     Remove-Item (Join-Path $claudeDir 'claude-buttons-path.txt') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $claudeDir 'hooks\shutdown-on-done.mjs') -Force -ErrorAction SilentlyContinue
     if (Test-Path $settingsPath) {
         $settings = Get-Settings
         Remove-Hook $settings 'UserPromptSubmit' 'active-session.json'
         Remove-Hook $settings 'Stop' 'close-pc-on-done.flag'
+        Remove-Hook $settings 'Stop' 'shutdown-on-done.mjs'
+        Remove-AllowRules $settings 'shutdown-on-done.mjs'
         Save-Settings $settings
     }
     $keep = Read-Host "Remove the program folder and your buttons.json too? ($InstallDir) [y/N]"
@@ -148,26 +162,58 @@ if (-not (Hook-Exists $settings 'UserPromptSubmit' 'active-session.json')) {
 $wantShutdown = $Shutdown
 if (-not $Shutdown -and -not $Update) {
     Write-Host ""
-    Write-Host "Optional feature: 'Shut down PC when done'." -ForegroundColor Yellow
-    Write-Host "  This installs two skills and a Stop hook that can run 'shutdown /s /t 60'"
-    Write-Host "  (60-second, cancellable) when a session you explicitly armed finishes."
+    Write-Host "Optional feature: 'Shutdown on done' (requires Node.js)." -ForegroundColor Yellow
+    Write-Host "  Installs the shutdown-on-done engine: a /shutdown-on-done command, a Stop hook"
+    Write-Host "  and a panel toggle button. The agent keeps working and powers the PC off only"
+    Write-Host "  at verified full completion (60s grace, 'shutdown -a' aborts)."
     $ans = Read-Host "  Install the shutdown feature? [y/N]"
     $wantShutdown = ($ans -eq 'y')
 }
 if ($wantShutdown) {
-    foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
-        $dst = Join-Path $skillsDir $s
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Host "  ! Node.js not found on PATH - the shutdown feature requires it. Skipped." -ForegroundColor Yellow
+    } else {
+        $hooksDir = Join-Path $claudeDir 'hooks'
+        New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
+        Copy-Item (Join-Path $src 'engine\shutdown-on-done.mjs') (Join-Path $hooksDir 'shutdown-on-done.mjs') -Force
+        $scriptFwd = ((Join-Path $hooksDir 'shutdown-on-done.mjs') -replace '\\', '/')
+        # Skill from template (script path substituted per user)
+        $dst = Join-Path $skillsDir 'shutdown-on-done'
         New-Item -ItemType Directory -Force -Path $dst | Out-Null
-        Copy-Item (Join-Path $src "skills-optional\$s\SKILL.md") (Join-Path $dst 'SKILL.md') -Force
-    }
-    $settings = Get-Settings
-    if (-not (Hook-Exists $settings 'Stop' 'close-pc-on-done.flag')) {
-        Ensure-HookArray $settings 'Stop'
-        $grp = [pscustomobject]@{ hooks = @([pscustomobject]@{ type='command'; shell='powershell'; timeout=15; command=$shutdownHookCmd }) }
-        $settings.hooks.Stop = @($settings.hooks.Stop) + $grp
+        $tpl = Get-Content (Join-Path $src 'skills-optional\shutdown-on-done\SKILL.md') -Raw -Encoding UTF8
+        Write-Utf8Bom (Join-Path $dst 'SKILL.md') ($tpl -replace '\{\{SCRIPT\}\}', $scriptFwd)
+        # Settings: migrate off the legacy hook, add engine hook + the allow rules the
+        # agent needs to arm the shutdown unattended
+        $settings = Get-Settings
+        Remove-Hook $settings 'Stop' 'close-pc-on-done.flag'   # legacy v1 hook, superseded
+        if (-not (Hook-Exists $settings 'Stop' 'shutdown-on-done.mjs')) {
+            Ensure-HookArray $settings 'Stop'
+            $grp = [pscustomobject]@{ hooks = @([pscustomobject]@{ type='command'; command="node `"$scriptFwd`""; timeout=15 }) }
+            $settings.hooks.Stop = @($settings.hooks.Stop) + $grp
+        }
+        Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle *)"
+        Ensure-AllowRule $settings "Bash(node $scriptFwd toggle *)"
         Save-Settings $settings
+        # Legacy skills out (superseded by /shutdown-on-done)
+        foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
+            $d = Join-Path $skillsDir $s
+            if (Test-Path $d) { Remove-Item $d -Recurse -Force }
+        }
+        # Default stateful power button (mirrors the .request marker; added once)
+        try {
+            $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -eq $cfg.buttons) { $cfg | Add-Member buttons @() -Force }
+            if (-not (@($cfg.buttons) | Where-Object { $_.text -eq '/shutdown-on-done on' })) {
+                $cfg.buttons = @($cfg.buttons) + [pscustomobject]@{
+                    label = 'Shutdown on done'; short = 'Shutdown'; icon = 'power'
+                    toggle = $true; confirm = $true
+                    stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
+                    text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
+                Write-Utf8Bom $cfgPath ($cfg | ConvertTo-Json -Depth 6)
+            }
+        } catch {}
+        Write-Host "  + Shutdown-on-done engine installed (completion-judged; power button added to the panel)." -ForegroundColor DarkGray
     }
-    Write-Host "  + Shutdown feature installed (session-bound, cancellable)." -ForegroundColor DarkGray
 }
 
 # 7) Autostart
