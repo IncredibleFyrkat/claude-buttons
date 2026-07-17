@@ -73,8 +73,9 @@ confirm to arm, one click to cancel. It is never installed silently.
 - Switch to the Claude app — the strip appears in the bottom bar.
 - **Right-click the dot-grip** → *Pin new button* → pick a command (choose scope with the checkboxes at the top).
 - **Left-click** a button to type its command; global buttons also press Enter, per-chat buttons let you review first.
-- **Right-click a button** → rename, set an icon, switch on/off (toggle) mode, move, or remove.
-- **Position** and **Language** live in the same grip menu.
+- **Hover a button** for a themed tooltip showing its command, scope and behavior — add your own explanation with a `"desc"` field in `buttons.json`.
+- **Right-click a button** → rename, edit the text/prompt, set an icon, switch on/off (toggle) mode, move, or remove.
+- **Position** and **Language** live in the same grip menu. *Position → Free placement* lets you drop the strip anywhere with the mouse (it stays anchored to the window); *Auto* re-docks it to the bottom bar.
 
 ### Icons
 

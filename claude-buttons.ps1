@@ -297,6 +297,12 @@ $script:reservedW = 380                 # width reserved for the app's own bar e
 if ($script:config.reservedW) { $script:reservedW = [int]$script:config.reservedW }
 $script:relX = 0.0
 if ($null -ne $script:config.relX) { $script:relX = [double]$script:config.relX }
+$script:freeX = $null   # fri placering: strimlens position relativt til vinduets top-venstre
+$script:freeY = $null
+if ($null -ne $script:config.freeX -and $null -ne $script:config.freeY) {
+    $script:freeX = [int]$script:config.freeX
+    $script:freeY = [int]$script:config.freeY
+}
 
 # ---------- Language (default: English; switch in the grip menu) ----------
 $script:lang = 'en'
@@ -309,6 +315,7 @@ $script:strings = @{
         confirm = 'Confirm?'; gripTip = 'Right-click: menu'
         position = 'Position'; posLeft = 'Left'; posCenter = 'Center'; posRight = 'Right'
         nudgeL = 'Nudge left'; nudgeR = 'Nudge right'
+        posFree = 'Free placement (move with mouse, click to drop)'; posAuto = 'Auto (dock to the bottom bar)'
         pinScopeChat = 'Pin to: only this chat'; pinScopeGlobal = 'Pin to: global (all chats)'
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
@@ -331,6 +338,7 @@ $script:strings = @{
         confirm = 'Bekræft?'; gripTip = 'Højreklik: menu'
         position = 'Position'; posLeft = 'Venstre'; posCenter = 'Centreret'; posRight = 'Højre'
         nudgeL = 'Skub til venstre'; nudgeR = 'Skub til højre'
+        posFree = 'Fri placering (flyt med musen, klik for at slippe)'; posAuto = 'Auto (dock i bundbjælken)'
         pinScopeChat = 'Pin til: kun denne chat'; pinScopeGlobal = 'Pin til: global (alle chats)'
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
@@ -361,6 +369,12 @@ function Save-PanelState {
         $fresh | Add-Member -NotePropertyName targetProcess -NotePropertyValue $targetProcess -Force
         $fresh | Add-Member -NotePropertyName lang -NotePropertyValue $script:lang -Force
         $fresh | Add-Member -NotePropertyName relX -NotePropertyValue ([Math]::Round($script:relX, 4)) -Force
+        if ($null -ne $script:freeX) {
+            $fresh | Add-Member -NotePropertyName freeX -NotePropertyValue $script:freeX -Force
+            $fresh | Add-Member -NotePropertyName freeY -NotePropertyValue $script:freeY -Force
+        } else {
+            foreach ($f in @('freeX', 'freeY')) { $fresh.PSObject.Properties.Remove($f) }
+        }
         foreach ($legacy in @('x', 'y', 'offsetX', 'offsetY', 'offsetBottom')) { $fresh.PSObject.Properties.Remove($legacy) }
         [void](Write-ConfigAtomic $fresh)
     } finally { [void]$script:cfgLock.ReleaseMutex() }
@@ -676,14 +690,57 @@ $form.Controls.Add($panel)
 # Dark theme on all menus (applies to the whole process)
 [System.Windows.Forms.ToolStripManager]::Renderer = New-Object CkRenderer
 
-$tip = New-Object System.Windows.Forms.ToolTip
-$tip.InitialDelay = 400
-$tip.AutoPopDelay = 8000
+# Custom hover tooltip - the built-in WinForms ToolTip is unreliable on a
+# window that never takes focus, so we draw our own themed tip form.
+$tipForm = New-Object NoActivateForm
+$tipForm.FormBorderStyle = 'None'
+$tipForm.TopMost = $true
+$tipForm.ShowInTaskbar = $false
+$tipForm.StartPosition = 'Manual'
+$tipForm.AutoSize = $true
+$tipForm.AutoSizeMode = 'GrowAndShrink'
+$tipForm.BackColor = [System.Drawing.Color]::FromArgb(46, 45, 43)
+$tipForm.Padding = New-Object System.Windows.Forms.Padding((S 9), (S 6), (S 9), (S 6))
+$tipLbl = New-Object System.Windows.Forms.Label
+$tipLbl.AutoSize = $true
+$tipLbl.MaximumSize = New-Object System.Drawing.Size((S 360), 0)
+$tipLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8.25)
+$tipLbl.ForeColor = [System.Drawing.Color]::FromArgb(216, 212, 204)
+$tipLbl.BackColor = $tipForm.BackColor
+$tipLbl.Location = New-Object System.Drawing.Point((S 9), (S 6))
+$tipForm.Controls.Add($tipLbl)
 
-# First-run onboarding balloon (shown once when there are no visible buttons)
-$balloon = New-Object System.Windows.Forms.ToolTip
-$balloon.IsBalloon = $true
+$script:hoverCtrl = $null
+$script:hoverAt = Get-Date '2000-01-01'
 $script:balloonShown = $false
+$script:tipUntil = $null
+
+function Show-TipForm([string]$text, $anchorCtrl) {
+    try {
+        $tipLbl.Text = $text
+        $p = $anchorCtrl.PointToScreen([System.Drawing.Point]::Empty)
+        $x = $p.X
+        $y = $form.Top - $tipForm.Height - (S 7)   # over strimlen (den ligger typisk nederst)
+        if ($y -lt 0) { $y = $form.Bottom + (S 7) }
+        $tipForm.Location = New-Object System.Drawing.Point($x, $y)
+        if (-not $tipForm.Visible) { $tipForm.Show() }
+    } catch {}
+}
+
+# Hover-tekst for en knap: valgfri "desc"-forklaring + kommando + scope + betjening
+function Get-TipText($b) {
+    $head = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
+    $head = $head -replace "`r`n", ' ' -replace "`n", ' '
+    if ($head.Length -gt 140) { $head = $head.Substring(0, 140) + [char]0x2026 }
+    $scope = if ($b.chat -or $b.chatTitle) {
+        $sl = if ($b.chatTitle) { $b.chatTitle } elseif ($b.chatLabel) { $b.chatLabel } else { $null }
+        if ($sl) { (L 'tipChatIn') -f $sl } else { L 'tipChatOnly' }
+    } else { L 'tipGlobal' }
+    $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
+    $out = ''
+    if ($b.desc) { $out = "$($b.desc)`n" }
+    "$out$head`n$scope - $enter`n$(L 'tipRemove')"
+}
 
 # Grip
 $grip = New-Object GripHandle
@@ -692,6 +749,8 @@ $grip.BackColor = $colBar
 $grip.Width = S(14)
 $grip.Height = $pillH
 $grip.Margin = New-Object System.Windows.Forms.Padding((S(2)), (S(2)), (S(2)), (S(2)))
+$grip.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+$grip.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
 
 # ---------- Instant pin menu (no Claude involved) ----------
 function Get-PinCatalog {
@@ -765,9 +824,19 @@ $posC = New-Object System.Windows.Forms.ToolStripMenuItem 'Center';     $posC.ad
 $posR = New-Object System.Windows.Forms.ToolStripMenuItem 'Right';      $posR.add_Click({ Set-CkRelX 0.97 })
 $posNL = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge left';  $posNL.add_Click({ Set-CkRelX ($script:relX - 0.05) })
 $posNR = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge right'; $posNR.add_Click({ Set-CkRelX ($script:relX + 0.05) })
+$posFree = New-Object System.Windows.Forms.ToolStripMenuItem 'Free placement'
+$posFree.add_Click({
+    $script:moveMode = $true
+    $script:moveModeAt = Get-Date
+    [void][CkWin]::GetAsyncKeyState(0x01)   # slug klikket der valgte menupunktet
+})
+$posAuto = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto (dock)'
+$posAuto.add_Click({ $script:freeX = $null; $script:freeY = $null; Save-PanelState })
 foreach ($mi in @($posL, $posC, $posR)) { [void]$miPos.DropDownItems.Add($mi) }
 [void]$miPos.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 foreach ($mi in @($posNL, $posNR)) { [void]$miPos.DropDownItems.Add($mi) }
+[void]$miPos.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+foreach ($mi in @($posFree, $posAuto)) { [void]$miPos.DropDownItems.Add($mi) }
 [void]$gripMenu.Items.Add($miPos)
 $miLang = New-Object System.Windows.Forms.ToolStripMenuItem 'Language'
 $subEn = New-Object System.Windows.Forms.ToolStripMenuItem 'English'
@@ -796,6 +865,8 @@ $gripMenu.add_Opening({
     $miPos.Text = L 'position'
     $posL.Text = L 'posLeft'; $posC.Text = L 'posCenter'; $posR.Text = L 'posRight'
     $posNL.Text = L 'nudgeL'; $posNR.Text = L 'nudgeR'
+    $posFree.Text = L 'posFree'; $posAuto.Text = L 'posAuto'
+    $posAuto.Checked = ($null -eq $script:freeX); $posFree.Checked = ($null -ne $script:freeX)
     $subEn.Checked = ($script:lang -eq 'en')
     $subDa.Checked = ($script:lang -eq 'da')
     $miPin.DropDownItems.Clear()
@@ -924,7 +995,7 @@ $miRemove.add_Click({
         $t = $src.Tag
         if (Update-Buttons { param($btns) $btns | Where-Object { -not (Same-Button $_ $t) } }) {
             if ($script:armedBtn -eq $src) { $script:armedBtn = $null }
-            $tip.SetToolTip($src, $null)
+            if ($script:hoverCtrl -eq $src) { $script:hoverCtrl = $null }
             $panel.Controls.Remove($src)
             $src.Dispose()
             $script:menuSource = $null
@@ -990,6 +1061,8 @@ $script:menuAway = 0
 $script:armedBtn = $null
 $script:armedAt = Get-Date '2000-01-01'
 $script:stateGlobLast = Get-Date '2000-01-01'
+$script:moveMode = $false
+$script:moveModeAt = Get-Date '2000-01-01'
 
 function Test-TargetForeground {
     [CkWin]::GetForegroundWindow() -eq $script:target
@@ -1009,6 +1082,8 @@ function Get-ToggleState($item) {
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    if ($script:moveMode) { return }  # the drop click must never fire a button
+    if ($tipForm.Visible) { $tipForm.Hide() }
     try {
         $item = $btn.Tag
         # Two-click confirmation for destructive buttons (within 3 s).
@@ -1069,12 +1144,12 @@ function Rebuild-Buttons {
     $form.SuspendLayout()
     $panel.SuspendLayout()
     $old = @($panel.Controls | Where-Object { $_ -ne $grip })
-    foreach ($o in $old) { $tip.SetToolTip($o, $null) }  # drop tooltip registrations for disposed controls
     $script:armedBtn = $null
     $script:menuSource = $null
+    $script:hoverCtrl = $null
+    if ($tipForm.Visible) { $tipForm.Hide() }
     $panel.Controls.Clear()
     $panel.Controls.Add($grip)
-    $tip.SetToolTip($grip, (L 'gripTip'))
     foreach ($b in $script:config.buttons) {
         if (-not (Test-ChatButtonVisible $b)) { continue }
         $btn = New-Object PillButton
@@ -1092,15 +1167,8 @@ function Rebuild-Buttons {
         $btn.ContextMenuStrip = $btnMenu
         $btn.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
         $btn.add_Click({ Invoke-PillClick $this })
-        $scope = if ($b.chat -or $b.chatTitle) {
-            $sl = if ($b.chatTitle) { $b.chatTitle } elseif ($b.chatLabel) { $b.chatLabel } else { $null }
-            if ($sl) { (L 'tipChatIn') -f $sl } else { L 'tipChatOnly' }
-        } else { L 'tipGlobal' }
-        $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
-        $tipHead = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
-        $tipHead = $tipHead -replace "`r`n", ' ' -replace "`n", ' '
-        if ($tipHead.Length -gt 140) { $tipHead = $tipHead.Substring(0, 140) + [char]0x2026 }
-        $tip.SetToolTip($btn, "$tipHead`n$scope - $enter`n$(L 'tipRemove')")
+        $btn.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+        $btn.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
         $panel.Controls.Add($btn)
     }
     $panel.ResumeLayout()
@@ -1208,8 +1276,10 @@ $timer.add_Tick({
                 ([CkWin]::GetForegroundWindow() -eq $script:target)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
+            if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
+            $script:moveMode = $false
             return
         }
 
@@ -1231,31 +1301,65 @@ $timer.add_Tick({
         elseif ($script:compact -and (Get-StripWidth $false) -lt ($avail - (S(60)))) { $newCompact = $false }
         if ($newCompact -ne $script:compact) { $script:compact = $newCompact; Rebuild-Buttons }
 
-        # Horizontal: after the app's own left cluster (relX nudges within the remaining space).
-        # Vertical: locked to the app's bottom button row (self-calibrating).
-        $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
-        $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
-        $x = $startX + [int]($script:relX * $room)
-        if ($null -ne $script:rowCenterOff) {
-            $y = $r.Bottom - $script:rowCenterOff - [int]($form.Height / 2)
-        } else {
-            $y = $r.Bottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
-        }
-        $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
-        $y = [Math]::Max($r.Top + 4, [Math]::Min($y, $r.Bottom - $form.Height - 2))
-        $desired = New-Object System.Drawing.Point($x, $y)
-        if ($form.Location -ne $desired) {
+        if ($script:moveMode) {
+            # Fri flytning: strimlen foelger musen; et venstreklik slipper den
+            if ($tipForm.Visible) { $tipForm.Hide() }
+            $mp = [System.Windows.Forms.Cursor]::Position
             $script:autoMove = $true
-            $form.Location = $desired
+            $form.Location = New-Object System.Drawing.Point(($mp.X - [int]($form.Width / 2)), ($mp.Y - (S 10)))
             $script:autoMove = $false
+            $drop = (([CkWin]::GetAsyncKeyState(0x01) -band 0x8001) -ne 0)
+            if ($drop -and ((Get-Date) - $script:moveModeAt).TotalMilliseconds -gt 400) {
+                $script:moveMode = $false
+                $script:freeX = [int]($form.Left - $r.Left)
+                $script:freeY = [int]($form.Top - $r.Top)
+                Save-PanelState
+            }
+        } else {
+            if ($null -ne $script:freeX) {
+                # Fri placering: fast punkt relativt til vinduet
+                $x = $r.Left + $script:freeX
+                $y = $r.Top + $script:freeY
+            } else {
+                # Horizontal: after the app's own left cluster (relX nudges within the remaining space).
+                # Vertical: locked to the app's bottom button row (self-calibrating).
+                $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
+                $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
+                $x = $startX + [int]($script:relX * $room)
+                if ($null -ne $script:rowCenterOff) {
+                    $y = $r.Bottom - $script:rowCenterOff - [int]($form.Height / 2)
+                } else {
+                    $y = $r.Bottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
+                }
+            }
+            $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
+            $y = [Math]::Max($r.Top + 4, [Math]::Min($y, $r.Bottom - $form.Height - 2))
+            $desired = New-Object System.Drawing.Point($x, $y)
+            if ($form.Location -ne $desired) {
+                $script:autoMove = $true
+                $form.Location = $desired
+                $script:autoMove = $false
+            }
         }
         if (-not $form.Visible) { $form.Show() }
         if ($form.Opacity -lt 1) { $form.Opacity = 1 }
 
-        # First-run hint: no visible buttons yet -> show a one-time balloon on the grip
+        # Hover-tooltip + engangs foerstegangs-hint (egen tip-boks - indbygget ToolTip
+        # viser sig ikke paalideligt paa et vindue uden fokus)
         if (-not $script:balloonShown -and ($panel.Controls.Count -le 1)) {
             $script:balloonShown = $true
-            try { $balloon.Show((L 'firstRun'), $grip, 0, -($grip.Height), 6000) } catch {}
+            $script:tipUntil = (Get-Date).AddSeconds(6)
+            Show-TipForm (L 'firstRun') $grip
+        }
+        if ($script:tipUntil) {
+            if ((Get-Date) -gt $script:tipUntil) { $script:tipUntil = $null; if ($tipForm.Visible) { $tipForm.Hide() } }
+        } elseif ($menusOpen.Count -eq 0 -and -not $script:moveMode -and $script:hoverCtrl) {
+            if (((Get-Date) - $script:hoverAt).TotalMilliseconds -gt 500 -and -not $tipForm.Visible) {
+                $txt = if ($script:hoverCtrl -eq $grip) { L 'gripTip' } else { Get-TipText $script:hoverCtrl.Tag }
+                Show-TipForm $txt $script:hoverCtrl
+            }
+        } elseif ($tipForm.Visible) {
+            $tipForm.Hide()
         }
     } catch {
         Write-CkLog "Tick error: $($_.Exception.Message)"

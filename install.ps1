@@ -206,6 +206,7 @@ if ($wantShutdown) {
             if (-not (@($cfg.buttons) | Where-Object { $_.text -eq '/shutdown-on-done on' })) {
                 $cfg.buttons = @($cfg.buttons) + [pscustomobject]@{
                     label = 'Shutdown on done'; short = 'Shutdown'; icon = 'power'
+                    desc = 'Shuts the PC down once this chat is COMPLETELY done with all its work (agent-judged, 60 s grace). Lit while a request is standing; click again to cancel.'
                     toggle = $true; confirm = $true
                     stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
                     text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
