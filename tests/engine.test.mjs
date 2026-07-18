@@ -79,14 +79,16 @@ test('toggle off clears the flag and the request', () => {
   assert.ok(!existsSync(join(flagDir(), 'sOff.request')));
 });
 
-test("toggle off clears EVERY session's flags, not just this chat (global disarm)", () => {
-  // Arm chat A, then disarm from chat B: A must not survive to shut the PC down.
+test('toggle off is per-chat: cancelling one chat leaves other armed chats intact', () => {
+  // Arm A and B independently, then off from B: A must SURVIVE (per-chat arming).
   toggle('toggle request-on', 'chatA');
   toggle('toggle on --this-turn', 'chatA');
-  assert.ok(existsSync(join(flagDir(), 'chatA.json')), 'chatA armed');
+  toggle('toggle request-on', 'chatB');
+  toggle('toggle on --this-turn', 'chatB');
   toggle('toggle off', 'chatB');
-  assert.ok(!existsSync(join(flagDir(), 'chatA.json')), 'chatA flag cleared by chatB off');
-  assert.ok(!existsSync(join(flagDir(), 'chatA.request')), 'chatA request cleared by chatB off');
+  assert.ok(!existsSync(join(flagDir(), 'chatB.json')), 'chatB disarmed by its own off');
+  assert.ok(existsSync(join(flagDir(), 'chatA.json')), 'chatA still armed (not touched by chatB off)');
+  assert.ok(existsSync(join(flagDir(), 'chatA.request')), 'chatA request intact');
 });
 
 test('Stop hook: skip counter decrements without firing', () => {

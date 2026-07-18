@@ -13,7 +13,7 @@
 //     starts a 60s-grace shutdown (abort with `shutdown -a`).
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -96,21 +96,19 @@ if (mode === 'toggle') {
     rmSync(requestPath(id), { force: true });
     console.log('Standing shutdown request cleared for this chat.');
   } else if (action === 'off') {
-    // Global disarm: clear EVERY session's flags, not just this chat's. The panel's
-    // power button is global and lit whenever ANY *.request marker exists, so its
-    // "off" must mean "no shutdown, anywhere". A per-session off left other armed
-    // chats live and the PC shut down after the user believed they had cancelled.
-    if (existsSync(FLAG_DIR)) {
-      for (const f of readdirSync(FLAG_DIR)) {
-        if (f.endsWith('.log')) continue; // keep the audit log
-        rmSync(join(FLAG_DIR, f), { force: true });
-      }
-    }
+    // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
+    // must be too - disarming one chat must never silently disarm another the user
+    // still wants armed. The global power button stays lit while any OTHER chat is
+    // armed (its *.request glob still matches), which honestly signals "still armed
+    // elsewhere" rather than going dark on a shutdown that is actually still coming.
+    rmSync(flagPath(id), { force: true });
+    rmSync(requestPath(id), { force: true });
+    rmSync(MACHINE_FLAG, { force: true });
     const abort = spawnSync(SHUTDOWN_EXE, ['-a'], { stdio: 'pipe' });
     console.log(
       abort.status === 0
-        ? 'Disarmed (all chats + machine switch), and aborted a shutdown countdown that was already in flight.'
-        : 'Disarmed (all chats + machine switch): nothing will shut down the PC.',
+        ? 'Disarmed this chat (+ machine switch), and aborted a shutdown countdown that was already in flight.'
+        : 'Disarmed this chat (+ machine switch): this chat will no longer shut down the PC.',
     );
   } else {
     const chat = existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
