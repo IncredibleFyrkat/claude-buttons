@@ -66,16 +66,27 @@ const writeFlagAtomic = (p, data) => {
       try { renameSync(tmp, p); return; } catch (e) {
         // On Windows, rename-over-existing fails with EPERM/EBUSY while ANY process holds the
         // target open (Defender, a backup agent, an indexer). The plain write it replaced
-        // tolerated that, so an unguarded rename is a reliability REGRESSION. Retry briefly.
+        // tolerated that, so an unguarded rename is a reliability REGRESSION. Retry with a
+        // real backoff - a retry loop with no delay completes in microseconds and cannot
+        // outlast the transient hold it exists to survive.
         if (i >= 4 || (e.code !== 'EPERM' && e.code !== 'EBUSY')) throw e;
+        const until = Date.now() + 120 * (i + 1);
+        while (Date.now() < until) { /* deliberate sync sleep: this path must not go async */ }
       }
     }
   } catch (e) {
     // Never let a flag write crash the hook: an uncaught throw here means the arm silently
     // fails behind a stack trace, or the counter is not written and the shutdown lands late.
-    rmSync(tmp, { force: true });
-    writeFileSync(p, data);   // last resort: the old, non-atomic path is better than nothing
-    logLine(`atomic flag write fell back to a direct write: ${e.code ?? e}`);
+    try { rmSync(tmp, { force: true }); } catch {}
+    try {
+      writeFileSync(p, data);   // last resort: the old, non-atomic path is better than nothing
+      logLine(`atomic flag write fell back to a direct write: ${e.code ?? e}`);
+    } catch (e2) {
+      // The fallback hits the SAME lock the retry just exhausted on, so it must be guarded
+      // too - an unguarded one crashed every turn-end with a raw stack trace and emitted no
+      // confirmation at all. Failing here defers the shutdown, which is the safe direction.
+      logLine(`flag write FAILED entirely (${e.code ?? e} then ${e2.code ?? e2}); state unchanged`);
+    }
   }
 };
 
@@ -225,7 +236,11 @@ if (!id || !existsSync(flagPath(id))) {
 // stop_hook_active) and - far worse - left the flag armed, so the shutdown the user was
 // promised for THIS turn silently detonated at the end of some unrelated later turn. That
 // moves a power-off from a moment they consented to, to one they did not.
-const sameTurn = input.stop_hook_active === true;
+// Truthy, not === true: line ~208 tests this field truthily, and a strict check here would
+// disagree with it if the harness ever sent 1 or "true" - treating a re-entry as a fresh turn
+// and firing a turn early. In a file whose whole principle is fail-closed, the permissive
+// reading is the safe one, because it can only ever DELAY a shutdown.
+const sameTurn = Boolean(input.stop_hook_active);
 
 // Fail CLOSED. `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant
 // every truncated / empty / malformed flag powered the PC off. There is no shape of

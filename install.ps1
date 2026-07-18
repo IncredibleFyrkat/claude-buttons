@@ -136,12 +136,24 @@ function Get-JsonDepth($o, [int]$d = 0) {
     if ($d -gt 120) { return $d }                              # cycle guard
     if ($null -eq $o -or $o -is [string] -or $o -is [ValueType]) { return $d }
     $max = $d
-    $children = if ($o -is [System.Collections.IDictionary]) { $o.Values }
-                elseif ($o -is [System.Collections.IEnumerable]) { $o }
-                else { $o.PSObject.Properties.Value }
-    foreach ($c in @($children)) {
-        $cd = Get-JsonDepth $c ($d + 1)
-        if ($cd -gt $max) { $max = $cd }
+    if ($o -is [System.Collections.IDictionary]) {
+        foreach ($k in @($o.Keys)) {
+            $cd = Get-JsonDepth $o[$k] ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
+    }
+    elseif ($o -is [System.Collections.IList]) {
+        # Index, never pipe. PowerShell UNROLLS nested arrays through @() and the pipeline, so
+        # walking children that way under-measures an array-of-arrays - a 10-deep array chain
+        # measured 6. `hooks` is an array of objects containing arrays of objects, so that is
+        # exactly the shape this guard exists to measure.
+        for ($i = 0; $i -lt $o.Count; $i++) {
+            $cd = Get-JsonDepth $o[$i] ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
+    }
+    else {
+        foreach ($p in $o.PSObject.Properties) {
+            $cd = Get-JsonDepth $p.Value ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
     }
     return $max
 }

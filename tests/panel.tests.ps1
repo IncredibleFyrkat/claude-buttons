@@ -214,10 +214,15 @@ function Invoke-CbCli([string]$json, [string]$switchName, [string]$startCfg) {
     $fakeHome = Join-Path $dir 'home'
     New-Item -ItemType Directory -Force -Path (Join-Path $fakeHome '.claude') | Out-Null
     $prevHome = $env:USERPROFILE
+    $prevEap  = $ErrorActionPreference
     try {
         $env:USERPROFILE = $fakeHome
+        # PS 5.1 wraps a native command's stderr in ErrorRecords, which under
+        # $ErrorActionPreference='Stop' terminate the whole test run. Several of these cases
+        # deliberately exercise stderr paths (AMBIGUOUS, bad payload), so relax it here only.
+        $ErrorActionPreference = 'Continue'
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') $switchName $pay 2>&1
-    } finally { $env:USERPROFILE = $prevHome }
+    } finally { $env:USERPROFILE = $prevHome; $ErrorActionPreference = $prevEap }
     $after = Get-Content (Join-Path $dir 'buttons.json') -Raw
     Remove-Item $dir -Recurse -Force
     [pscustomobject]@{ Out = "$out"; Labels = (($after | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ',' }
@@ -238,6 +243,21 @@ Check 'CLI remove deletes the matching button' (($r.Out -match 'REMOVED') -and (
 $r = Invoke-CbCli '{"label":"Ghost","text":"/ghost"}' '-RemoveButton' $start
 Check 'CLI remove of a missing button reports NOTFOUND' ($r.Out -match 'NOTFOUND')
 Check 'a DECLINED remove leaves the file intact' ($r.Labels -eq 'Kept')
+
+# Identity is CASE-SENSITIVE. PowerShell's -eq is not, so unpinning "Deploy" also deleted a
+# genuinely different button "deploy" carrying a different prompt - with no backup and no undo.
+$cased = '{"buttons":[{"label":"Deploy","text":"/deploy prod"},{"label":"deploy","text":"/DEPLOY PROD"},{"label":"Safe","text":"/safe"}]}'
+$r = Invoke-CbCli '{"label":"Deploy","text":"/deploy prod"}' '-RemoveButton' $cased
+Check 'remove is case-SENSITIVE: the other-case button survives' ($r.Labels -eq 'deploy,Safe')
+$r = Invoke-CbCli '{"label":"DEPLOY","text":"/deploy prod"}' '-RemoveButton' $cased
+Check 'a wrong-case payload matches nothing rather than the wrong button' `
+    (($r.Out -match 'NOTFOUND') -and ($r.Labels -eq 'Deploy,deploy,Safe'))
+
+# An ambiguous delete must refuse, not guess. skills/unpin/SKILL.md documents exit 3 for this.
+$dupes = '{"buttons":[{"label":"Dup","text":"/x"},{"label":"Dup","text":"/x"},{"label":"Keep","text":"/k"}]}'
+$r = Invoke-CbCli '{"label":"Dup","text":"/x"}' '-RemoveButton' $dupes
+Check 'an ambiguous remove is REFUSED (exit 3) and deletes nothing' `
+    (($r.Out -match 'AMBIGUOUS') -and ($r.Labels -eq 'Dup,Dup,Keep'))
 
 # --- Does the lock actually LOCK? (QA-2/QA-3) ---
 # The battery above proves add/remove works with a single writer. It does NOT prove the mutex
@@ -284,7 +304,12 @@ $finalLabels = ((Get-Content $cfgFile -Raw | ConvertFrom-Json).buttons | ForEach
 Remove-Item $dir -Recurse -Force
 
 Check 'the CLI waits for the lock and reports success' ("$lockOut" -match 'ADDED')
-Check "a concurrent writer's button SURVIVES the CLI write (got: $finalLabels)" ($finalLabels -eq 'Start,FromPanel,FromCli')
+# Assert MEMBERSHIP, not order. Which writer wins the mutex is a legitimate race; losing a
+# button is not. Asserting the exact sequence would fail on a correctly-merged run that simply
+# interleaved the other way - a flaky test that punishes the behaviour it is meant to protect.
+$lockSet = @($finalLabels -split ',')
+Check "no button is lost under concurrent writers (got: $finalLabels)" `
+    (($lockSet.Count -eq 3) -and ($lockSet -contains 'Start') -and ($lockSet -contains 'FromPanel') -and ($lockSet -contains 'FromCli'))
 
 # The skills must route through the locked entry point, not edit the JSON themselves.
 foreach ($s in @('pin', 'unpin')) {

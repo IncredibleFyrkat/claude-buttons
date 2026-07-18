@@ -562,7 +562,12 @@ $activePath = Join-Path $env:USERPROFILE '.claude\active-session.json'
 # run from the wrong folder would rewrite the very file the skills use to find the panel, and
 # the breakage is self-propagating because there is then no correct path left to recover from.
 # No BOM: the skills read this as a PATH, and a leading U+FEFF is a silent "file not found".
-if (-not $SmokeTest -and -not $AddButton -and -not $RemoveButton) {
+# Deliberately a FUNCTION, called only after the single-instance mutex is won (see the bottom
+# of this file). Writing it here would still repoint a live install's marker when someone
+# double-clicks a repo copy once: that duplicate exits at the single-instance guard ~2000 lines
+# later, but by then it has already rewritten the file the skills use to find the panel.
+function Write-InstallMarker {
+    if ($SmokeTest -or $AddButton -or $RemoveButton) { return }
     try {
         $markerDir = Join-Path $env:USERPROFILE '.claude'
         if (Test-Path $markerDir) {
@@ -2528,6 +2533,9 @@ if ($SmokeTest) {
 $created = $false
 $script:mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeButtonsPanel', [ref]$created)
 if (-not $created) { Write-CkLog 'Another instance is already running - exiting' ; exit 0 }
+
+# Only now: this process is THE panel for this session, so its path is the authoritative one.
+Write-InstallMarker
 
 [WinHook]::Start()   # let Windows push window move/resize/foreground/chat-switch events
 $timer.Start()

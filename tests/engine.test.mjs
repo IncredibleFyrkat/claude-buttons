@@ -236,6 +236,51 @@ test('request-off also drops the arm it authorised (button state cannot lie)', (
   assert.doesNotMatch(out, /would start PC shutdown/, 'a withdrawn request must not still fire');
 });
 
+// The MACHINE-ARMED round trip. Round 1 "fixed" double-counting with a blanket
+// `if (input.stop_hook_active) process.exit(0)`, which killed this feature outright - the wake
+// IS a decision:"block", so the invocation that would fire always carries stop_hook_active -
+// and left the flag armed to detonate at an arbitrary later turn. Every other test passed with
+// the feature dead, so this end-to-end path is what actually guards against its resurrection.
+test('MACHINE-ARMED round trip: wake, arm, and FIRE on the same turn', () => {
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  const wake = stop({ session_id: 'sTrip', stop_hook_active: false });
+  assert.match(wake.out, /"decision":"block"/, 'turn end wakes the model to judge completion');
+  toggle('toggle on --this-turn', 'sTrip');      // the model judges "done" and arms
+  const fired = stop({ session_id: 'sTrip', stop_hook_active: true });   // re-entry caused BY the block
+  assert.match(fired.out, /would start PC shutdown/, 'the promised turn must actually fire');
+  assert.ok(!existsSync(join(flagDir(), 'sTrip.json')), 'flag consumed, not left to detonate later');
+});
+
+test('an armed chat does not detonate in a LATER unrelated turn', () => {
+  const id = 'sLater';
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  stop({ session_id: id, stop_hook_active: false });
+  toggle('toggle on --this-turn', id);
+  stop({ session_id: id, stop_hook_active: true });          // fires here
+  const later = stop({ session_id: id, stop_hook_active: false });
+  assert.doesNotMatch(later.out, /would start PC shutdown/, 'must not fire again in a later turn');
+});
+
+// TEST-02: these behaviours were all correct but unguarded - reverting any of them left the
+// suite fully green.
+test('request-off also clears the machine switch (else the wake re-arms next turn)', () => {
+  const id = 'sReqOffMachine';
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  toggle('toggle request-on', id);
+  toggle('toggle on --this-turn', id);
+  toggle('toggle request-off', id);
+  assert.ok(!existsSync(join(flagDir(), 'MACHINE-ARMED')), 'machine switch cleared too');
+  const woke = stop({ session_id: id, stop_hook_active: false });
+  assert.equal(woke.out, '', 'a withdrawn request must not be re-armed by a lingering wake');
+});
+
+test('a flag with no verb is rejected rather than reported as status', () => {
+  const r = toggle('toggle --this-turn', 'sNoVerb');
+  assert.equal(r.code, 1, 'exits non-zero');
+  assert.match(r.err, /needs a verb/);
+  assert.doesNotMatch(r.out, /Armed for this chat|Not armed/, 'must not read as an arm confirmation');
+});
+
 // QA-07: machineArmedFresh() is what makes the 12h expiry real, but only the Stop path was
 // covered - a forgotten week-old switch could still satisfy the anti-injection arm gate.
 test('a STALE machine switch does not satisfy the arm gate', () => {
