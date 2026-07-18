@@ -706,9 +706,9 @@ function Same-Button($a, $b) {
 }
 
 # ---------- Text helpers ----------
-$script:btnFont = New-Object System.Drawing.Font('Segoe UI', 8.5)
+$script:btnFont = New-Object System.Drawing.Font('Segoe UI', 11)
 $script:compact = $false
-$script:padX = S(10)
+$script:padX = S(6)   # tighter side padding so the label can carry a larger font at the same width
 
 # ---------- Icons (built-in Windows icon font - Lucide-style line icons, no downloads) ----------
 $fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
@@ -733,8 +733,28 @@ $script:iconMap = @{
     'redo'='E7A6'; 'clipboard'='E77F'; 'file'='E7C3'; 'keyboard'='E765'; 'bulb'='EA80'
     # chat / feedback
     'comment'='E90A'; 'message'='E8BD'; 'thumbup'='E8E1'; 'thumbdown'='E8E0'; 'more'='E712'
-    # arrows
+    # arrows / navigation
     'arrow-right'='E72A'; 'arrow-left'='E72B'; 'arrow-up'='E70E'; 'arrow-down'='E70D'
+    'up'='E74A'; 'down'='E74B'; 'chevron-left'='E76B'; 'chevron-right'='E76C'
+    'expand'='E740'; 'collapse'='E73F'; 'move'='E7C2'; 'menu'='E700'; 'grid'='E75F'
+    # notes / documents
+    'note'='E70B'; 'document'='E729'; 'text'='E7BC'; 'book'='E736'; 'archive'='E7B8'
+    'tag'='E75C'; 'attach'='E723'; 'checklist'='E762'; 'brackets'='E799'; 'cut'='E77A'
+    # media / image
+    'image'='E7AA'; 'video'='E714'; 'crop'='E7A8'; 'palette'='E790'; 'brush'='E754'
+    'contrast'='E7A1'; 'volume'='E767'; 'mute'='E74F'; 'headphones'='E7F6'; 'record'='E7C8'
+    # people / social
+    'people'='E716'; 'contacts'='E779'; 'badge'='E780'; 'smile'='E76E'; 'chat'='E7E7'
+    'share'='E72D'; 'megaphone'='E789'; 'gift'='E74C'; 'cart'='E7BF'
+    # devices / system
+    'monitor'='E770'; 'laptop'='E75B'; 'mobile'='E72F'; 'mouse'='E75E'; 'devices'='E703'
+    'wifi'='E701'; 'bluetooth'='E702'; 'cloud'='E753'; 'print'='E749'; 'game'='E7FC'
+    'car'='E7EC'; 'plane'='E709'; 'building'='E731'
+    # actions / state
+    'sparkle'='E794'; 'target'='E759'; 'sliders'='E78A'; 'zoom-in'='E71E'; 'zoom-out'='E71F'
+    'unlock'='E785'; 'block'='E733'; 'reset'='E777'; 'logout'='E7F2'; 'alarm'='E781'
+    'bell-off'='E7ED'; 'star-fill'='E735'; 'location'='E707'; 'translate'='E775'
+    'accessibility'='E776'; 'education'='E7BE'; 'click'='E7C9'
 }
 # Dark single-line input dialog (replaces the plain white VB InputBox). Returns $null on cancel.
 function Show-InputDialog([string]$title, [string]$message, [string]$default) {
@@ -858,7 +878,29 @@ function Show-IconPicker([string]$current) {
         $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
         $ib.BackColor = if ($e.name -eq $current) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
         $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
-        if ($e.glyph) { $ib.Font = $bigIcon; $ib.Text = $e.glyph }
+        if ($e.glyph) {
+            # Draw the glyph ourselves with the SAME faux-bold the strip uses, so the picker
+            # previews the true stroke weight instead of a thinner plain-rendered glyph. The
+            # offset scales with the picker's larger font so the weight matches proportionally.
+            $ib.Font = $bigIcon; $ib.Text = ''
+            $ib.add_Paint({
+                param($src, $pe)
+                $gl = Get-IconGlyph ([string]$this.Tag)
+                if (-not $gl) { return }
+                $gr = $pe.Graphics
+                $gr.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+                $sf = New-Object System.Drawing.StringFormat
+                $sf.Alignment = [System.Drawing.StringAlignment]::Center
+                $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+                $br = New-Object System.Drawing.SolidBrush($this.ForeColor)
+                $o = 0.3 * ($this.Font.Size / 9.0)
+                foreach ($d in @(@(-$o, 0.0), @($o, 0.0), @(0.0, -$o), @(0.0, $o), @(0.0, 0.0))) {
+                    $r = New-Object System.Drawing.RectangleF($d[0], $d[1], $this.Width, $this.Height)
+                    $gr.DrawString($gl, $this.Font, $br, $r, $sf)
+                }
+                $br.Dispose(); $sf.Dispose()
+            })
+        }
         else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
         $ib.Tag = $e.name
         # No GetNewClosure: $this must resolve to the clicked button at event time,
@@ -1609,8 +1651,37 @@ function Focus-ChatInput($stripCenterX, $stripTopY) {
             $score = $dx + $dy
             if ($score -lt $bestScore) { $best = $c; $bestScore = $score }
         }
-        if ($best) { $best.El.SetFocus() }
+        if ($best) { $best.El.SetFocus(); return $best.El }
     } catch {}
+    return $null
+}
+
+# Block until keyboard focus has ACTUALLY landed inside the given composer. SetFocus on a
+# Chromium composer is asynchronous: typing straight after it sends the first characters to
+# whichever chat was focused before, splitting one message across two chats. Polling the real
+# focused element replaces the old fixed delay - it is both correct and snappier, since focus
+# normally lands in ~20-40ms. Returns $false on timeout so the caller aborts instead of typing
+# into the wrong chat. Focus often lands on an inner editable node, so a descendant whose rect
+# sits inside the composer counts as focused.
+function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 800) {
+    if (-not $composerEl) { return $false }
+    try { $cr = $composerEl.Current.BoundingRectangle } catch { return $false }
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $f = [System.Windows.Automation.AutomationElement]::FocusedElement
+            if ($f) {
+                if ([System.Windows.Automation.Automation]::Compare($f, $composerEl)) { return $true }
+                $fr = $f.Current.BoundingRectangle
+                if ($fr.Width -gt 0 -and $fr.Height -gt 0 -and
+                    $fr.X -ge ($cr.X - 4) -and $fr.Y -ge ($cr.Y - 4) -and
+                    ($fr.X + $fr.Width) -le ($cr.X + $cr.Width + 4) -and
+                    ($fr.Y + $fr.Height) -le ($cr.Y + $cr.Height + 4)) { return $true }
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 12
+    }
+    return $false
 }
 
 $script:toggleState = @{}   # in-memory on/off state for toggle buttons (per panel run)
@@ -1670,47 +1741,57 @@ function Invoke-PillClick($btn) {
         }
         $script:sending = $true
         try {
-            Start-Sleep -Milliseconds 120
+            Start-Sleep -Milliseconds 40
             # Focus THIS pane's composer first. SetFocus on the composer pulls Claude forward and
             # puts the caret in the right box even if Claude was not the active window - so you can
-            # click a button from another window. Then verify Claude is now foreground before typing
-            # (if focusing failed, abort rather than type into whatever else was focused).
+            # click a button from another window. Then WAIT for focus to actually land in that
+            # composer: a foreground check alone is not enough, because when Claude is already
+            # foreground with another chat focused it passes instantly and the first characters
+            # go to the wrong chat. Abort if focus never lands rather than type into the wrong box.
             $sf = $btn.FindForm()
-            if ($sf) { Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top; Start-Sleep -Milliseconds 160 }
+            $composerEl = if ($sf) { Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top } else { $null }
+            if (-not (Wait-ComposerFocus $composerEl)) {
+                Write-CkLog 'Send aborted: focus never landed in this pane composer'
+                return
+            }
             if (-not (Test-TargetForeground)) { return }   # focus didn't reach Claude - don't type elsewhere
             # Toggle with nothing to send (off, no textOff): flip only, we're foreground.
             if ($isToggle -and [string]::IsNullOrEmpty($textToSend)) { Set-ToggleFace $item $newOn; return }
 
-            if ($textToSend.Length -gt 80 -or $textToSend -match "`n") {
-                # Long/multiline prompts: paste atomically via clipboard (fast, no typing race).
-                # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
-                # it clobbered, and restore in finally so it's restored even on an exception.
-                if (-not (Test-TargetForeground)) { return }
-                if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
-                $backup = $null; $snapOk = $false
-                try {
-                    $old = [System.Windows.Forms.Clipboard]::GetDataObject()
-                    $backup = New-Object System.Windows.Forms.DataObject
-                    if ($old) { foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} } }
-                    $snapOk = $true   # empty snapshot = "was empty"; restoring it re-empties correctly
-                } catch { $snapOk = $false }
-                try {
-                    [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
-                    [System.Windows.Forms.SendKeys]::SendWait('^v')
-                    Start-Sleep -Milliseconds 300
-                } finally {
-                    # M1: always restore the full prior clipboard. If the snapshot itself failed we
-                    # leave our text rather than guess (can't safely reconstruct unknown content).
-                    if ($snapOk) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
-                }
-            } else {
+            # ALWAYS paste via the clipboard rather than typing: it lands instantly instead of
+            # animating key-by-key, and it is ATOMIC - a focus change mid-send can no longer
+            # split one message across two chats. Typing is kept only as a fallback for when the
+            # clipboard is unavailable (another app holding it open).
+            # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
+            # it clobbered, and restore it in finally so it survives an exception.
+            if (-not (Test-TargetForeground)) { return }
+            if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
+            $backup = $null; $snapOk = $false; $pasted = $false
+            try {
+                $old = [System.Windows.Forms.Clipboard]::GetDataObject()
+                $backup = New-Object System.Windows.Forms.DataObject
+                if ($old) { foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} } }
+                $snapOk = $true   # empty snapshot = "was empty"; restoring it re-empties correctly
+            } catch { $snapOk = $false }
+            try {
+                [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                [System.Windows.Forms.SendKeys]::SendWait('^v')
+                $pasted = $true
+                Start-Sleep -Milliseconds 90   # let the paste land in the composer
+            } catch {
+                Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
+            } finally {
+                # M1: always restore the full prior clipboard. If the snapshot itself failed we
+                # leave our text rather than guess (can't safely reconstruct unknown content).
+                if ($snapOk) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
+            }
+            if (-not $pasted) {
                 if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
-                if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
                 [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             }
             # Per-chat buttons never auto-send: the user must see the text before Enter
             if ($item.submit -and -not $item.chat) {
-                Start-Sleep -Milliseconds 400
+                Start-Sleep -Milliseconds 90
                 if (-not (Test-TargetForeground)) { return }
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
             }
