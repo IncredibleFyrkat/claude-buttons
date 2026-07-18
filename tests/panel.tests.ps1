@@ -279,8 +279,9 @@ $cfgFile = Join-Path $dir 'buttons.json'
 [IO.File]::WriteAllText((Join-Path $dir 'pay.json'), '{"label":"FromCli","text":"/cli"}',
                         (New-Object System.Text.UTF8Encoding($false)))
 
-$holder = Start-Job -ArgumentList $cfgFile -ScriptBlock {
-    param($cfg)
+$readyFile = Join-Path $dir 'holder-ready.flag'
+$holder = Start-Job -ArgumentList $cfgFile, $readyFile -ScriptBlock {
+    param($cfg, $ready)
     $m = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
     [void]$m.WaitOne(5000)
     try {
@@ -288,6 +289,7 @@ $holder = Start-Job -ArgumentList $cfgFile -ScriptBlock {
         # skills used to do by hand. Without the lock the CLI's write lands inside this gap
         # and is overwritten by the stale copy read before it.
         $o = Get-Content $cfg -Raw | ConvertFrom-Json
+        [IO.File]::WriteAllText($ready, 'held')   # signal AFTER the read, while still holding
         Start-Sleep -Milliseconds 1200
         $b = [pscustomobject]@{ label = 'FromPanel'; text = '/panel' }
         $o.buttons = @($o.buttons) + $b
@@ -295,7 +297,14 @@ $holder = Start-Job -ArgumentList $cfgFile -ScriptBlock {
                                 (New-Object System.Text.UTF8Encoding($false)))
     } finally { $m.ReleaseMutex() }
 }
-Start-Sleep -Milliseconds 300                   # let the job take the mutex first
+# Handshake, not a sleep. A fixed 300ms sleep made this test timing-dependent: under load the
+# job took up to 12s to acquire, so the CLI ran to completion first and the test "passed"
+# having exercised no concurrency at all - it passed identically with the mutex removed.
+# Waiting for the holder to signal guarantees the lock IS held (and the stale read IS taken)
+# before the CLI starts, so the CLI can only succeed by genuinely waiting and re-reading.
+$deadline = (Get-Date).AddSeconds(30)
+while (-not (Test-Path $readyFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+Check 'the concurrent holder acquired the lock before the CLI started' (Test-Path $readyFile)
 $prevHome = $env:USERPROFILE
 try {
     $env:USERPROFILE = Join-Path $dir 'home'
