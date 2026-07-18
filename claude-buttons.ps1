@@ -632,6 +632,7 @@ $script:strings = @{
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
+        tipShift = 'Shift-click: insert without sending'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
@@ -651,6 +652,7 @@ $script:strings = @{
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
+        tipShift = 'Shift-klik: indsæt uden at sende'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
@@ -1419,7 +1421,9 @@ function Get-TipText($b) {
     $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
     $out = ''
     if ($b.desc) { $out = "$($b.desc)`n" }
-    "$out$head`n$scope - $enter`n$(L 'tipRemove')"
+    # Only advertise Shift-click on buttons that would otherwise send.
+    $shiftHint = if ($b.submit -and -not $b.chat) { "`n$(L 'tipShift')" } else { '' }
+    "$out$head`n$scope - $enter$shiftHint`n$(L 'tipRemove')"
 }
 
 # Grip
@@ -1815,6 +1819,9 @@ function Set-ToggleFace($item, [bool]$on) {
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    # Shift-click = insert the text but do NOT press Enter, so it can be edited or extended
+    # first. Read it up front: Shift may be released during the focus + paste round-trip.
+    $holdShift = ([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) -ne 0
     if ($tipForm.Visible) { $tipForm.Hide() }
     try {
         $item = $btn.Tag
@@ -1932,10 +1939,12 @@ function Invoke-PillClick($btn) {
             }
             # F4: flip the toggle only once the text is actually delivered. Flipping before the
             # send left it inverted with nothing sent whenever the paste threw and the typing
-            # fallback then aborted on the foreground re-check.
-            if ($isToggle) { Set-ToggleFace $item $newOn }
-            # Per-chat buttons never auto-send: the user must see the text before Enter
-            if ($item.submit -and -not $item.chat) {
+            # fallback then aborted on the foreground re-check. On a Shift-click the command is
+            # only parked in the box, not run, so the state must not flip either.
+            if ($isToggle -and -not $holdShift) { Set-ToggleFace $item $newOn }
+            # Per-chat buttons never auto-send: the user must see the text before Enter.
+            # Shift-click suppresses the send too, leaving the text ready to edit.
+            if ($item.submit -and -not $item.chat -and -not $holdShift) {
                 Start-Sleep -Milliseconds 90
                 if (-not (Test-TargetForeground)) { return }
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
