@@ -92,6 +92,14 @@ $showExpr = if ($showLine) { ($src[($showLine - 1)..([Math]::Min($showLine + 4, 
 Check 'the $show gate does not consult composerLost (else the strips latch off)' (($showLine -gt 0) -and ($showExpr -notmatch 'composerLost'))
 Check 'the modal-hide runs AFTER Update-UiaInfo (so the flag can clear again)' (($uiaLine -gt 0) -and ($hideLine -gt 0) -and ($hideLine -gt $uiaLine))
 
+# The two checks above guard the SETTING side of the latch. They both passed against a
+# mutant that simply deleted the CLEAR side - so the flag could never become false again
+# and the v1.7.0 deadlock was fully reintroduced with a green suite. Guard the clear too.
+# NOTE: this is still a source-text proxy, not a behavioural test. The real fix is to
+# extract the visibility decision into a pure function and test the state machine.
+$clearsFlag = @($src | Select-String -Pattern '\$script:composerLost\s*=\s*\$false').Count
+Check 'composerLost is cleared somewhere (else it latches on forever)' ($clearsFlag -ge 1)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

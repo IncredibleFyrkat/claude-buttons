@@ -13,7 +13,9 @@
 //     starts a 60s-grace shutdown (abort with `shutdown -a`).
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync, renameSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -52,6 +54,15 @@ const machineArmedFresh = () => {
   return true;
 };
 
+// Write via temp + rename so the flag is never observed half-written. A bare writeFileSync
+// truncates first, and this tool cuts power to the machine - so an interrupted write was a
+// realistic way to produce the corrupt flag that (before the fail-closed fix) fired a shutdown.
+const writeFlagAtomic = (p, data) => {
+  const tmp = `${p}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, p);
+};
+
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // Standing-request marker: exists from the moment the user asks until disarm or
 // fire. Carries no logic; external UIs (button panels) read it for toggle state.
@@ -61,9 +72,29 @@ const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 const [mode, ...rest] = process.argv.slice(2);
 
 if (mode === 'toggle') {
-  const verb = rest.find((a) => !a.startsWith('--'));
-  const action = verb ?? 'status';   // no verb at all = report status (documented default)
+  // Nothing on the disarm path may fail quietly. A user who types a disarm command and
+  // sees a success-shaped message must never still be armed, so EVERY unrecognised token
+  // exits non-zero rather than falling through to the status report.
   const KNOWN = ['on', 'off', 'request-on', 'request-off', 'status'];
+  const KNOWN_FLAGS = ['--this-turn'];
+  const flags = rest.filter((a) => a.startsWith('--'));
+  const words = rest.filter((a) => !a.startsWith('--'));
+  // A dash-prefixed typo (`--off`) used to be filtered out as a "flag" BEFORE the verb
+  // check ran, so it reached the status branch: exit 0, no stderr, machine still armed.
+  const badFlag = flags.find((f) => !KNOWN_FLAGS.includes(f));
+  if (badFlag) {
+    console.error(
+      `Unknown option "${badFlag}". Valid options: ${KNOWN_FLAGS.join(', ')}. ` +
+        `Did you mean \`toggle ${badFlag.replace(/^-+/, '')}\`?`,
+    );
+    process.exit(1);
+  }
+  if (words.length > 1) {
+    console.error(`Unexpected extra argument "${words[1]}". Usage: toggle ${KNOWN.join('|')} [--this-turn]`);
+    process.exit(1);
+  }
+  const verb = words[0];
+  const action = verb ?? 'status';   // no verb at all = report status (documented default)
   if (verb && !KNOWN.includes(verb)) {
     // A mistyped verb must NOT silently fall through to a status report: someone who
     // typed `toggle of` (meaning off) would believe they had disarmed while the chat
@@ -91,7 +122,7 @@ if (mode === 'toggle') {
       process.exit(0);
     }
     mkdirSync(FLAG_DIR, { recursive: true });
-    writeFileSync(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
+    writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
     console.log(
       thisTurn
         ? `Armed: the PC will shut down (${GRACE_SECONDS}s grace) when THIS response finishes. Disarm: toggle off. Abort a started countdown: shutdown -a`
@@ -99,11 +130,16 @@ if (mode === 'toggle') {
     );
   } else if (action === 'request-on') {
     mkdirSync(FLAG_DIR, { recursive: true });
-    writeFileSync(requestPath(id), new Date().toISOString());
+    writeFlagAtomic(requestPath(id), new Date().toISOString());
     console.log('Standing shutdown request recorded for this chat.');
   } else if (action === 'request-off') {
+    // Withdrawing the request must also drop any arm it authorised. The panel's toggle
+    // watches *.request via stateGlob, so clearing only the marker made the power button
+    // go dark while the chat stayed armed and the PC still shut down - the UI actively
+    // asserting "not armed" about a machine that was.
     rmSync(requestPath(id), { force: true });
-    console.log('Standing shutdown request cleared for this chat.');
+    rmSync(flagPath(id), { force: true });
+    console.log('Standing shutdown request cleared for this chat (and any arm it authorised).');
   } else if (action === 'off') {
     // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
     // must be too - disarming one chat must never silently disarm another the user
@@ -153,15 +189,42 @@ if (!id || !existsSync(flagPath(id))) {
   process.exit(0);
 }
 
-let flag = { skip: 0 };
+// A turn-end that re-enters the Stop hook (any hook returning decision:"block" causes
+// this - including our own MACHINE-ARMED wake below) is still the SAME user-visible turn.
+// Counting invocations instead of turns burned the skip counter twice and fired one
+// response early, i.e. exactly the mid-work shutdown `toggle on` promises not to do.
+if (input.stop_hook_active) process.exit(0);
+
+// Fail CLOSED. `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant
+// every truncated / empty / malformed flag powered the PC off. There is no shape of
+// unreadable data that means "shut down" - it means we do not know what the user wanted.
+let parsed = null;
 try {
-  flag = JSON.parse(readFileSync(flagPath(id), 'utf8'));
+  parsed = JSON.parse(readFileSync(flagPath(id), 'utf8'));
 } catch {
-  // Unreadable flag: treat as armed with no skip.
+  parsed = null;
+}
+const skip =
+  parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+  typeof parsed.skip === 'number' && Number.isInteger(parsed.skip) && parsed.skip >= 0
+    ? parsed.skip
+    : null;
+
+if (skip === null) {
+  // Consume the bad flag so it cannot repeat, and tell the user plainly - silently
+  // disarming would be its own trap ("I armed it and nothing happened").
+  rmSync(flagPath(id), { force: true });
+  rmSync(requestPath(id), { force: true });
+  logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
+  emit({
+    systemMessage:
+      'Shutdown-on-done: the arm flag was unreadable, so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
+  });
+  process.exit(0);
 }
 
-if ((flag.skip ?? 0) > 0) {
-  writeFileSync(flagPath(id), JSON.stringify({ skip: flag.skip - 1 }));
+if (skip > 0) {
+  writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1 }));
   emit({
     systemMessage:
       'Shutdown-on-done armed: the PC will shut down when the next response in this chat finishes.',

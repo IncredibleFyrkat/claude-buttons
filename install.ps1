@@ -211,8 +211,17 @@ if ($wantShutdown) {
         }
         # H1: scope the allow-rules to the exact subcommands the skill runs instead of a
         # blanket `toggle *` wildcard (which pre-authorized any future/unexpected subcommand).
+        #
+        # SEC-01: `request-on` is deliberately NOT allow-listed. The engine refuses to arm
+        # without a standing *.request, but request-on is what CREATES that marker - so
+        # pre-authorizing both made the gate satisfiable by whoever it was meant to stop:
+        # two consecutive unattended Bash calls (`request-on` then `on --this-turn`) walked
+        # injected instructions all the way to a real power-off with no prompt. Leaving
+        # request-on off the list costs the legitimate flow exactly one approval, which the
+        # user is present to give (they just clicked the button), and restores the gate's
+        # two sides to different principals. Disarming stays friction-free on purpose.
         Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
-        foreach ($verb in @('request-on', 'request-off', 'on --this-turn', 'off', 'status')) {
+        foreach ($verb in @('request-off', 'on --this-turn', 'off', 'status')) {
             Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
             Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
         }

@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.7.2 — 2026-07-18
+
+**Safety release for the optional shutdown-on-done feature.** A ten-agent audit found five
+ways the power-off path could fire when it should not, or report success without disarming.
+If you use shutdown-on-done, upgrade. The button panel itself is unaffected by these bugs.
+
+Every fix below ships with a regression test that was verified to **fail** against 1.7.1 —
+17 of the 18 new engine tests do (the eighteenth guards an invariant 1.7.1 already held).
+
+- **A corrupt arm flag no longer shuts the PC down.** `skip: 0` is the fire sentinel, and it
+  was also the default when the flag could not be parsed — so a truncated, empty, or
+  malformed flag powered the machine off. No attacker required: the flag was written
+  non-atomically, and this tool cuts power mid-write by design. The engine now fails closed,
+  consumes the bad flag, disarms, and says so. Flag writes are atomic (temp + rename).
+- **A re-entered Stop hook no longer burns the grace turn.** Any hook returning
+  `decision: "block"` re-runs Stop hooks within the same user-visible turn — including this
+  engine's own MACHINE-ARMED wake. The skip counter decremented twice and fired one response
+  early, which is precisely the mid-work shutdown `toggle on` promises not to do.
+- **`toggle --off` no longer reports success while leaving the machine armed.** Dash-prefixed
+  typos were filtered out as "flags" before the verb check and fell through to the status
+  report: exit 0, no stderr, still armed. Unknown options and stray arguments now exit 1.
+- **`request-off` now drops the arm it authorised.** The panel's power button watches
+  `*.request`, so clearing only that marker made the button go dark while the chat stayed
+  armed — the UI asserting "not armed" about a machine that was.
+- **The arming gate now has two sides.** `toggle on` refuses without a standing `*.request`,
+  but `request-on` creates that marker and both were pre-authorised in `settings.json` — so
+  the gate was satisfiable by exactly the thing it was meant to stop, in two unattended
+  commands with no prompt. `request-on` is no longer allow-listed: arming costs one approval,
+  which the user is present to give. Disarming stays friction-free.
+- **The skill no longer re-grants `toggle *`.** Its frontmatter reinstated the wildcard the
+  installer deliberately removed, so the narrowing was only half-applied.
+- **The test runner no longer reports success when it skipped the engine tests.** With Node
+  absent it printed `ALL TESTS PASSED` having run none of the suite that guards the power-off
+  path. It now fails closed (`CB_ALLOW_NO_NODE=1` to opt out deliberately).
+- **The 1.7.1 modal-latch guard was itself evadable** — it checked the flag's setting side
+  only, and passed against a mutant that deleted the clearing side, fully reintroducing the
+  1.7.0 deadlock. Now guarded too. (Still a source-text proxy; a behavioural test needs the
+  tick decomposed, which is tracked separately.)
+
 ## 1.7.1 — 2026-07-18
 
 Follow-up fixes from [@RasmusKD](https://github.com/RasmusKD) (PR #3). **Two of these are

@@ -9,7 +9,16 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
     & node --test (Join-Path $PSScriptRoot 'engine.test.mjs')
     if ($LASTEXITCODE -ne 0) { $fail = 1 }
 } else {
-    Write-Host "  Node.js not found - skipping engine tests" -ForegroundColor Yellow
+    # Fail CLOSED. A skipped suite is not a passed suite, and this is the one that guards
+    # the component that can power the PC off - reporting ALL TESTS PASSED having run none
+    # of it is worse than reporting nothing. Set CB_ALLOW_NO_NODE=1 to opt out deliberately.
+    Write-Host "  Node.js NOT FOUND - engine tests could not run" -ForegroundColor Red
+    if ($env:CB_ALLOW_NO_NODE -eq '1') {
+        Write-Host "  CB_ALLOW_NO_NODE=1 set - continuing without them (engine is UNVERIFIED)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Install Node.js, or set CB_ALLOW_NO_NODE=1 to skip deliberately." -ForegroundColor Yellow
+        $fail = 1
+    }
 }
 
 Write-Host ""
