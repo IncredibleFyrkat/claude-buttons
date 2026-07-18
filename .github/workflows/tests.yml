@@ -20,3 +20,22 @@ jobs:
       - name: Run test suite
         shell: powershell
         run: .\tests\run-all.ps1
+
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse
+          $r | Sort-Object Severity, ScriptName, Line | Format-Table Severity, RuleName, ScriptName, Line -AutoSize
+          $err = @($r | Where-Object Severity -eq 'Error')
+          $warn = @($r | Where-Object Severity -eq 'Warning')
+          Write-Host "PSScriptAnalyzer: $($err.Count) error(s), $($warn.Count) warning(s)."
+          # Fail on Errors (genuine defects) now; Warnings are surfaced for cleanup and
+          # are the ratchet target once the baseline is curated (excludes for the tool's
+          # deliberate Write-Host / non-approved-verb style go in a settings file then).
+          if ($err.Count) { throw "PSScriptAnalyzer found $($err.Count) error(s) - see table above." }

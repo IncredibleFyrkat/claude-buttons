@@ -27,6 +27,11 @@ const FLAG_DIR = join(homedir(), '.claude', 'shutdown-on-done');
 // external trigger (e.g. a physical/custom button) to use completion-judged mode.
 const MACHINE_FLAG = join(FLAG_DIR, 'MACHINE-ARMED');
 const GRACE_SECONDS = 60;
+// Resolve shutdown.exe absolutely: Claude runs Stop hooks with CWD = the project
+// dir, and Node/Windows resolves a bare command name from CWD before PATH, so a
+// cloned repo shipping its own shutdown.exe could otherwise run at turn-end or on
+// `toggle off`. Absolute path from %SystemRoot% closes that repo-to-machine gap.
+const SHUTDOWN_EXE = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'shutdown.exe');
 // A forgotten machine-wide switch must not power off some unrelated session days
 // later. Ignore (and clear) MACHINE-ARMED once it is older than this.
 const MACHINE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -56,7 +61,16 @@ const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 const [mode, ...rest] = process.argv.slice(2);
 
 if (mode === 'toggle') {
-  const action = rest.find((a) => !a.startsWith('--')) ?? 'status';
+  const verb = rest.find((a) => !a.startsWith('--'));
+  const action = verb ?? 'status';   // no verb at all = report status (documented default)
+  const KNOWN = ['on', 'off', 'request-on', 'request-off', 'status'];
+  if (verb && !KNOWN.includes(verb)) {
+    // A mistyped verb must NOT silently fall through to a status report: someone who
+    // typed `toggle of` (meaning off) would believe they had disarmed while the chat
+    // stays armed and the PC still shuts down. Fail loudly on the disarm path instead.
+    console.error(`Unknown toggle verb "${verb}". Valid verbs: ${KNOWN.join(', ')}.`);
+    process.exit(1);
+  }
   const thisTurn = rest.includes('--this-turn');
   const id = process.env.CLAUDE_CODE_SESSION_ID;
   if (!id) {
@@ -64,6 +78,18 @@ if (mode === 'toggle') {
     process.exit(1);
   }
   if (action === 'on') {
+    // Arming requires an intent signal the user established: either a standing
+    // request (the skill runs `request-on` first) or a fresh machine switch.
+    // Without one, refuse - this blocks a drive-by prompt injection that runs
+    // `toggle on` directly from powering the machine off, while the legitimate
+    // request-on -> on flow and the physical-switch flow stay untouched.
+    if (!existsSync(requestPath(id)) && !machineArmedFresh()) {
+      console.log(
+        'Refused: no standing shutdown request for this chat. Run `toggle request-on` first (the /shutdown-on-done skill does this).',
+      );
+      logLine(`ARM refused for session ${id}: no standing request or machine switch`);
+      process.exit(0);
+    }
     mkdirSync(FLAG_DIR, { recursive: true });
     writeFileSync(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
     console.log(
@@ -79,14 +105,19 @@ if (mode === 'toggle') {
     rmSync(requestPath(id), { force: true });
     console.log('Standing shutdown request cleared for this chat.');
   } else if (action === 'off') {
+    // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
+    // must be too - disarming one chat must never silently disarm another the user
+    // still wants armed. The global power button stays lit while any OTHER chat is
+    // armed (its *.request glob still matches), which honestly signals "still armed
+    // elsewhere" rather than going dark on a shutdown that is actually still coming.
     rmSync(flagPath(id), { force: true });
     rmSync(requestPath(id), { force: true });
     rmSync(MACHINE_FLAG, { force: true });
-    const abort = spawnSync('shutdown', ['-a'], { stdio: 'pipe' });
+    const abort = spawnSync(SHUTDOWN_EXE, ['-a'], { stdio: 'pipe' });
     console.log(
       abort.status === 0
-        ? 'Disarmed (chat flag + machine switch), and aborted a shutdown countdown that was already in flight.'
-        : 'Disarmed (chat flag + machine switch): nothing will shut down the PC.',
+        ? 'Disarmed this chat (+ machine switch), and aborted a shutdown countdown that was already in flight.'
+        : 'Disarmed this chat (+ machine switch): this chat will no longer shut down the PC.',
     );
   } else {
     const chat = existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
@@ -152,7 +183,7 @@ if (process.env.SHUTDOWN_ON_DONE_DRYRUN === '1') {
 // -f force-closes apps that would otherwise block the shutdown; without it a
 // single hung app leaves the PC on all night, which defeats the feature.
 const res = spawnSync(
-  'shutdown',
+  SHUTDOWN_EXE,
   ['-s', '-f', '-t', String(GRACE_SECONDS), '-c', `Claude chat finished. Shutting down in ${GRACE_SECONDS}s; run "shutdown -a" to abort.`],
   { stdio: 'pipe' },
 );

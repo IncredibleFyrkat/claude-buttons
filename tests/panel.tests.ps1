@@ -61,6 +61,22 @@ Check 'icon (name), unknown icon (fallback), raw-hex icon, toggle build' ((Butto
 $r = Run-Smoke '{ "buttons": [ {"label":"C","text":"/c","chat":"sess","chatTitle":"Some chat"} ] }'
 Check 'per-chat button builds (chat-scoped hidden until its chat shows)' ($r.Code -eq 0)
 
+# --- Escape-SendKeys: exactly what gets typed into Claude (security-relevant encoding) ---
+# The input goes through a temp FILE so newlines and metacharacters survive verbatim.
+function Esc([string]$in) {
+    $tmp = [IO.Path]::GetTempFileName()
+    [IO.File]::WriteAllText($tmp, $in, (New-Object System.Text.UTF8Encoding($false)))
+    try { $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $panel -EscapeProbe $tmp 2>$null }
+    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    if ($null -eq $o) { '' } else { -join $o }
+}
+Check 'plain text passes through unchanged' ((Esc 'hello world') -eq 'hello world')
+Check 'SendKeys metachars are braced literal (+ ^ % ~ ( ) { } [ ])' ((Esc '+^%~(){}[]') -eq '{+}{^}{%}{~}{(}{)}{{}{}}{[}{]}')
+Check 'a newline becomes Shift+Enter (never a bare submit)' ((Esc "a`nb") -eq 'a+{ENTER}b')
+Check 'CRLF and CR both normalize to Shift+Enter' ((Esc "a`r`nb`rc") -eq 'a+{ENTER}b+{ENTER}c')
+Check 'a slash command is not mangled' ((Esc '/shutdown-on-done on') -eq '/shutdown-on-done on')
+Check 'empty text yields empty output' ((Esc '') -eq '')
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
