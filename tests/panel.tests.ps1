@@ -61,6 +61,14 @@ Check 'icon (name), unknown icon (fallback), raw-hex icon, toggle build' ((Butto
 $r = Run-Smoke '{ "buttons": [ {"label":"C","text":"/c","chat":"sess","chatTitle":"Some chat"} ] }'
 Check 'per-chat button builds (chat-scoped hidden until its chat shows)' ($r.Code -eq 0)
 
+# Untrusted-input hardening (OWASP LLM01): malformed/oversized entries are dropped, valid kept.
+$r = Run-Smoke '{ "buttons": [ {"label":"Good","text":"/g"}, {"label":"NoText"}, {"text":"/nolabel"} ] }'
+Check 'buttons missing label or text are dropped, valid kept' ((Buttons $r.Out) -eq 1 -and $r.Code -eq 0)
+
+$big = '{ "buttons": [ {"label":"Huge","text":"' + ('x' * 9000) + '"}, {"label":"OK","text":"/ok"} ] }'
+$r = Run-Smoke $big
+Check 'over-length button text is dropped, valid kept' ((Buttons $r.Out) -eq 1 -and $r.Code -eq 0)
+
 # --- Escape-SendKeys: exactly what gets typed into Claude (security-relevant encoding) ---
 # The input goes through a temp FILE so newlines and metacharacters survive verbatim.
 function Esc([string]$in) {
