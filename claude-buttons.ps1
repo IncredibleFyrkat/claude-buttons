@@ -30,7 +30,7 @@ if ($null -ne $EscapeProbe) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.6.0'
+$CB_VERSION = '1.7.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
