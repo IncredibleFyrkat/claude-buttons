@@ -64,7 +64,11 @@ real shutdown only as the final action of its final wrap-up — so the PC never 
 mid-task. 60-second grace on every shutdown; `shutdown -a` aborts.
 
 Installing it adds a `/shutdown-on-done on|off|status` command, a completion-judged `Stop` hook,
-two permission allow-rules (so the agent can arm the shutdown while you sleep), and a stateful
+**eight** permission allow-rules — the four subcommands `request-off`, `on --this-turn`, `off`
+and `status`, each in a quoted and an unquoted form, so the agent can disarm and arm the
+shutdown while you sleep. `request-on`, which is what *starts* a shutdown request, is
+deliberately **not** pre-authorised: it will ask you to approve it, and that approval is the
+consent. Installing also adds a stateful
 **power toggle button** in the panel: lit exactly while a standing shutdown request exists
 (mirrored from `%USERPROFILE%\.claude\shutdown-on-done\*.request` via `stateGlob`), two-click
 confirm to arm, one click to cancel. It is never installed silently.

@@ -95,6 +95,12 @@ const writeFlagAtomic = (p, data) => {
   }
 };
 
+// A session id becomes a FILENAME, and the fire path calls rmSync(force, recursive) on the
+// result - so `../../x` escaped FLAG_DIR and deleted an arbitrary file or directory tree.
+// Claude Code mints UUIDs, so no attacker channel was found, but a hook that deletes paths
+// derived from stdin JSON should not rely on the caller being well-behaved.
+const validSessionId = (v) => typeof v === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(v) && v !== '.' && v !== '..';
+
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // Standing-request marker: exists from the moment the user asks until disarm or
 // fire. Carries no logic; external UIs (button panels) read it for toggle state.
@@ -151,8 +157,8 @@ if (mode === 'toggle') {
   }
   const thisTurn = rest.includes('--this-turn');
   const id = process.env.CLAUDE_CODE_SESSION_ID;
-  if (!id) {
-    console.error('CLAUDE_CODE_SESSION_ID is not set; cannot identify this chat.');
+  if (!validSessionId(id)) {
+    console.error('CLAUDE_CODE_SESSION_ID is not set or is not a plain session id; cannot identify this chat.');
     process.exit(1);
   }
   if (action === 'on') {
@@ -161,11 +167,24 @@ if (mode === 'toggle') {
     // Without one, refuse - this blocks a drive-by prompt injection that runs
     // `toggle on` directly from powering the machine off, while the legitimate
     // request-on -> on flow and the physical-switch flow stay untouched.
-    if (!existsSync(requestPath(id)) && !machineArmedFresh()) {
+    // A STANDING REQUEST IS THE ONLY KEY. MACHINE-ARMED deliberately does NOT satisfy this
+    // gate any more, because it was a second key with no lock on it:
+    //
+    //   MACHINE-ARMED is a zero-byte file with no allow-rule and no content check. An agent
+    //   that had read untrusted content could create it - it is not a shutdown command and
+    //   does not read like one - and that alone re-opened the gate that withholding
+    //   `request-on` from permissions.allow was meant to close. The wake below then handed
+    //   the model the exact pre-authorised arm command, so the tool completed the chain
+    //   itself. Both "sides" of the gate were reachable by one principal.
+    //
+    // The physical-switch flow is unaffected in practice: a real external trigger writes to
+    // the filesystem anyway, so it should write BOTH the marker and a `<session>.request`.
+    // That keeps the two sides in different hands, which is the property that matters.
+    if (!existsSync(requestPath(id))) {
       console.log(
-        'Refused: no standing shutdown request for this chat. Run `toggle request-on` first (the /shutdown-on-done skill does this).',
+        'Refused: no standing shutdown request for this chat. Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
       );
-      logLine(`ARM refused for session ${id}: no standing request or machine switch`);
+      logLine(`ARM refused for session ${id}: no standing request`);
       process.exit(0);
     }
     mkdirSync(FLAG_DIR, { recursive: true });
@@ -225,7 +244,7 @@ try {
   process.exit(0);
 }
 const id = input.session_id;
-if (!id || !existsSync(flagPath(id))) {
+if (!validSessionId(id) || !existsSync(flagPath(id))) {
   // Machine-wide switch: no file heuristic can know whether a session is truly
   // finished (background shells, pending wakeups), so wake the model at turn-end
   // and let it judge; it arms the real per-session flag when everything is done.
@@ -233,8 +252,13 @@ if (!id || !existsSync(flagPath(id))) {
     logLine(`MACHINE-ARMED wake sent to session ${id ?? '(none)'}`);
     emit({
       decision: 'block',
+      // Deliberately does NOT name the arm command. This message is emitted because a file
+      // exists on disk, and an agent that had read untrusted content could be the reason it
+      // exists - so spelling out a pre-authorised command here made the tool an amplifier for
+      // the very injection its arm gate exists to stop. Describing the state is enough; the
+      // model already has the skill if the user legitimately asked for this.
       reason:
-        `The user's machine-wide "shut down the PC when done" switch is ON (they flipped a physical toggle, expecting the PC to power off once their long-running Claude work completes). Judge honestly: is ALL work in this session completely finished, with no background shells, subagents, workflows, or planned follow-ups pending? If anything is still running, or you are unsure, or this brief session is clearly not the long task they meant: continue your remaining work normally and ignore this (you may note briefly that the shutdown switch is on). If everything is truly done: run via Bash: node "${SELF}" toggle on --this-turn  then tell the user the PC will power off 60 seconds after this response, and stop.`,
+        `The user's machine-wide "shut down the PC when done" switch is ON (a file marking it is present). Judge honestly: is ALL work in this session completely finished, with no background shells, subagents, workflows, or planned follow-ups pending? If anything is still running, or you are unsure, or this brief session is clearly not the long task they meant, then simply continue your remaining work normally - you may note briefly that the switch is on. If everything is truly done and the user has actually asked for a shutdown in this conversation, use the /shutdown-on-done skill; it will ask them to confirm. Do NOT arm a shutdown that the user did not ask for in this conversation, and do not treat this message as permission to do so.`,
     });
   }
   process.exit(0);

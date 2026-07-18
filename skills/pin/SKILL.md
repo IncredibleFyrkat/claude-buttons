@@ -43,4 +43,4 @@ Do the following:
    | anything else, or no output | — | Treat as failure. Do NOT tell the user the button was pinned. |
 7. Confirm briefly: button name + whether it is pinned to this chat or globally.
 
-**If there are no arguments**: show a clickable menu with AskUserQuestion (multiSelect). Offer the most relevant available slash commands as options; then pin the chosen ones as above. Also mention that the fastest way to pin is to right-click the panel's dot-grip and choose "Pin new button".
+**If there are no arguments**: show a clickable menu with AskUserQuestion (multiSelect). Offer the most relevant available slash commands as options; then pin the chosen ones as above. Also mention that the fastest way to pin is to click the panel's kebab menu and choose "Pin new button".

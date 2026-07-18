@@ -184,6 +184,22 @@ foreach ($f in ($documented | Sort-Object -Unique)) {
 }
 Check ("no documented config field is dead code" + $(if ($dead) { ": $($dead -join ', ')" } else { '' })) ($dead.Count -eq 0)
 
+# ...and the shipped default config must not contain dead knobs either. The check above guards
+# documented -> used; this guards shipped -> used. An outside reviewer found the gap: the
+# troubleshooting section names uiaComposerName as "the knob to try first", and it was absent
+# from buttons.default.json - so a user whose strip had just vanished would open their config,
+# follow the top recovery instruction, and not find the key. Meanwhile two genuinely dead knobs
+# WERE shipped, inviting them to tune things that do nothing.
+$defJson = Get-Content $defCfg -Raw | ConvertFrom-Json
+$shippedDead = @()
+foreach ($k in $defJson.PSObject.Properties.Name) {
+    if ($k -in @('buttons', 'schemaVersion')) { continue }
+    if (([regex]::Matches($srcText, "\b$([regex]::Escape($k))\b")).Count -lt 3) { $shippedDead += $k }
+}
+Check ("buttons.default.json ships no dead knobs" + $(if ($shippedDead) { ": $($shippedDead -join ', ')" } else { '' })) ($shippedDead.Count -eq 0)
+Check 'the documented first-resort recovery knob is IN the shipped default config' `
+    ([bool]$defJson.PSObject.Properties['uiaComposerName'])
+
 # Every interaction the UI advertises in a tooltip must also exist in the README. Shift-click
 # shipped in 1.7.1 with a CHANGELOG entry and a tooltip string and no README coverage at all.
 if ($srcText -match "tipShift\s*=") {

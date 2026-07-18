@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.7.3 — 2026-07-19
+
+**Security release.** Found by an independent auditor reviewing the published v1.7.2 with no
+knowledge of the project — after four internal review rounds had taken the arming gate's
+"two principals" design at face value. **If you use shutdown-on-done, upgrade.**
+
+- **`MACHINE-ARMED` was a second key with no lock on it.** Arming required *either* a standing
+  request *or* the machine switch — but the switch is a zero-byte file with no allow-rule and
+  no content check. An agent that had read untrusted content could create it (it is not a
+  shutdown command and does not read like one), and that alone re-opened the gate that
+  withholding `request-on` from `permissions.allow` exists to close, because `on --this-turn`
+  *is* pre-authorised. A standing request is now the only key.
+  **Behaviour change:** an external/physical trigger must now write both the `MACHINE-ARMED`
+  marker and a `<session>.request` file. That is what keeps the two sides in different hands.
+- **The wake message no longer names the arm command.** It fires because a file exists — and
+  that file may exist because of injected content — so spelling out the exact pre-authorised
+  command turned the tool into an amplifier for the injection its gate exists to stop. It now
+  describes the state and explicitly warns against arming a shutdown the user did not request.
+- **Session ids are validated before becoming filenames.** `session_id` came from hook stdin
+  and reached `rmSync(force, recursive)`, so `../../x` escaped the flag directory and could
+  delete an arbitrary file or directory tree. No attacker channel was found (Claude Code mints
+  UUIDs), but a hook that deletes derived paths should not depend on its caller.
+
+Documentation, from the same outside review:
+
+- **The install disclosure said "two permission allow-rules"; it grants eight.** Nothing
+  improper is granted and the set is correctly scoped — but that sentence is what a cautious
+  reader uses to decide whether to enable a feature that powers off their PC. It now states
+  the real number, lists the four subcommands, and explains that `request-on` is deliberately
+  withheld so the approval prompt *is* the consent.
+- **`uiaComposerName` is now in the shipped default config.** The troubleshooting section calls
+  it "the knob to try first" when the strip vanishes, and it was absent from
+  `buttons.default.json` — so a user following the top recovery instruction would not find the
+  key. The two genuinely dead knobs (`uiaPaneName`, `uiaSidebarName`) are no longer shipped.
+- A new test guards the whole class: every knob in the default config must actually be read by
+  the panel, and the documented first-resort recovery knob must be present in it.
+
+152 tests (45 engine + 50 panel + 57 installer). The three security fixes were each verified to
+fail against v1.7.2.
+
 ## 1.7.2 — 2026-07-18
 
 **Safety release for the optional shutdown-on-done feature.** A ten-agent audit found five

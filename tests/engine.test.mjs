@@ -73,11 +73,37 @@ test('toggle on is REFUSED without a standing request (arm gate)', () => {
   assert.ok(!existsSync(join(flagDir(), 'sInj.json')), 'no flag written when refused');
 });
 
-test('toggle on is allowed when a fresh machine switch is set (arm gate)', () => {
+// MACHINE-ARMED must NOT be a second key to the arm gate. It is a zero-byte file with no
+// allow-rule and no content check, so an agent that had read untrusted content could create it
+// - and that alone re-opened the gate that withholding `request-on` from permissions.allow
+// exists to close, because `on --this-turn` IS pre-authorised. Found by an outside auditor
+// after four internal review rounds took the gate's "two principals" framing at face value.
+test('a machine switch alone does NOT satisfy the arm gate (second-key hole)', () => {
   writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
-  toggle('toggle on --this-turn', 'sMach');
-  assert.equal(JSON.parse(readFileSync(join(flagDir(), 'sMach.json'), 'utf8')).skip, 0);
+  const { out } = toggle('toggle on --this-turn', 'sMach');
+  assert.match(out, /Refused: no standing shutdown request/);
+  assert.ok(!existsSync(join(flagDir(), 'sMach.json')), 'no flag written from the marker alone');
 });
+
+test('the machine-switch wake does not hand the model a pre-authorised arm command', () => {
+  // The wake fires because a FILE exists, and that file may exist because of injected content.
+  // Naming the exact allow-listed command in the reason made the tool complete the chain itself.
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  const { out } = stop({ session_id: 'sWake', stop_hook_active: false });
+  const reason = JSON.parse(out).reason;
+  assert.doesNotMatch(reason, /toggle\s+on\b/, 'must not spell out the arm command');
+  assert.doesNotMatch(reason, /--this-turn/, 'must not spell out the arm flag');
+  assert.match(reason, /did not ask|not treat this message as permission/i, 'must warn against unrequested arming');
+});
+
+// A session id becomes a filename, and the fire path calls rmSync(force, recursive) on it.
+for (const bad of ['../../escape', '..', '.', 'a/b', 'a\\b', '']) {
+  test(`a malformed session id (${JSON.stringify(bad)}) is rejected, not turned into a path`, () => {
+    const r = toggle('toggle request-on', bad);
+    assert.notEqual(r.code, 0, 'must exit non-zero');
+    assert.doesNotMatch(r.out, /recorded/i, 'must not report success');
+  });
+}
 
 test('toggle off clears the flag and the request', () => {
   toggle('toggle request-on', 'sOff');
@@ -127,14 +153,14 @@ test('Stop hook: a leading UTF-8 BOM on the payload still parses (F8 fix)', () =
   assert.match(out, /\[dry-run\].*shutdown/i);
 });
 
-test('MACHINE-ARMED fresh: wakes the model with a forward-slash script path', () => {
+test('MACHINE-ARMED fresh: still wakes the model to judge completion', () => {
   writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
   const { out } = stop({ session_id: 'sMachine', stop_hook_active: false });
   const obj = JSON.parse(out);
   assert.equal(obj.decision, 'block');
-  const m = obj.reason.match(/node "([^"]+)"/);
-  assert.ok(m, 'reason names the engine');
-  assert.ok(!m[1].includes('\\'), 'path must be forward-slash to match the allow-rules');
+  assert.match(obj.reason, /switch is ON/, 'the wake still describes the state');
+  // It used to name the engine path so the command would match the allow-rules. That is now
+  // the opposite of what we want: see the no-pre-authorised-command test above.
 });
 
 test('MACHINE-ARMED stale (>12h): ignored, cleared, no wake', () => {
@@ -241,8 +267,13 @@ test('request-off also drops the arm it authorised (button state cannot lie)', (
 // IS a decision:"block", so the invocation that would fire always carries stop_hook_active -
 // and left the flag armed to detonate at an arbitrary later turn. Every other test passed with
 // the feature dead, so this end-to-end path is what actually guards against its resurrection.
-test('MACHINE-ARMED round trip: wake, arm, and FIRE on the same turn', () => {
+test('machine-switch round trip: wake, arm WITH a standing request, and FIRE on the same turn', () => {
+  // The supported physical-switch flow now requires the external trigger to write BOTH the
+  // marker and a request - the marker alone is no longer a key (see the second-key test
+  // above). Everything downstream of the arm must still work, which is what this covers:
+  // round 1 "fixed" double-counting in a way that killed firing on the re-entry entirely.
   writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  toggle('toggle request-on', 'sTrip');
   const wake = stop({ session_id: 'sTrip', stop_hook_active: false });
   assert.match(wake.out, /"decision":"block"/, 'turn end wakes the model to judge completion');
   toggle('toggle on --this-turn', 'sTrip');      // the model judges "done" and arms
