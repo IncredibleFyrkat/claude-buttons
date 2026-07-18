@@ -361,6 +361,7 @@ public class CkWin {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     public struct POINT { public int X, Y; }
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
@@ -597,6 +598,10 @@ if ($script:config.uiaPaneName) { $script:uiaPaneName = [string]$script:config.u
 # Matches EVERY chat pane in split/grid view: "Primary pane", "Secondary pane", "Tertiary pane"...
 $script:uiaPaneMatch = ' pane$'
 if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config.uiaPaneMatch }
+# Accessible name of the chat composer. Overridable like every other app-dependent name, so a
+# rename or localization on Claude's side can be self-healed from buttons.json.
+$script:uiaComposerName = 'Prompt'
+if ($script:config.uiaComposerName) { $script:uiaComposerName = [string]$script:config.uiaComposerName }
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
@@ -1116,13 +1121,19 @@ function Enable-WebA11y {
 function Get-Composers($root) {
     $out = @()
     try {
+        # Height ceiling scales with the window. The composer GROWS as you type or paste, and a
+        # fixed 220px cap made a large pasted prompt stop matching - the pane dropped out and its
+        # strip vanished until the text was sent. Anything taller than most of the window is a
+        # container rather than an input, so cap at 60% of the window height.
+        $maxH = 700
+        try { $rb = $root.Current.BoundingRectangle; if ($rb.Height -gt 100) { $maxH = [int]($rb.Height * 0.6) } } catch {}
         $grpT  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
-        $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Prompt')
+        $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaComposerName)
         $cond  = New-Object System.Windows.Automation.AndCondition($grpT, $nameC)
         $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
         foreach ($e in $els) {
             $b = $e.Current.BoundingRectangle
-            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt 220) { continue }
+            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt $maxH) { continue }
             $out += [pscustomobject]@{ El = $e; X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height }
         }
     } catch {}
@@ -1203,6 +1214,10 @@ function Update-UiaInfo {
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
                     Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
                     DockX = $dockX; DockY = $dockY
+                    # Dock point stored RELATIVE to the composer, so the per-tick geometry
+                    # refresh can recompute it live without redoing the expensive tree walk.
+                    DockDX = $dockX - [int]$c.X
+                    DockDY = $dockY - [int]($c.Y + $c.H)
                     # Did we find the control-row buttons we dock after? When a Claude modal
                     # (settings, connectors, a menu) is open they leave the tree, which both
                     # slides the strip to the pane's left edge and means the composer is not
@@ -1324,9 +1339,11 @@ function Render-StripFor($ctrl) {
 # ---------- UI ----------
 $form = New-Object LayeredForm
 $form.Text = 'Claude Buttons'
-# TopMost: keeps the strip rock-steady above Claude with no tab-over flash. Trade-off: it
-# can show over a window that fully covers Claude (a floating overlay can't have both).
 $form.TopMost = $true
+# TopMost + the occlusion probe below. Do NOT try to attach these to Claude's owner chain
+# (GWLP_HWNDPARENT): it hung claude.exe (Windows "stopped communicating", event 1002) because
+# this UI thread blocks on synchronous UIA/SendKeys work, and the window manager then waits on
+# it for the owner chain's z-order/activation. Verified by crash log, not theory.
 $form.FormBorderStyle = 'None'
 $form.ShowInTaskbar = $false
 $form.AutoSize = $true
@@ -1705,6 +1722,22 @@ function Test-TargetForeground {
 # The composer sits just above the clicked strip, so we pick the editable control that is
 # above the strip and nearest it horizontally. Fails safe: if none is found, focus is left
 # alone and the send proceeds exactly as before (no regression).
+# The pane a strip is BOUND to (main strip = first pane, mirror i = pane i+1). The send path
+# must target this pane's own composer element, not re-derive one from geometry: in a tight
+# grid an adjacent pane's composer can score closer and the text lands in the wrong chat.
+function Get-PaneForForm($frm) {
+    if (-not $frm) { return $null }
+    if ($frm -eq $form) { if ($script:panes.Count -gt 0) { return $script:panes[0] }; return $null }
+    for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
+        if ($script:mirrors[$i].Form -eq $frm) {
+            $idx = $i + 1
+            if ($idx -lt $script:panes.Count) { return $script:panes[$idx] }
+            return $null
+        }
+    }
+    return $null
+}
+
 function Focus-ChatInput($stripCenterX, $stripTopY) {
     try {
         if ($script:target -eq [IntPtr]::Zero) { return }
@@ -1818,7 +1851,19 @@ function Invoke-PillClick($btn) {
             # foreground with another chat focused it passes instantly and the first characters
             # go to the wrong chat. Abort if focus never lands rather than type into the wrong box.
             $sf = $btn.FindForm()
-            $composerEl = if ($sf) { Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top } else { $null }
+            # Target the composer this strip is BOUND to. Geometric re-discovery is only a
+            # fallback for a dead element - picking by nearest-rect can select the neighbouring
+            # pane's composer in a tight grid and send the text to the wrong chat.
+            $composerEl = $null
+            $pane = Get-PaneForForm $sf
+            if ($pane -and $pane.Composer) {
+                try { $pane.Composer.SetFocus(); $composerEl = $pane.Composer }
+                catch { $composerEl = $null }   # element died (pane closed/re-mounted)
+            }
+            if (-not $composerEl -and $sf) {
+                Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
+                $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
+            }
             if (-not (Wait-ComposerFocus $composerEl)) {
                 Write-CkLog 'Send aborted: focus never landed in this pane composer'
                 return
@@ -1834,7 +1879,6 @@ function Invoke-PillClick($btn) {
             # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
             # it clobbered, and restore it in finally so it survives an exception.
             if (-not (Test-TargetForeground)) { return }
-            if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
             $backup = $null; $snapOk = $false; $pasted = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
@@ -1842,22 +1886,50 @@ function Invoke-PillClick($btn) {
                 if ($old) { foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} } }
                 $snapOk = $true   # empty snapshot = "was empty"; restoring it re-empties correctly
             } catch { $snapOk = $false }
+            $seqAfterSet = $null
             try {
-                [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                # Mark the payload so Windows keeps it OUT of clipboard history (Win+V) and out
+                # of Cloud Clipboard sync. Button prompts are standing text the user never chose
+                # to copy; without this every click is archived and may sync to their other
+                # devices. Restoring the old clipboard does not remove a history entry.
+                $dobj = New-Object System.Windows.Forms.DataObject
+                $dobj.SetText(($textToSend -replace "`r`n", "`n"))
+                foreach ($fmt in @('ExcludeClipboardContentFromMonitorProcessing',
+                                   'CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard')) {
+                    try {
+                        $ms = New-Object System.IO.MemoryStream
+                        $ms.Write([byte[]]@(0, 0, 0, 0), 0, 4)
+                        $dobj.SetData($fmt, $ms)
+                    } catch {}
+                }
+                [System.Windows.Forms.Clipboard]::SetDataObject($dobj, $true)
+                $seqAfterSet = [CkWin]::GetClipboardSequenceNumber()
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
                 $pasted = $true
                 Start-Sleep -Milliseconds 90   # let the paste land in the composer
             } catch {
                 Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
             } finally {
-                # M1: always restore the full prior clipboard. If the snapshot itself failed we
-                # leave our text rather than guess (can't safely reconstruct unknown content).
-                if ($snapOk) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
+                # M1: restore the full prior clipboard - but only if nothing else wrote to it
+                # meanwhile, or we would clobber another app's copy with stale content. If the
+                # snapshot itself failed we leave our text rather than guess.
+                if ($snapOk) {
+                    $seqNow = [CkWin]::GetClipboardSequenceNumber()
+                    if ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet) {
+                        try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {}
+                    } else {
+                        Write-CkLog 'Clipboard changed by another app mid-send; left it alone'
+                    }
+                }
             }
             if (-not $pasted) {
                 if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
                 [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             }
+            # F4: flip the toggle only once the text is actually delivered. Flipping before the
+            # send left it inverted with nothing sent whenever the paste threw and the typing
+            # fallback then aborted on the foreground re-check.
+            if ($isToggle) { Set-ToggleFace $item $newOn }
             # Per-chat buttons never auto-send: the user must see the text before Enter
             if ($item.submit -and -not $item.chat) {
                 Start-Sleep -Milliseconds 90
@@ -2140,6 +2212,28 @@ $timer.add_Tick({
             $dirty = $true
         }
         if ($dirty) { Rebuild-Buttons }
+
+        # LIVE geometry, every tick. Discovering which panes exist needs a full tree walk, which
+        # is expensive and therefore throttled - but where they ARE must never lag, or the strip
+        # trails behind a composer that just grew from typing/pasting. Re-reading one cached
+        # element's rectangle per pane is cheap, and the dock point is stored relative to the
+        # composer, so this tracks it exactly without redoing the walk.
+        foreach ($pn in $script:panes) {
+            if (-not $pn.Composer -or $null -eq $pn.DockDX) { continue }
+            try {
+                $cb = $pn.Composer.Current.BoundingRectangle
+                if ($cb.Width -gt 0 -and $cb.Height -gt 0) {
+                    $pn.Cx = [int]$cb.X; $pn.Cy = [int]$cb.Y
+                    $pn.Cw = [int]$cb.Width; $pn.Ch = [int]$cb.Height
+                    $pn.DockX = [int]$cb.X + $pn.DockDX
+                    $pn.DockY = [int]($cb.Y + $cb.Height) + $pn.DockDY
+                }
+            } catch {}
+        }
+        if ($script:panes.Count -gt 0 -and $script:panes[0].Cx) {
+            $p0 = $script:panes[0]
+            $script:paneCRect = @{ X = $p0.Cx; Y = $p0.Cy; W = $p0.Cw; H = $p0.Ch; DockX = $p0.DockX; DockY = $p0.DockY; Anchored = $p0.Anchored }
+        }
 
         $r = New-Object CkWin+RECT
         if (-not [CkWin]::GetWindowRect($script:target, [ref]$r)) { return }
