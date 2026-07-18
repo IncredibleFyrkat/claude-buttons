@@ -1746,6 +1746,50 @@ function Get-PaneForForm($frm) {
     return $null
 }
 
+# Current text of a composer, via TextPattern. Chromium exposes contenteditables as a
+# read-only TextPattern - enough to confirm what actually landed. The pattern usually sits on
+# an editable descendant rather than the "Prompt" group, so try the group then its descendants.
+function Get-ComposerText($el) {
+    if (-not $el) { return $null }
+    try {
+        $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        if ($tp) { return [string]$tp.DocumentRange.GetText(-1) }
+    } catch {}
+    try {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty, $true)
+        $d = $el.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if ($d) {
+            $tp2 = $d.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+            if ($tp2) { return [string]$tp2.DocumentRange.GetText(-1) }
+        }
+    } catch {}
+    return $null
+}
+
+# Block until the pasted text is VISIBLE in the composer. Ctrl+V is asynchronous: the keystroke
+# is queued and Claude reads the clipboard later. Restoring the user's clipboard before that
+# read happens makes Claude paste THEIR clipboard instead of the button's text - a wrong message
+# and a leak of whatever they had copied. Returns $true when confirmed. When the composer
+# exposes no readable text we cannot verify, so the caller falls back to a conservative wait.
+function Wait-PasteLanded($el, [string]$text, [int]$timeoutMs = 1500) {
+    $probe = if ($text.Length -gt 40) { $text.Substring(0, 40) } else { $text }
+    $probe = ($probe -replace "`r`n", "`n").Trim()
+    if ([string]::IsNullOrEmpty($probe)) { return $true }
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    $readable = $false
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-ComposerText $el
+        if ($null -ne $now) {
+            $readable = $true
+            if (($now -replace "`r`n", "`n").Contains($probe)) { return $true }
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    if (-not $readable) { return $null }   # unverifiable, not a confirmed failure
+    return $false
+}
+
 function Focus-ChatInput($stripCenterX, $stripTopY) {
     try {
         if ($script:target -eq [IntPtr]::Zero) { return }
@@ -1916,8 +1960,14 @@ function Invoke-PillClick($btn) {
                 [System.Windows.Forms.Clipboard]::SetDataObject($dobj, $true)
                 $seqAfterSet = [CkWin]::GetClipboardSequenceNumber()
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
-                $pasted = $true
-                Start-Sleep -Milliseconds 90   # let the paste land in the composer
+                # Confirm the text is actually IN the composer before the finally block puts the
+                # user's clipboard back. Restoring too early makes Claude read the restored
+                # content and paste THAT instead - the wrong message, and a leak of whatever the
+                # user had copied. A fixed delay cannot make this safe; only the read-back can.
+                $landed = Wait-PasteLanded $composerEl $textToSend
+                if ($null -eq $landed) { Start-Sleep -Milliseconds 350 }   # unverifiable: wait it out
+                elseif (-not $landed) { Write-CkLog 'Paste not observed in composer' }
+                $pasted = ($landed -ne $false)
             } catch {
                 Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
             } finally {
