@@ -726,6 +726,15 @@ $script:iconMap = @{
     'mail'='E715'; 'globe'='E774'; 'lock'='E72E'; 'heart'='EB51'; 'flag'='E7C1'
     'calendar'='E787'; 'phone'='E717'; 'broom'='EA99'; 'terminal'='E756'; 'shield'='EA18'
     'copy'='E8C8'; 'link'='E71B'
+    # help / status
+    'help'='E9CE'; 'question'='E897'; 'info'='E946'; 'warning'='E7BA'; 'error'='E783'
+    # actions / editing
+    'sync'='E895'; 'filter'='E71C'; 'list'='E8FD'; 'eye'='E7B3'; 'undo'='E7A7'
+    'redo'='E7A6'; 'clipboard'='E77F'; 'file'='E7C3'; 'keyboard'='E765'; 'bulb'='EA80'
+    # chat / feedback
+    'comment'='E90A'; 'message'='E8BD'; 'thumbup'='E8E1'; 'thumbdown'='E8E0'; 'more'='E712'
+    # arrows
+    'arrow-right'='E72A'; 'arrow-left'='E72B'; 'arrow-up'='E70E'; 'arrow-down'='E70D'
 }
 # Dark single-line input dialog (replaces the plain white VB InputBox). Returns $null on cancel.
 function Show-InputDialog([string]$title, [string]$message, [string]$default) {
