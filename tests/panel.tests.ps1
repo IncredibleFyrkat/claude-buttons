@@ -222,26 +222,30 @@ function Invoke-CbCli([string]$json, [string]$switchName, [string]$startCfg) {
         # deliberately exercise stderr paths (AMBIGUOUS, bad payload), so relax it here only.
         $ErrorActionPreference = 'Continue'
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') $switchName $pay 2>&1
+        $code = $LASTEXITCODE
     } finally { $env:USERPROFILE = $prevHome; $ErrorActionPreference = $prevEap }
     $after = Get-Content (Join-Path $dir 'buttons.json') -Raw
     Remove-Item $dir -Recurse -Force
-    [pscustomobject]@{ Out = "$out"; Labels = (($after | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ',' }
+    # Exit code is part of the contract: skills/pin and skills/unpin document a table that a
+    # skill branches on (0 = done or declined, 2 = bad payload, 3 = ambiguous). Nothing
+    # asserted it, so changing `exit 3` to `exit 0` passed.
+    [pscustomobject]@{ Out = "$out"; Code = $code; Labels = (($after | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ',' }
 }
 $start = '{"schemaVersion":1,"buttons":[{"label":"Kept","text":"/kept"}]}'
 
 $r = Invoke-CbCli '{"label":"New","text":"/new"}' '-AddButton' $start
 Check 'CLI add merges instead of overwriting (existing button survives)' ($r.Labels -eq 'Kept,New')
-Check 'CLI add reports ADDED' ($r.Out -match 'ADDED')
+Check 'CLI add reports ADDED with exit 0' (($r.Out -match 'ADDED') -and ($r.Code -eq 0))
 
 $r = Invoke-CbCli '{"label":"Other","text":"/kept"}' '-AddButton' $start
-Check 'CLI add refuses a duplicate text in the same scope' ($r.Out -match 'DUPLICATE')
+Check 'CLI add refuses a duplicate (exit 0, nothing changed)' (($r.Out -match 'DUPLICATE') -and ($r.Code -eq 0))
 Check 'a DECLINED add leaves the file intact (must not write a null entry)' ($r.Labels -eq 'Kept')
 
 $r = Invoke-CbCli '{"label":"Kept","text":"/kept"}' '-RemoveButton' $start
 Check 'CLI remove deletes the matching button' (($r.Out -match 'REMOVED') -and ($r.Labels -eq ''))
 
 $r = Invoke-CbCli '{"label":"Ghost","text":"/ghost"}' '-RemoveButton' $start
-Check 'CLI remove of a missing button reports NOTFOUND' ($r.Out -match 'NOTFOUND')
+Check 'CLI remove of a missing button reports NOTFOUND with exit 0' (($r.Out -match 'NOTFOUND') -and ($r.Code -eq 0))
 Check 'a DECLINED remove leaves the file intact' ($r.Labels -eq 'Kept')
 
 # Identity is CASE-SENSITIVE. PowerShell's -eq is not, so unpinning "Deploy" also deleted a
@@ -257,7 +261,7 @@ Check 'a wrong-case payload matches nothing rather than the wrong button' `
 $dupes = '{"buttons":[{"label":"Dup","text":"/x"},{"label":"Dup","text":"/x"},{"label":"Keep","text":"/k"}]}'
 $r = Invoke-CbCli '{"label":"Dup","text":"/x"}' '-RemoveButton' $dupes
 Check 'an ambiguous remove is REFUSED (exit 3) and deletes nothing' `
-    (($r.Out -match 'AMBIGUOUS') -and ($r.Labels -eq 'Dup,Dup,Keep'))
+    (($r.Out -match 'AMBIGUOUS') -and ($r.Code -eq 3) -and ($r.Labels -eq 'Dup,Dup,Keep'))
 
 # --- Does the lock actually LOCK? (QA-2/QA-3) ---
 # The battery above proves add/remove works with a single writer. It does NOT prove the mutex

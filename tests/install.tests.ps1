@@ -209,23 +209,41 @@ Check 'the .orig.bak is WRITE-ONCE (still the untouched original after two saves
 # evadable: adding an Ensure-AllowRule call for request-on anywhere OUTSIDE that loop left the
 # whole suite green with the command fully pre-authorised. Replay the installer's own
 # allow-rule block against a sandbox settings object and assert on what it actually grants.
-# Check EVERY grant site, not just the verb list. Grepping only the `foreach ($verb in @(...))`
-# literal was evadable: an Ensure-AllowRule call for request-on placed anywhere OUTSIDE that
-# loop left the suite green with the command fully pre-authorised. So scan all call sites, and
-# separately confirm the loop still grants the disarm verbs.
-$installLines = Get-Content $install
-$grantSites = @($installLines | Where-Object { $_ -match 'Ensure-AllowRule' -and $_ -notmatch '^\s*#' })
-Check "found the allow-rule grant sites ($($grantSites.Count))" ($grantSites.Count -ge 1)
-Check 'NO grant site anywhere pre-authorises request-on (SEC-01)' `
-    (-not ($grantSites | Where-Object { $_ -match 'request-on' }))
-Check 'NO grant site anywhere grants a toggle wildcard' `
-    (-not ($grantSites | Where-Object { $_ -match 'toggle \$?\*|toggle \*' }))
+# EXECUTE the grant function and assert on the permissions it actually produces. Every
+# source-text version of this check has been evaded: first by adding a grant outside the
+# foreach loop, then by building the verb from a variable (`$rv = 'request' + '-on'`), which
+# defeats any grep for the literal. Asserting the resulting permission set is immune to how
+# the verb is spelled, because it inspects the outcome rather than the spelling.
+Set-Settings '{}'
+$granted = Get-Settings
+Grant-ShutdownAllowRules $granted 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs'
+$rules = @($granted.permissions.allow)
+Check "Grant-ShutdownAllowRules produces rules ($($rules.Count))" ($rules.Count -gt 0)
+Check 'request-on is NOT pre-authorised, however it is spelled (SEC-01)' `
+    (-not ($rules | Where-Object { $_ -match 'toggle\s+request-on' }))
+Check 'no wildcard rule is granted (SEC-02)' (-not ($rules | Where-Object { $_ -match 'toggle\s+\*' }))
+Check 'off IS pre-authorised (disarming must stay friction-free)' `
+    ([bool]($rules | Where-Object { $_ -match 'toggle\s+off' }))
+Check 'status IS pre-authorised' ([bool]($rules | Where-Object { $_ -match 'toggle\s+status' }))
+Check 'on --this-turn IS pre-authorised (the arm itself, gated by the request marker)' `
+    ([bool]($rules | Where-Object { $_ -match 'toggle\s+on\s+--this-turn' }))
 
-$verbLine = [regex]::Match(($installLines -join "`n"), "foreach \(\`$verb in @\(([^)]*)\)\)")
-Check 'the allow-rule verb list is parseable' ($verbLine.Success)
-Check 'request-on is not in the verb list either' ($verbLine.Groups[1].Value -notmatch "'request-on'")
-Check 'the disarm verbs ARE allow-listed (disarming must stay friction-free)' `
-    (($verbLine.Groups[1].Value -match "'off'") -and ($verbLine.Groups[1].Value -match "'status'"))
+# Granting twice must not duplicate: -Update re-runs this on every upgrade.
+$before = @($granted.permissions.allow).Count
+Grant-ShutdownAllowRules $granted 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs'
+Check 'granting twice is idempotent (no duplicate rules on -Update)' `
+    (@($granted.permissions.allow).Count -eq $before)
+
+# The install marker: /pin and /unpin cannot locate the panel without it, and it has already
+# been broken once on this machine. It was a bare call in the main flow, which this seam
+# cannot reach - so deleting it or pointing it elsewhere left the suite green.
+$markerHome = Join-Path $sandbox 'markerhome'
+New-Item -ItemType Directory -Force -Path $markerHome | Out-Null
+Write-InstallMarker $markerHome 'C:\Some\Install\buttons.json'
+$markerFile = Join-Path $markerHome 'claude-buttons-path.txt'
+Check 'the install marker is written' (Test-Path $markerFile)
+Check 'the marker contains the config path verbatim' (([IO.File]::ReadAllText($markerFile)) -eq 'C:\Some\Install\buttons.json')
+Check 'the marker has NO BOM (the skills read it as a path)' (([IO.File]::ReadAllBytes($markerFile))[0] -ne 0xEF)
 
 # Scope this to the frontmatter GRANT line only. The skill body must still tell the agent to
 # run request-on - the point of SEC-01 is that the command prompts, not that it is forbidden.

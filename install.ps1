@@ -142,10 +142,13 @@ function Get-JsonDepth($o, [int]$d = 0) {
         }
     }
     elseif ($o -is [System.Collections.IList]) {
-        # Index, never pipe. PowerShell UNROLLS nested arrays through @() and the pipeline, so
-        # walking children that way under-measures an array-of-arrays - a 10-deep array chain
-        # measured 6. `hooks` is an array of objects containing arrays of objects, so that is
-        # exactly the shape this guard exists to measure.
+        # Index $o directly; do NOT collect the children into a variable first. Measured:
+        # `$kids = if (...) { $o } else { ... }` routes the value through the pipeline, which
+        # UNROLLS a single-element array into its element - so an array-of-arrays loses one
+        # level per recursion and a 10-deep chain measures 6 instead of 11. (@() and foreach
+        # are innocent; both measure 11 on their own. It is specifically the assignment from
+        # an if-expression.) `hooks` is an array of objects containing arrays of objects, so
+        # this is exactly the shape the guard exists to measure.
         for ($i = 0; $i -lt $o.Count; $i++) {
             $cd = Get-JsonDepth $o[$i] ($d + 1); if ($cd -gt $max) { $max = $cd }
         }
@@ -168,6 +171,28 @@ function Assert-JsonDepthSafe($obj) {
                "NOTHING has been changed - add the hook manually (see README). " +
                "Pristine backup: $settingsPath.orig.bak")
     }
+}
+# A FUNCTION, not an inline loop, so a test can execute it and assert on the rules that are
+# actually granted. The previous test grepped the source for `request-on` near an
+# Ensure-AllowRule line, which a two-line variant defeated:
+#     $rv = 'request' + '-on'
+#     Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $rv)"
+# - the grant line does not contain the literal, and the line that does is not a grant line.
+# Testing the resulting permission set is immune to how the verb is spelled.
+function Grant-ShutdownAllowRules($settings, [string]$scriptFwd) {
+    Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
+    # request-on is deliberately absent - see the SEC-01 note at the call site.
+    foreach ($verb in @('request-off', 'on --this-turn', 'off', 'status')) {
+        Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
+        Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
+    }
+}
+# Also a function, for the same reason: the marker records where this install keeps
+# buttons.json, and /pin and /unpin cannot find the panel without it. It was previously a bare
+# call in the main flow, which the AST test seam cannot reach - so deleting it, or pointing it
+# at the wrong path, left the whole suite green.
+function Write-InstallMarker([string]$claudeDir, [string]$cfgPath) {
+    Write-Utf8NoBom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
 }
 function Save-Settings($obj) {
     if (Test-Path $settingsPath) {
@@ -278,7 +303,7 @@ foreach ($s in @('pin','unpin')) {
 }
 
 # 4) Marker so skills find buttons.json without any hardcoded path
-Write-Utf8NoBom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
+Write-InstallMarker $claudeDir $cfgPath
 
 # 5) Core hook (UserPromptSubmit) - merged safely
 $settings = Get-Settings
@@ -339,11 +364,7 @@ if ($wantShutdown) {
         # request-on off the list costs the legitimate flow exactly one approval, which the
         # user is present to give (they just clicked the button), and restores the gate's
         # two sides to different principals. Disarming stays friction-free on purpose.
-        Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
-        foreach ($verb in @('request-off', 'on --this-turn', 'off', 'status')) {
-            Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
-            Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
-        }
+        Grant-ShutdownAllowRules $settings $scriptFwd
         Save-Settings $settings
         # Legacy skills out (superseded by /shutdown-on-done)
         foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
