@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.7.0 — 2026-07-18
+
+Incorporates the community rework from [@RasmusKD](https://github.com/RasmusKD) (PR #2) — thank you.
+All four tiers were taken; the 1.6.x hardening (clipboard-restore, mutex handling, config
+self-heal, accessibility names/roles) was preserved and the rework builds on top of it.
+
+- **Composer-anchored docking (Tier 3).** The strip now docks to the chat's *composer* group
+  in the Chromium accessibility tree rather than measuring the pane and scanning the button row.
+  This naturally follows split/stacked panes and keeps the strip under the chat when an in-chat
+  panel is open — the case 1.6.1 clamped for — without the width-heuristic.
+- **Transparent layered strips (Tier 3).** Each strip is a per-pixel-alpha layered window
+  (`UpdateLayeredWindow`) that sits directly on the bottom bar with no visible backing rectangle,
+  so the buttons read as native chrome. The dot-grip is replaced by a **⋮ kebab menu**.
+- **Reliable send (Tier 2).** Composer detection makes typing target the real prompt box;
+  the send path was reworked to survive the app's focus model.
+- **WinEvent-driven refresh (Tier 2).** Foreground/location changes drive redraws via
+  WinEvent hooks instead of polling alone, cutting latency and idle wakeups.
+- **Safe-gains bundle (Tier 1).** Expanded icon set (~134 Segoe Fluent glyphs), plus the
+  smaller robustness fixes from the fork.
+- **Engine + installer hardening carried forward.** Arm-requires-intent gate (a bare
+  `toggle on` is refused without a standing request or fresh machine switch), per-chat disarm,
+  absolute `shutdown.exe`, 12h machine-switch stale guard, smoke-test-gated install.
+- **Tests:** 16 engine + 16 panel tests (adds the arm-gate, per-chat, unknown-verb, and
+  Escape-SendKeys encoding cases); CI runs the suite + PSScriptAnalyzer on `windows-latest`.
+
 ## 1.6.1 — 2026-07-18
 
 - **Strip no longer drifts when an in-chat panel is open.** Background tasks / preview panels
