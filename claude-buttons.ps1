@@ -70,15 +70,69 @@ public class NoActivateForm : Form {
     }
 }
 
+// A no-activate window that is ALSO per-pixel-alpha layered (WS_EX_LAYERED). Its content
+// comes from UpdateLayeredWindow (an ARGB bitmap), NOT normal painting: the background is
+// truly transparent and click-through where alpha==0, while button pixels (alpha>0) stay
+// clickable. Do NOT set Form.Opacity on these - that uses SetLayeredWindowAttributes, which
+// is mutually exclusive with UpdateLayeredWindow.
+public class LayeredForm : NoActivateForm {
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams p = base.CreateParams;
+            p.ExStyle |= 0x00080000; // WS_EX_LAYERED
+            return p;
+        }
+    }
+}
+
+public static class Layered {
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
+    [StructLayout(LayoutKind.Sequential)] public struct SIZE { public int Cx, Cy; public SIZE(int x, int y) { Cx = x; Cy = y; } }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] public struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr h);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT ppt, ref SIZE size, IntPtr src, ref POINT pptSrc, int crKey, ref BLENDFUNCTION blend, int flags);
+    // Push a premultiplied-ARGB bitmap to the layered window at screen (x,y). This both
+    // positions and shows the window, so it doubles as the reposition path.
+    public static void Push(IntPtr hwnd, Bitmap bmp, int x, int y) {
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screen);
+        IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0));
+        IntPtr old = SelectObject(mem, hbmp);
+        try {
+            var size = new SIZE(bmp.Width, bmp.Height);
+            var src = new POINT(0, 0);
+            var dst = new POINT(x, y);
+            var blend = new BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 }; // AC_SRC_ALPHA
+            UpdateLayeredWindow(hwnd, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2); // ULW_ALPHA
+        } finally {
+            SelectObject(mem, old);
+            DeleteObject(hbmp);
+            DeleteDC(mem);
+            ReleaseDC(IntPtr.Zero, screen);
+        }
+    }
+}
+
 public class PillButton : Control {
     public Color Fill = Color.FromArgb(48, 47, 44);
     public Color HoverFill = Color.FromArgb(60, 58, 54);
     public Color DownFill = Color.FromArgb(70, 67, 62);
     public Color ToggleFill = Color.FromArgb(150, 108, 54); // active state for toggle buttons (brighter for state contrast)
     public Color Accent = Color.Empty; // border on per-chat buttons
+    public bool Bold = false;          // draw the glyph with extra stroke weight (icons)
     bool toggled;
-    public bool Toggled { get { return toggled; } set { toggled = value; Invalidate(); } }
+    public bool Toggled { get { return toggled; } set { toggled = value; Invalidate(); FireRepaint(); } }
     bool hover, down;
+    // Fired whenever the visual state changes so the layered strip can recomposite
+    // (a layered per-pixel-alpha window ignores normal WM_PAINT, so Invalidate() alone
+    // is not enough - the owner must rebuild and push the ARGB bitmap).
+    public event EventHandler Repaint;
+    protected void FireRepaint() { var h = Repaint; if (h != null) h(this, EventArgs.Empty); }
     public PillButton() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -88,16 +142,21 @@ public class PillButton : Control {
         // AccessibleName is set per-instance to the label (not the icon glyph).
         AccessibleRole = AccessibleRole.PushButton;
     }
-    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
-    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { down = true; Invalidate(); } base.OnMouseDown(e); }
-    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
-    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
-    static GraphicsPath Pill(Rectangle r, int rad) {
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); FireRepaint(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); FireRepaint(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { down = true; Invalidate(); FireRepaint(); } base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); FireRepaint(); base.OnMouseUp(e); }
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); FireRepaint(); base.OnTextChanged(e); }
+    // Force the hover/press highlight off (a tick-level safety net: WM_MOUSELEAVE can lag
+    // on a layered window, so the panel also clears hover when the cursor leaves the rect).
+    public void ClearHover() { if (hover || down) { hover = false; down = false; Invalidate(); FireRepaint(); } }
+    static GraphicsPath RoundRect(Rectangle r, int rad) {
         int d = rad * 2;
         var p = new GraphicsPath();
-        p.AddArc(r.X, r.Y, d, d, 90, 180);
-        p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+        p.AddArc(r.X, r.Y, d, d, 180, 90);                 // top-left
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);         // top-right
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);  // bottom-right
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);         // bottom-left
         p.CloseFigure();
         return p;
     }
@@ -106,13 +165,19 @@ public class PillButton : Control {
         g.Clear(BackColor);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var rc = new Rectangle(0, 0, Width - 1, Height - 1);
-        using (var path = Pill(rc, (Height - 1) / 2)) {
-            Color f;
-            if (toggled) { f = down ? DownFill : ToggleFill; }
-            else { f = down ? DownFill : (hover ? HoverFill : Fill); }
+        int rad = Math.Max(4, Height / 4);   // rounded corners, not a full pill/circle
+        // Resting buttons have NO background - they sit transparent on the bar like Claude's
+        // own toolbar icons. A rounded-corner highlight appears only on hover/press; a
+        // toggled button stays highlighted so its "on" state is visible.
+        if (hover || down || toggled) {
+            Color f = down ? DownFill : (toggled ? ToggleFill : HoverFill);
+            using (var path = RoundRect(rc, rad))
             using (var b = new SolidBrush(f)) g.FillPath(b, path);
-            // Per-chat accent: brighter + 2px so it clears WCAG 1.4.11 (3:1 non-text contrast).
-            if (Accent != Color.Empty) using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
+        }
+        // Per-chat accent: brighter + 2px so it clears WCAG 1.4.11 (3:1 non-text contrast).
+        if (Accent != Color.Empty) {
+            using (var path = RoundRect(rc, rad))
+            using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
         }
         // Toggle-on gets a NON-COLOR cue (a bright left dot) so state isn't conveyed by fill alone.
         int textLeft = 0;
@@ -126,10 +191,65 @@ public class PillButton : Control {
         TextRenderer.DrawText(g, Text, Font, new Rectangle(textLeft, 0, Width - textLeft, Height), ForeColor,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
+    // Composite this button onto a transparent ARGB surface at (ox,oy). The whole
+    // button rect is painted at alpha=1: invisible on any background, but non-zero
+    // alpha means the layered window still hit-tests (and hovers) there, so the button
+    // is fully clickable without a visible box. Glyph/hover/accent draw at full alpha.
+    public void RenderTo(Graphics g, int ox, int oy) {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var hit = new SolidBrush(Color.FromArgb(1, 0, 0, 0)))
+            g.FillRectangle(hit, new Rectangle(ox, oy, Width, Height));
+        var rc = new Rectangle(ox, oy, Width - 1, Height - 1);
+        int rad = Math.Max(4, Height / 4);
+        if (hover || down || toggled) {
+            Color f = down ? DownFill : (toggled ? ToggleFill : HoverFill);
+            using (var path = RoundRect(rc, rad))
+            using (var b = new SolidBrush(Color.FromArgb(255, f))) g.FillPath(b, path);
+        }
+        if (Accent != Color.Empty) {
+            using (var path = RoundRect(rc, rad))
+            using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
+        }
+        int textLeft = 0;
+        if (toggled) {
+            int dd = Math.Max(4, Height / 3);
+            int dx = Math.Max(3, (Height - dd) / 2);
+            using (var b = new SolidBrush(Color.FromArgb(236, 200, 130)))
+                g.FillEllipse(b, ox + dx, oy + (Height - dd) / 2, dd, dd);
+            textLeft = dx + dd;
+        }
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+        using (var sf = new StringFormat()) {
+            sf.Alignment = StringAlignment.Center;
+            sf.LineAlignment = StringAlignment.Center;
+            sf.FormatFlags = StringFormatFlags.NoWrap;
+            var rect = new RectangleF(ox + textLeft, oy, Width - textLeft, Height);
+            using (var b = new SolidBrush(ForeColor)) {
+                if (Bold) {
+                    // Faux-bold: redraw the glyph at sub-pixel offsets to thicken strokes
+                    // without enlarging the icon (Segoe Fluent Icons has no bold weight).
+                    float o = 0.3f;
+                    float[] dx = { -o, o, 0, 0 };
+                    float[] dy = { 0, 0, -o, o };
+                    for (int k = 0; k < 4; k++)
+                        g.DrawString(Text, Font, b, new RectangleF(rect.X + dx[k], rect.Y + dy[k], rect.Width, rect.Height), sf);
+                }
+                g.DrawString(Text, Font, b, rect, sf);
+            }
+        }
+    }
 }
 
+// The menu button: a vertical 3-dot kebab that is visually IDENTICAL to an icon
+// PillButton (same square size, hover/press highlight, and white dots) - it just draws
+// dots instead of a glyph and opens the menu instead of sending text.
 public class GripHandle : Control {
-    public Color DotColor = Color.FromArgb(122, 118, 110);
+    public Color DotColor = Color.White;
+    public Color HoverFill = Color.FromArgb(48, 48, 47);
+    public Color DownFill = Color.FromArgb(58, 58, 56);
+    bool hover, down;
+    public event EventHandler Repaint;
+    protected void FireRepaint() { var h = Repaint; if (h != null) h(this, EventArgs.Empty); }
     public GripHandle() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -138,17 +258,54 @@ public class GripHandle : Control {
         AccessibleRole = AccessibleRole.ButtonDropDown;
         AccessibleName = "Claude Buttons menu";
     }
-    protected override void OnPaint(PaintEventArgs e) {
-        var g = e.Graphics;
-        g.Clear(BackColor);
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); FireRepaint(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); FireRepaint(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { down = true; Invalidate(); FireRepaint(); } base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); FireRepaint(); base.OnMouseUp(e); }
+    public void ClearHover() { if (hover || down) { hover = false; down = false; Invalidate(); FireRepaint(); } }
+    static GraphicsPath RoundRect(Rectangle r, int rad) {
+        int d = rad * 2;
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+    // Shared face draw (used by both normal and layered rendering), matching PillButton.
+    void DrawFace(Graphics g, int ox, int oy) {
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        int d = Math.Max(2, Height / 9);
-        int cx = Width / 2, cy = Height / 2, gap = d + 2;
-        using (var b = new SolidBrush(DotColor)) {
-            for (int col = -1; col <= 0; col++)
-                for (int row = -1; row <= 1; row++)
-                    g.FillEllipse(b, cx + col * gap + (gap / 2) - d, cy + row * gap - (d / 2), d, d);
+        if (hover || down) {
+            var rc = new Rectangle(ox, oy, Width - 1, Height - 1);
+            int rad = Math.Max(4, Height / 4);
+            Color f = down ? DownFill : HoverFill;
+            using (var path = RoundRect(rc, rad))
+            using (var b = new SolidBrush(Color.FromArgb(255, f))) g.FillPath(b, path);
         }
+        // Match the icon glyphs exactly: same soft-grey, and each dot is drawn with the SAME
+        // faux-bold stacking (center + 4 sub-pixel offsets) so its edges are reinforced and it
+        // reads as solid/bright as a glyph stroke, not a faded single-pass circle.
+        float d = Math.Max(1.8f, Height / 12f);
+        float cx = ox + Width / 2f, cy = oy + Height / 2f, vgap = d * 2f;
+        float o = 0.3f;
+        float[] dx = { 0f, -o, o, 0f, 0f };
+        float[] dy = { 0f, 0f, 0f, -o, o };
+        using (var b = new SolidBrush(DotColor)) {
+            for (int row = -1; row <= 1; row++) {   // vertical 3-dot kebab
+                float y = cy + row * vgap;
+                for (int k = 0; k < 5; k++)
+                    g.FillEllipse(b, cx - d / 2f + dx[k], y - d / 2f + dy[k], d, d);
+            }
+        }
+    }
+    protected override void OnPaint(PaintEventArgs e) { e.Graphics.Clear(BackColor); DrawFace(e.Graphics, 0, 0); }
+    // Composite onto a transparent ARGB surface at (ox,oy); the full rect is painted at
+    // alpha=1 so it stays clickable while invisible (see PillButton).
+    public void RenderTo(Graphics g, int ox, int oy) {
+        using (var hit = new SolidBrush(Color.FromArgb(1, 0, 0, 0)))
+            g.FillRectangle(hit, new Rectangle(ox, oy, Width, Height));
+        DrawFace(g, ox, oy);
     }
 }
 
@@ -204,6 +361,20 @@ public class CkWin {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    public struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    // Root top-level window currently at a screen point (what the user would actually see/click
+    // there). Used to tell whether a pane's spot on Claude is visible or covered by another app.
+    public static IntPtr RootAtPoint(int x, int y) {
+        IntPtr h = WindowFromPoint(new POINT { X = x, Y = y });
+        if (h == IntPtr.Zero) return IntPtr.Zero;
+        return GetAncestor(h, 2); // GA_ROOT
+    }
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
+    // WS_EX_TOPMOST: screen-snip/capture overlays are top-most and briefly cover Claude; a
+    // normal app that covers Claude is not. Used to avoid hiding the strips for such overlays.
+    public static bool IsTopmost(IntPtr h) { return (GetWindowLong(h, -20) & 0x00000008) != 0; }
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
 
@@ -297,6 +468,30 @@ public static class WinHook {
     // Returns true (and clears) if an event arrived since the last call.
     public static bool Consume() { bool d = _dirty; _dirty = false; return d; }
     public static void Touch() { _dirty = true; }   // force the next tick to do full work
+}
+"@
+
+# Enumerate a window's Chrome_RenderWidgetHostHWND children. Requesting the accessibility
+# root of each is what turns ON Chromium's web AXTree (it stays off until an AT client asks),
+# which is the only way to see the chat panes/composers of the Electron app from outside.
+Add-Type -TypeDefinition @"
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class CkChild {
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] static extern int GetClassName(IntPtr h, StringBuilder s, int m);
+    public static IntPtr[] RenderWidgets(IntPtr top) {
+        var list = new List<IntPtr>();
+        EnumChildWindows(top, (h, l) => {
+            var sb = new StringBuilder(200); GetClassName(h, sb, 200);
+            if (sb.ToString().StartsWith("Chrome_RenderWidgetHostHWND")) list.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
 }
 "@
 
@@ -416,12 +611,9 @@ $script:reservedW = 380                 # width reserved for the app's own bar e
 if ($script:config.reservedW) { $script:reservedW = [int]$script:config.reservedW }
 $script:relX = 0.0
 if ($null -ne $script:config.relX) { $script:relX = [double]$script:config.relX }
-$script:freeX = $null   # free placement: the strip's position relative to the window's top-left
-$script:freeY = $null
-if ($null -ne $script:config.freeX -and $null -ne $script:config.freeY) {
-    $script:freeX = [int]$script:config.freeX
-    $script:freeY = [int]$script:config.freeY
-}
+$script:vNudge = [int]$script:config.vNudge   # vertical nudge in px (+ = down, - = up); 0 if unset
+$script:tipCtrl = $null    # control the hover tip is currently showing for
+$script:tipsOff = [bool]$script:config.tipsOff   # hover-tooltip off switch (grip menu; persisted)
 
 # ---------- Language (default: English; switch in the grip menu) ----------
 $script:lang = 'en'
@@ -432,9 +624,6 @@ $script:strings = @{
         pinNew = 'Pin new button'; custom = 'Other: type your own...'; onlyChat = 'Only this chat'; globalScope = 'Global (all chats)'
         closePanel = 'Close panel'; language = 'Language'
         confirm = 'Confirm?'; gripTip = 'Right-click: menu'
-        position = 'Position'; posLeft = 'Left'; posCenter = 'Center'; posRight = 'Right'
-        nudgeL = 'Nudge left'; nudgeR = 'Nudge right'
-        posFree = 'Free placement (move with mouse, click to drop)'; posAuto = 'Auto (dock to the bottom bar)'
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
@@ -454,9 +643,6 @@ $script:strings = @{
         pinNew = 'Pin ny knap'; custom = 'Andet: skriv selv…'; onlyChat = 'Kun denne chat'; globalScope = 'Global (alle chats)'
         closePanel = 'Luk panelet'; language = 'Sprog'
         confirm = 'Bekræft?'; gripTip = 'Højreklik: menu'
-        position = 'Position'; posLeft = 'Venstre'; posCenter = 'Centreret'; posRight = 'Højre'
-        nudgeL = 'Skub til venstre'; nudgeR = 'Skub til højre'
-        posFree = 'Fri placering (flyt med musen, klik for at slippe)'; posAuto = 'Auto (dock i bundbjælken)'
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
@@ -492,13 +678,9 @@ function Save-PanelState {
         $fresh | Add-Member -NotePropertyName targetProcess -NotePropertyValue $targetProcess -Force
         $fresh | Add-Member -NotePropertyName lang -NotePropertyValue $script:lang -Force
         $fresh | Add-Member -NotePropertyName relX -NotePropertyValue ([Math]::Round($script:relX, 4)) -Force
-        if ($null -ne $script:freeX) {
-            $fresh | Add-Member -NotePropertyName freeX -NotePropertyValue $script:freeX -Force
-            $fresh | Add-Member -NotePropertyName freeY -NotePropertyValue $script:freeY -Force
-        } else {
-            foreach ($f in @('freeX', 'freeY')) { $fresh.PSObject.Properties.Remove($f) }
-        }
-        foreach ($legacy in @('x', 'y', 'offsetX', 'offsetY', 'offsetBottom')) { $fresh.PSObject.Properties.Remove($legacy) }
+        $fresh | Add-Member -NotePropertyName tipsOff -NotePropertyValue ([bool]$script:tipsOff) -Force
+        # Strip is statically docked; drop any legacy free-placement / offset fields.
+        foreach ($legacy in @('freeX', 'freeY', 'x', 'y', 'offsetX', 'offsetY', 'offsetBottom')) { $fresh.PSObject.Properties.Remove($legacy) }
         [void](Write-ConfigAtomic $fresh)
     } finally { [void]$script:cfgLock.ReleaseMutex() }
 }
@@ -532,7 +714,7 @@ $script:padX = S(10)
 $fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
 $script:iconFontName = if ($fams -contains 'Segoe Fluent Icons') { 'Segoe Fluent Icons' }
                        elseif ($fams -contains 'Segoe MDL2 Assets') { 'Segoe MDL2 Assets' } else { $null }
-$script:iconFont = if ($script:iconFontName) { New-Object System.Drawing.Font($script:iconFontName, 10) } else { $null }
+$script:iconFont = if ($script:iconFontName) { New-Object System.Drawing.Font($script:iconFontName, 9) } else { $null }
 # Lucide-style names -> glyph codepoints (shared between Fluent Icons and MDL2 Assets)
 $script:iconMap = @{
     'mic'='E720'; 'power'='E7E8'; 'play'='E768'; 'pause'='E769'; 'stop'='E71A'
@@ -814,11 +996,45 @@ function Measure-Pane($pane, $wr, $btnCond) {
     return $info
 }
 
+# Turn ON Chromium's web accessibility tree (off by default until an AT client requests the
+# render-widget root). Without this the whole web UI is a single opaque Document and we can
+# see nothing inside. Continuous UIA polling in Update-UiaInfo keeps it from auto-disabling.
+$script:a11yTarget = [IntPtr]::Zero
+function Enable-WebA11y {
+    if ($script:target -eq [IntPtr]::Zero -or $script:a11yTarget -eq $script:target) { return }
+    try {
+        foreach ($rw in [CkChild]::RenderWidgets($script:target)) {
+            try { [void][System.Windows.Automation.AutomationElement]::FromHandle($rw) } catch {}
+        }
+        [void][System.Windows.Automation.AutomationElement]::FromHandle($script:target)
+        $script:a11yTarget = $script:target
+    } catch {}
+}
+
+# The chat composers: keyboard-focusable Groups named "Prompt", one per pane. Their positions
+# ARE the pane layout (works for any split/grid), and each is the focus target for sending.
+function Get-Composers($root) {
+    $out = @()
+    try {
+        $grpT  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
+        $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Prompt')
+        $cond  = New-Object System.Windows.Automation.AndCondition($grpT, $nameC)
+        $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        foreach ($e in $els) {
+            $b = $e.Current.BoundingRectangle
+            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt 220) { continue }
+            $out += [pscustomobject]@{ El = $e; X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height }
+        }
+    } catch {}
+    return @($out)
+}
+
 function Update-UiaInfo {
     if (((Get-Date) - $script:uiaLast).TotalMilliseconds -lt $script:uiaInterval) { return }
     $script:uiaLast = Get-Date
     try {
         if ($script:target -eq [IntPtr]::Zero) { throw 'no window' }
+        Enable-WebA11y   # turn the web AXTree on (idempotent per window); this poll keeps it alive
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($script:target)
         $wr = New-Object CkWin+RECT
         [void][CkWin]::GetWindowRect($script:target, [ref]$wr)
@@ -834,29 +1050,60 @@ function Update-UiaInfo {
         # Activate the property cache for every UIA query below (root, panes, buttons).
         $cacheScope = $script:uiaCache.Activate()
         try {
-        # Strategy 1: EVERY chat pane. The app names them "Primary pane", "Secondary pane",
-        # "Tertiary pane"... in split/grid view - match all Groups whose name ends with "pane".
-        $allGroups = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)
-        $found = @()
-        foreach ($gp in $allGroups) {
-            $gn = $gp.Cached.Name
-            if ($gn -and ($gn -match $script:uiaPaneMatch) -and $gp.Cached.BoundingRectangle.Width -gt (SW 250)) { $found += $gp }
-        }
+        # Strategy 0 (primary): the chat composers ("Prompt" groups) ARE the panes - one per
+        # chat, in any split/grid layout. Their positions define where to dock each strip and
+        # give us the exact element to focus when a button on that strip is clicked.
+        # Sort into ROWS by a coarse Y band (so 1px render jitter between same-row panes can't
+        # flip their order and swap strips), then left-to-right by X within each row.
+        $composers = @(Get-Composers $root | Sort-Object @{ e = { [int]($_.Y / 50) } }, @{ e = { $_.X } })
         $newPanes = @()
-        if ($found.Count -gt 0) {
-            foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond) }
-            # Reading order: rows top-to-bottom, then left-to-right
-            $newPanes = @($newPanes | Sort-Object @{ e = { [int]($_.OffT / 100) } }, @{ e = { $_.OffL } })
-        } else {
-            # Strategy 2: derive a single chat area as window minus sidebar
-            $sbCond = New-Object System.Windows.Automation.AndCondition($grpType,
-                (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaSidebarName)))
-            $sb = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $sbCond)
-            if ($sb) {
-                $sr = $sb.Cached.BoundingRectangle
-                $newPanes = @(@{ OffL = [int]($sr.X + $sr.Width - $wr.Left); OffT = 0; Width = [int]($wr.Right - ($sr.X + $sr.Width)); BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null })
+        if ($composers.Count -gt 0) {
+            # All buttons once (cached); per composer, find its control row (the Auto/+/mic bar
+            # just below the input) so we dock the strip AFTER that left cluster, on that row -
+            # exactly where it sat before, but per pane.
+            $allBtns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+            foreach ($c in $composers) {
+                $cBottom = $c.Y + $c.H
+                # Collect the control-row buttons just below this composer (its left half).
+                $rowBtns = @()
+                foreach ($b in $allBtns) {
+                    $bb = $b.Cached.BoundingRectangle
+                    $bcy = $bb.Y + $bb.Height / 2
+                    if ($bcy -gt $cBottom -and $bcy -lt ($cBottom + (SW 64)) -and $bb.X -ge ($c.X - 12) -and $bb.X -lt ($c.X + $c.W * 0.6)) {
+                        $rowBtns += [pscustomobject]@{ X = [double]$bb.X; R = [double]($bb.X + $bb.Width); CY = $bcy }
+                    }
+                }
+                # Dock after the CONTIGUOUS left cluster (Auto/+/mic/...), not the rightmost
+                # button: walk left-to-right and stop at the first big gap, so a control that
+                # only appears while typing (send/stop, further right) can't drag us to center.
+                $rightEdge = $c.X; $sumY = 0.0; $n = 0
+                foreach ($rb in ($rowBtns | Sort-Object X)) {
+                    if ($n -eq 0 -or $rb.X -le ($rightEdge + (SW 60))) {
+                        if ($rb.R -gt $rightEdge) { $rightEdge = $rb.R }
+                        $sumY += $rb.CY; $n++
+                    } else { break }
+                }
+                $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
+                $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
+                $newPanes += @{
+                    OffL = $c.X - $wr.Left; OffT = $c.Y - $wr.Top; Width = $c.W
+                    BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
+                    Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
+                    DockX = $dockX; DockY = $dockY
+                }
             }
-            Write-CkLog "UIA: no pane matching '$($script:uiaPaneMatch)' found - the app may have updated (running on fallback). Adjust uiaPaneMatch in buttons.json."
+        } else {
+            # Fallback (accessibility not yet built, or an unexpected layout): legacy pane groups.
+            $allGroups = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)
+            $found = @()
+            foreach ($gp in $allGroups) {
+                $gn = $gp.Cached.Name
+                if ($gn -and ($gn -match $script:uiaPaneMatch) -and $gp.Cached.BoundingRectangle.Width -gt (SW 250)) { $found += $gp }
+            }
+            if ($found.Count -gt 0) {
+                foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond) }
+                $newPanes = @($newPanes | Sort-Object @{ e = { [int]($_.OffT / 100) } }, @{ e = { $_.OffL } })
+            }
         }
         } finally { $cacheScope.Dispose() }
         $script:panes = $newPanes
@@ -868,9 +1115,12 @@ function Update-UiaInfo {
             $script:rowCenterOff = $p0.RowCenter
             $script:leftEdgeOff = $p0.LeftOff
             $script:paneBottomOff = $p0.BottomOff
+            $script:paneComposer = $p0.Composer   # composer rect (screen px) for the primary strip
+            if ($p0.Cx) { $script:paneCRect = @{ X = $p0.Cx; Y = $p0.Cy; W = $p0.Cw; H = $p0.Ch; DockX = $p0.DockX; DockY = $p0.DockY } } else { $script:paneCRect = $null }
             if ($p0.Title -ne $script:uiaTitle) { $script:uiaTitle = $p0.Title; $script:uiaDirty = $true }
         } else {
             $script:paneRect = $null; $script:rowCenterOff = $null; $script:leftEdgeOff = $null; $script:paneBottomOff = 0
+            $script:paneComposer = $null; $script:paneCRect = $null
             if ($null -ne $script:uiaTitle) { $script:uiaTitle = $null; $script:uiaDirty = $true }
         }
 
@@ -910,18 +1160,52 @@ function Test-ChatButtonVisible($b) {
 }
 
 # ---------- Warm color palette (matches the app's dark theme) ----------
-$colBar   = [System.Drawing.Color]::FromArgb(32, 31, 30)
+$colBar   = [System.Drawing.Color]::FromArgb(29, 29, 28)   # 1d1d1c - matches Claude's bottom bar
 $colFill  = [System.Drawing.Color]::FromArgb(48, 47, 44)
-$colHover = [System.Drawing.Color]::FromArgb(60, 58, 54)
-$colDown  = [System.Drawing.Color]::FromArgb(70, 67, 62)
+$colHover = [System.Drawing.Color]::FromArgb(48, 48, 47)   # 30302f - matches Claude's own icon hover
+$colDown  = [System.Drawing.Color]::FromArgb(58, 58, 56)   # a touch brighter for press feedback
 $colText  = [System.Drawing.Color]::FromArgb(214, 210, 202)
-$colGrip  = [System.Drawing.Color]::FromArgb(122, 118, 110)
+$colIcon  = [System.Drawing.Color]::FromArgb(168, 168, 168)   # a8a8a8 - icon glyphs + kebab dots (soft grey, like Claude's own)
 $colAccent = [System.Drawing.Color]::FromArgb(198, 146, 78)   # border on per-chat buttons (brightened for WCAG 1.4.11)
-$pillH = S(21)
+$pillH = S(27)   # square icon buttons; the glyph font stays fixed, so this is padding around the icon
+
+# Strip background color (alias kept so the transparent-strip work has one knob).
+$script:barColor = $colBar
+
+# Recomposite a layered strip: paint its controls onto a transparent ARGB bitmap (button
+# pixels at alpha=1 stay clickable but invisible) and push it to the window. A layered
+# per-pixel-alpha window ignores normal WM_PAINT, so this replaces control painting.
+function Update-LayeredStrip($frm, $pnl) {
+    if (-not $frm -or -not $frm.IsHandleCreated) { return }
+    $w = $frm.Width; $h = $frm.Height
+    if ($w -le 0 -or $h -le 0) { return }
+    $bmp = $null; $g = $null
+    try {
+        $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::FromArgb(0, 0, 0, 0))
+        foreach ($ctrl in $pnl.Controls) {
+            if ($ctrl -is [PillButton] -or $ctrl -is [GripHandle]) {
+                $ctrl.RenderTo($g, ($pnl.Left + $ctrl.Left), ($pnl.Top + $ctrl.Top))
+            }
+        }
+        [Layered]::Push($frm.Handle, $bmp, $frm.Left, $frm.Top)
+    } catch { Write-CkLog "Update-LayeredStrip error: $($_.Exception.Message)" }
+    finally { if ($g) { $g.Dispose() }; if ($bmp) { $bmp.Dispose() } }
+}
+# Re-push the strip that owns a control (fired from a button's Repaint event on hover/toggle).
+function Render-StripFor($ctrl) {
+    if (-not $ctrl) { return }
+    $pnl = $ctrl.Parent
+    if ($pnl) { Update-LayeredStrip $pnl.FindForm() $pnl }
+}
 
 # ---------- UI ----------
-$form = New-Object NoActivateForm
+$form = New-Object LayeredForm
 $form.Text = 'Claude Buttons'
+# TopMost: keeps the strip rock-steady above Claude with no tab-over flash. Trade-off: it
+# can show over a window that fully covers Claude (a floating overlay can't have both).
 $form.TopMost = $true
 $form.FormBorderStyle = 'None'
 $form.ShowInTaskbar = $false
@@ -929,15 +1213,14 @@ $form.AutoSize = $true
 $form.AutoSizeMode = 'GrowAndShrink'
 $form.StartPosition = 'Manual'
 $form.Location = New-Object System.Drawing.Point(-4000, -4000)
-$form.Opacity = 0
-$form.BackColor = $colBar
+# Layered forms draw via UpdateLayeredWindow (see Update-LayeredStrip); no Opacity/BackColor.
 
 $panel = New-Object System.Windows.Forms.FlowLayoutPanel
 $panel.FlowDirection = 'LeftToRight'
 $panel.WrapContents = $false
 $panel.AutoSize = $true
 $panel.AutoSizeMode = 'GrowAndShrink'
-$panel.Padding = New-Object System.Windows.Forms.Padding((S(3)), (S(2)), (S(3)), (S(2)))
+$panel.Padding = New-Object System.Windows.Forms.Padding(0, (S(2)), (S(3)), (S(2)))
 [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($panel, $true, $null)
 $form.Controls.Add($panel)
 
@@ -1000,13 +1283,16 @@ function Get-TipText($b) {
 
 # Grip
 $grip = New-Object GripHandle
-$grip.DotColor = $colGrip
-$grip.BackColor = $colBar
-$grip.Width = S(14)
+$grip.BackColor = $script:barColor
+$grip.DotColor = $colIcon
+$grip.HoverFill = $colHover
+$grip.DownFill = $colDown
+$grip.Width = $pillH
 $grip.Height = $pillH
-$grip.Margin = New-Object System.Windows.Forms.Padding((S(2)), (S(2)), (S(2)), (S(2)))
+$grip.Margin = New-Object System.Windows.Forms.Padding((S(3)))
 $grip.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
 $grip.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+$grip.add_Repaint({ Render-StripFor $this })
 
 # ---------- Instant pin menu (no Claude involved) ----------
 function Get-PinCatalog {
@@ -1067,33 +1353,9 @@ function Set-CkLang([string]$l) {
     try { $script:lang = $l; Save-PanelState; Rebuild-Buttons } catch { Write-CkLog "Set-CkLang error: $($_.Exception.Message)" }
 }
 
-function Set-CkRelX([double]$v) {
-    try { $script:relX = [Math]::Max(0.0, [Math]::Min(1.0, $v)); Save-PanelState } catch { Write-CkLog "Set-CkRelX error: $($_.Exception.Message)" }
-}
-
 $gripMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $miPin = New-Object System.Windows.Forms.ToolStripMenuItem 'Pin new button'
 [void]$gripMenu.Items.Add($miPin)
-$miPos = New-Object System.Windows.Forms.ToolStripMenuItem 'Position'
-$posL = New-Object System.Windows.Forms.ToolStripMenuItem 'Left';       $posL.add_Click({ Set-CkRelX 0.03 })
-$posC = New-Object System.Windows.Forms.ToolStripMenuItem 'Center';     $posC.add_Click({ Set-CkRelX 0.5 })
-$posR = New-Object System.Windows.Forms.ToolStripMenuItem 'Right';      $posR.add_Click({ Set-CkRelX 0.97 })
-$posNL = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge left';  $posNL.add_Click({ Set-CkRelX ($script:relX - 0.05) })
-$posNR = New-Object System.Windows.Forms.ToolStripMenuItem 'Nudge right'; $posNR.add_Click({ Set-CkRelX ($script:relX + 0.05) })
-$posFree = New-Object System.Windows.Forms.ToolStripMenuItem 'Free placement'
-$posFree.add_Click({
-    $script:moveMode = $true
-    $script:moveModeAt = Get-Date
-    [void][CkWin]::GetAsyncKeyState(0x01)   # swallow the click that chose the menu item
-})
-$posAuto = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto (dock)'
-$posAuto.add_Click({ $script:freeX = $null; $script:freeY = $null; Save-PanelState })
-foreach ($mi in @($posL, $posC, $posR)) { [void]$miPos.DropDownItems.Add($mi) }
-[void]$miPos.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-foreach ($mi in @($posNL, $posNR)) { [void]$miPos.DropDownItems.Add($mi) }
-[void]$miPos.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-foreach ($mi in @($posFree, $posAuto)) { [void]$miPos.DropDownItems.Add($mi) }
-[void]$gripMenu.Items.Add($miPos)
 $miLang = New-Object System.Windows.Forms.ToolStripMenuItem 'Language'
 $subEn = New-Object System.Windows.Forms.ToolStripMenuItem 'English'
 $subEn.add_Click({ Set-CkLang 'en' })
@@ -1102,6 +1364,15 @@ $subDa.add_Click({ Set-CkLang 'da' })
 [void]$miLang.DropDownItems.Add($subEn)
 [void]$miLang.DropDownItems.Add($subDa)
 [void]$gripMenu.Items.Add($miLang)
+$miTips = New-Object System.Windows.Forms.ToolStripMenuItem 'Hover tooltips'
+$miTips.CheckOnClick = $true
+$miTips.Checked = -not $script:tipsOff
+$miTips.add_Click({
+    $script:tipsOff = -not $this.Checked
+    if ($script:tipsOff -and $tipForm.Visible) { $tipForm.Hide(); $script:tipCtrl = $null }
+    Save-PanelState
+})
+[void]$gripMenu.Items.Add($miTips)
 [void]$gripMenu.Items.Add('-')
 $miClose = $gripMenu.Items.Add('Close panel')
 $miClose.add_Click({ $form.Close() })
@@ -1149,20 +1420,12 @@ $gripMenu.add_Opening({
     $miPin.Text = L 'pinNew'
     $miClose.Text = L 'closePanel'
     $miLang.Text = L 'language'
-    $miPos.Text = L 'position'
-    $posL.Text = L 'posLeft'; $posC.Text = L 'posCenter'; $posR.Text = L 'posRight'
-    $posNL.Text = L 'nudgeL'; $posNR.Text = L 'nudgeR'
-    $posFree.Text = L 'posFree'; $posAuto.Text = L 'posAuto'
-    $posAuto.Checked = ($null -eq $script:freeX); $posFree.Checked = ($null -ne $script:freeX)
     $subEn.Checked = ($script:lang -eq 'en')
     $subDa.Checked = ($script:lang -eq 'da')
     $piThis.Text = L 'onlyChat'; $piGlob.Text = L 'globalScope'
     Fill-PinScope $piThis $false
     Fill-PinScope $piGlob $true
 })
-
-# No drag-and-drop: position is set via the menu, so nothing moves by accident
-$script:dragging = $false
 
 # ---------- Button context menu (capture source on right mouse-down) ----------
 $script:menuSource = $null
@@ -1312,11 +1575,33 @@ $script:menuAway = 0
 $script:armedBtn = $null
 $script:armedAt = Get-Date '2000-01-01'
 $script:stateGlobLast = Get-Date '2000-01-01'
-$script:moveMode = $false
-$script:moveModeAt = Get-Date '2000-01-01'
 
 function Test-TargetForeground {
     [CkWin]::GetForegroundWindow() -eq $script:target
+}
+
+# Best-effort: focus the message box of the SPECIFIC pane whose strip was clicked, so in a
+# multi-pane grid the keystrokes land in that pane's chat and not wherever focus drifted.
+# The composer sits just above the clicked strip, so we pick the editable control that is
+# above the strip and nearest it horizontally. Fails safe: if none is found, focus is left
+# alone and the send proceeds exactly as before (no regression).
+function Focus-ChatInput($stripCenterX, $stripTopY) {
+    try {
+        if ($script:target -eq [IntPtr]::Zero) { return }
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($script:target)
+        # Each strip docks just below its pane's composer, so the composer whose bottom sits
+        # just above the strip (and nearest in X) is this pane's input. Focus it directly.
+        $best = $null; $bestScore = [double]::MaxValue
+        foreach ($c in (Get-Composers $root)) {
+            $bottom = $c.Y + $c.H
+            if ($bottom -gt ($stripTopY + (SW 10))) { continue }   # composer must be above the strip
+            $dx = [Math]::Abs(($c.X + $c.W / 2) - $stripCenterX)
+            $dy = $stripTopY - $bottom
+            $score = $dx + $dy
+            if ($score -lt $bestScore) { $best = $c; $bestScore = $score }
+        }
+        if ($best) { $best.El.SetFocus() }
+    } catch {}
 }
 
 $script:toggleState = @{}   # in-memory on/off state for toggle buttons (per panel run)
@@ -1344,7 +1629,6 @@ function Set-ToggleFace($item, [bool]$on) {
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
-    if ($script:moveMode) { return }  # the drop click must never fire a button
     if ($tipForm.Visible) { $tipForm.Hide() }
     try {
         $item = $btn.Tag
@@ -1377,8 +1661,14 @@ function Invoke-PillClick($btn) {
         }
         $script:sending = $true
         try {
-            Start-Sleep -Milliseconds 150
-            if (-not (Test-TargetForeground)) { return }   # focus moved - abort BEFORE any state change
+            Start-Sleep -Milliseconds 120
+            # Focus THIS pane's composer first. SetFocus on the composer pulls Claude forward and
+            # puts the caret in the right box even if Claude was not the active window - so you can
+            # click a button from another window. Then verify Claude is now foreground before typing
+            # (if focusing failed, abort rather than type into whatever else was focused).
+            $sf = $btn.FindForm()
+            if ($sf) { Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top; Start-Sleep -Milliseconds 160 }
+            if (-not (Test-TargetForeground)) { return }   # focus didn't reach Claude - don't type elsewhere
             # Toggle with nothing to send (off, no textOff): flip only, we're foreground.
             if ($isToggle -and [string]::IsNullOrEmpty($textToSend)) { Set-ToggleFace $item $newOn; return }
 
@@ -1425,16 +1715,16 @@ function Invoke-PillClick($btn) {
 $script:mirrors = @()
 
 function New-MirrorStrip {
-    $mf = New-Object NoActivateForm
+    $mf = New-Object LayeredForm
     $mf.Text = 'Claude Buttons'
-    $mf.TopMost = $true
+    $mf.TopMost = $true   # see the main form
     $mf.FormBorderStyle = 'None'
     $mf.ShowInTaskbar = $false
     $mf.AutoSize = $true
     $mf.AutoSizeMode = 'GrowAndShrink'
     $mf.StartPosition = 'Manual'
     $mf.Location = New-Object System.Drawing.Point(-4000, -4000)
-    $mf.BackColor = $colBar
+    $mf.BackColor = $script:barColor
     $mp = New-Object System.Windows.Forms.FlowLayoutPanel
     $mp.FlowDirection = 'LeftToRight'
     $mp.WrapContents = $false
@@ -1444,15 +1734,18 @@ function New-MirrorStrip {
     [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($mp, $true, $null)
     $mf.Controls.Add($mp)
     $mg = New-Object GripHandle
-    $mg.DotColor = $colGrip
-    $mg.BackColor = $colBar
-    $mg.Width = S(14)
+    $mg.BackColor = $script:barColor
+    $mg.DotColor = $colIcon
+    $mg.HoverFill = $colHover
+    $mg.DownFill = $colDown
+    $mg.Width = $pillH
     $mg.Height = $pillH
-    $mg.Margin = New-Object System.Windows.Forms.Padding((S(2)), (S(2)), (S(2)), (S(2)))
+    $mg.Margin = New-Object System.Windows.Forms.Padding((S(3)))
     $mg.ContextMenuStrip = $gripMenu
     $mg.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($this, $_.Location) } })
     $mg.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
     $mg.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+    $mg.add_Repaint({ Render-StripFor $this })
     @{ Form = $mf; Panel = $mp; Grip = $mg }
 }
 
@@ -1473,10 +1766,15 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
         $btn.Height = $pillH
         Set-PillFace $btn
         if ($b.toggle) { $btn.Toggled = (Get-ToggleState $b) }
-        $btn.Margin = New-Object System.Windows.Forms.Padding((S(2)))
-        $btn.BackColor = $colBar
-        $btn.ForeColor = $colText
-        $btn.Fill = $colFill
+        $btn.Margin = New-Object System.Windows.Forms.Padding((S(3)))
+        $btn.BackColor = $script:barColor
+        # Icon glyphs use a soft grey (like Claude's own toolbar icons, not stark white);
+        # text buttons stay the warmer off-white so long labels are less harsh.
+        $btn.ForeColor = if ($b.icon) { $colIcon } else { $colText }
+        # Icon buttons carry no pill background (they blend into the bar like Claude's own
+        # toolbar icons, with only a hover highlight); text buttons keep the subtle fill.
+        $btn.Fill = if ($b.icon) { $script:barColor } else { $colFill }
+        $btn.Bold = [bool]$b.icon   # thicker strokes on icon glyphs
         $btn.HoverFill = $colHover
         $btn.DownFill = $colDown
         if ($b.chat) { $btn.Accent = $colAccent }
@@ -1490,6 +1788,7 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
         $btn.add_Click({ Invoke-PillClick $this })
         $btn.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
         $btn.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+        $btn.add_Repaint({ Render-StripFor $this })   # recomposite the layered strip on hover/toggle/press
         $destPanel.Controls.Add($btn)
     }
     $destPanel.ResumeLayout()
@@ -1504,11 +1803,13 @@ function Rebuild-Buttons {
     $form.SuspendLayout()
     Build-StripPanel $panel $grip $script:uiaTitle $true
     $form.ResumeLayout()
+    Update-LayeredStrip $form $panel
     for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
         $mTitle = if (($i + 1) -lt $script:panes.Count) { $script:panes[$i + 1].Title } else { $null }
         $script:mirrors[$i].Form.SuspendLayout()
         Build-StripPanel $script:mirrors[$i].Panel $script:mirrors[$i].Grip $mTitle $false
         $script:mirrors[$i].Form.ResumeLayout()
+        Update-LayeredStrip $script:mirrors[$i].Form $script:mirrors[$i].Panel
     }
 }
 [void](Read-ActiveSession)
@@ -1517,10 +1818,26 @@ Rebuild-Buttons
 # ---------- Window tracking ----------
 $script:target = [IntPtr]::Zero
 $script:targetPid = [uint32]0
+$script:myPid = [uint32](Get-Process -Id $PID).Id
 $script:autoMove = $false
 
+# Is a pane's spot on Claude actually visible (vs covered by another app)? The strips are
+# TopMost so they never flash on focus change; this is what stops them bleeding through a
+# window that covers Claude - we hide a strip whose pane is occluded. Fails OPEN (show) so a
+# probe glitch never hides a valid strip. Our own strip windows at the point count as visible
+# (Claude is behind them).
+function Test-PaneVisible([int]$x, [int]$y) {
+    $root = [CkWin]::RootAtPoint($x, $y)
+    if ($root -eq [IntPtr]::Zero -or $root -eq $script:target) { return $true }
+    $p = [uint32]0
+    [void][CkWin]::GetWindowThreadProcessId($root, [ref]$p)
+    if ($p -eq $script:targetPid -or $p -eq $script:myPid) { return $true }
+    if ([CkWin]::IsTopmost($root)) { return $true }   # transient top-most overlay (e.g. screen snip)
+    return $false
+}
+
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 200
+$timer.Interval = 50
 $timer.add_Tick({
     if ($script:sending) { return }   # don't touch the UI mid-send
     try {
@@ -1574,18 +1891,18 @@ $timer.add_Tick({
                 [WinHook]::Touch()          # a freshly (re)found window needs a full pass
             }
         }
-        $ourUiOpen = $gripMenu.Visible -or $btnMenu.Visible -or ($null -ne $script:iconDlg) -or $script:moveMode
+        # Show whenever Claude is on-screen (not minimized), even if it is not the active window -
+        # so the strips stay available and you can click a button from another window; the click
+        # then pulls Claude forward and focuses that pane's composer before typing.
         $show = ($script:target -ne [IntPtr]::Zero) -and
                 (-not [CkWin]::IsIconic($script:target)) -and
-                [CkWin]::IsWindowVisible($script:target) -and
-                (([CkWin]::GetForegroundWindow() -eq $script:target) -or $ourUiOpen)
+                [CkWin]::IsWindowVisible($script:target)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
             if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
-            $script:moveMode = $false
             return
         }
 
@@ -1671,67 +1988,88 @@ $timer.add_Tick({
         elseif ($script:compact -and (Get-StripWidth $false) -lt ($avail - (S(60)))) { $newCompact = $false }
         if ($newCompact -ne $script:compact) { $script:compact = $newCompact; Rebuild-Buttons }
 
-        if ($script:moveMode) {
-            # Free move: the strip follows the mouse; a left-click drops it
-            if ($tipForm.Visible) { $tipForm.Hide() }
-            $mp = [System.Windows.Forms.Cursor]::Position
-            $script:autoMove = $true
-            $form.Location = New-Object System.Drawing.Point(($mp.X - [int]($form.Width / 2)), ($mp.Y - (S 10)))
-            $script:autoMove = $false
-            $drop = (([CkWin]::GetAsyncKeyState(0x01) -band 0x8001) -ne 0)
-            if ($drop -and ((Get-Date) - $script:moveModeAt).TotalMilliseconds -gt 400) {
-                $script:moveMode = $false
-                $script:freeX = [int]($form.Left - $r.Left)
-                $script:freeY = [int]($form.Top - $r.Top)
-                Save-PanelState
-            }
+        # Static dock: always on the primary pane's composer control row, after the mic.
+        if ($null -ne $script:paneCRect) {
+            $c = $script:paneCRect
+            $startX = $c.DockX + (SW $script:stripGap)
+            $room = [Math]::Max(1, ($c.X + $c.W) - $startX - $form.Width)
+            $x = $startX + [int]($script:relX * $room)
+            $y = $c.DockY - [int]($form.Height / 2) + (SW $script:vNudge)
         } else {
-            if ($null -ne $script:freeX) {
-                # Free placement: fixed point relative to the window
-                $x = $r.Left + $script:freeX
-                $y = $r.Top + $script:freeY
+            # Legacy: dock on the app's own bottom button row.
+            $paneBottom = $r.Bottom - $script:paneBottomOff
+            $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
+            $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
+            $x = $startX + [int]($script:relX * $room)
+            if ($null -ne $script:rowCenterOff) {
+                $y = $paneBottom - $script:rowCenterOff - [int]($form.Height / 2)
             } else {
-                # Horizontal: after the app's own left cluster (relX nudges within the remaining space).
-                # Vertical: locked to the pane's bottom button row (self-calibrating, grid-aware).
-                $paneBottom = $r.Bottom - $script:paneBottomOff
-                $startX = if ($null -ne $script:leftEdgeOff) { $r.Left + $script:leftEdgeOff + (SW $script:stripGap) } else { $areaL }
-                $room = [Math]::Max(1, ($areaL + $areaW) - $startX - $form.Width)
-                $x = $startX + [int]($script:relX * $room)
-                if ($null -ne $script:rowCenterOff) {
-                    $y = $paneBottom - $script:rowCenterOff - [int]($form.Height / 2)
-                } else {
-                    $y = $paneBottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
-                }
+                $y = $paneBottom - (SW $script:fallbackRow) - [int]($form.Height / 2)
             }
-            $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
-            $y = [Math]::Max($r.Top + 4, [Math]::Min($y, $r.Bottom - $form.Height - 2))
+            $y += (SW $script:vNudge)   # user vertical nudge
+        }
+        $x = [Math]::Max($r.Left + 4, [Math]::Min($x, $r.Right - $form.Width - 4))
+        $y = [Math]::Max($r.Top + 4, [Math]::Min($y, $r.Bottom - $form.Height - 2))
+        # Hide this strip if its pane on Claude is covered by another app (no bleed-through).
+        # Probe on the control row just LEFT of the strip (over Claude's mic) - that's adjacent
+        # to the strip, so coverage of the strip is detected immediately, not only once the
+        # composer's center gets covered.
+        $mainVis = if ($script:paneCRect) { Test-PaneVisible ([int]($script:paneCRect.DockX - 5)) ([int]$script:paneCRect.DockY) } else { $true }
+        if (-not $mainVis) {
+            if ($form.Visible) { $form.Hide() }
+        } else {
             $desired = New-Object System.Drawing.Point($x, $y)
             if ($form.Location -ne $desired) {
                 $script:autoMove = $true
                 $form.Location = $desired
                 $script:autoMove = $false
             }
+            if (-not $form.Visible) { $form.Show(); Update-LayeredStrip $form $panel }
         }
-        if (-not $form.Visible) { $form.Show() }
-        if ($form.Opacity -lt 1) { $form.Opacity = 1 }
 
         # Mirror strips: dock each under its own pane
         for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
             $mForm = $script:mirrors[$i].Form
             if (($i + 1) -ge $script:panes.Count) { if ($mForm.Visible) { $mForm.Hide() }; continue }
             $pi = $script:panes[$i + 1]
-            $paneL = $r.Left + $pi.OffL
-            $paneBottom = $r.Bottom - $pi.BottomOff
-            $startX = if ($null -ne $pi.LeftOff) { $r.Left + $pi.LeftOff + (SW $script:stripGap) } else { $paneL }
-            $room = [Math]::Max(1, ($paneL + $pi.Width) - $startX - $mForm.Width)
-            $mx = $startX + [int]($script:relX * $room)
-            $my = if ($null -ne $pi.RowCenter) { $paneBottom - $pi.RowCenter - [int]($mForm.Height / 2) }
-                  else { $paneBottom - (SW $script:fallbackRow) - [int]($mForm.Height / 2) }
+            if ($pi.Cx) {
+                # Composer mode: dock on this pane's control row, after its own buttons.
+                $startX = $pi.DockX + (SW $script:stripGap)
+                $room = [Math]::Max(1, ($pi.Cx + $pi.Cw) - $startX - $mForm.Width)
+                $mx = $startX + [int]($script:relX * $room)
+                $my = $pi.DockY - [int]($mForm.Height / 2) + (SW $script:vNudge)
+            } else {
+                $paneL = $r.Left + $pi.OffL
+                $paneBottom = $r.Bottom - $pi.BottomOff
+                $startX = if ($null -ne $pi.LeftOff) { $r.Left + $pi.LeftOff + (SW $script:stripGap) } else { $paneL }
+                $room = [Math]::Max(1, ($paneL + $pi.Width) - $startX - $mForm.Width)
+                $mx = $startX + [int]($script:relX * $room)
+                $my = if ($null -ne $pi.RowCenter) { $paneBottom - $pi.RowCenter - [int]($mForm.Height / 2) + (SW $script:vNudge) }
+                      else { $paneBottom - (SW $script:fallbackRow) - [int]($mForm.Height / 2) + (SW $script:vNudge) }
+            }
             $mx = [Math]::Max($r.Left + 4, [Math]::Min($mx, $r.Right - $mForm.Width - 4))
             $my = [Math]::Max($r.Top + 4, [Math]::Min($my, $r.Bottom - $mForm.Height - 2))
-            $mDesired = New-Object System.Drawing.Point($mx, $my)
-            if ($mForm.Location -ne $mDesired) { $mForm.Location = $mDesired }
-            if (-not $mForm.Visible) { $mForm.Show() }
+            # Hide this mirror if its pane on Claude is covered by another app (probe just
+            # left of the strip, on the control row - see the primary strip above).
+            $mVis = if ($pi.Cx) { Test-PaneVisible ([int]($pi.DockX - 5)) ([int]$pi.DockY) } else { $true }
+            if (-not $mVis) {
+                if ($mForm.Visible) { $mForm.Hide() }
+            } else {
+                $mDesired = New-Object System.Drawing.Point($mx, $my)
+                if ($mForm.Location -ne $mDesired) { $mForm.Location = $mDesired }
+                if (-not $mForm.Visible) { $mForm.Show(); Update-LayeredStrip $mForm $script:mirrors[$i].Panel }
+            }
+        }
+
+        # Fast hover-clear: WM_MOUSELEAVE can lag on a layered window, so proactively drop
+        # the highlight on any button/kebab the cursor is no longer over (renders only on change).
+        $cp = [System.Windows.Forms.Cursor]::Position
+        foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+            foreach ($c in $pnl.Controls) {
+                if ($c -is [PillButton] -or $c -is [GripHandle]) {
+                    try { if (-not $c.RectangleToScreen($c.ClientRectangle).Contains($cp)) { $c.ClearHover() } } catch {}
+                }
+            }
         }
 
         # Hover tooltip + one-time first-run hint (our own tip box - the built-in ToolTip
@@ -1743,13 +2081,20 @@ $timer.add_Tick({
         }
         if ($script:tipUntil) {
             if ((Get-Date) -gt $script:tipUntil) { $script:tipUntil = $null; if ($tipForm.Visible) { $tipForm.Hide() } }
-        } elseif ($menusOpen.Count -eq 0 -and -not $script:moveMode -and $script:hoverCtrl) {
-            if (((Get-Date) - $script:hoverAt).TotalMilliseconds -gt 500 -and -not $tipForm.Visible) {
+        } elseif (-not $script:tipsOff -and $menusOpen.Count -eq 0 -and $script:hoverCtrl) {
+            # The first tip waits out the hover delay; but once a tip is already showing,
+            # moving to a DIFFERENT control switches to it immediately. Without this the tip
+            # stayed stuck on the first button and the next button's tip never appeared.
+            $switching = $tipForm.Visible -and $script:tipCtrl -ne $script:hoverCtrl
+            $firstShow = (-not $tipForm.Visible) -and (((Get-Date) - $script:hoverAt).TotalMilliseconds -gt 500)
+            if ($switching -or $firstShow) {
                 $txt = if ($script:hoverCtrl -eq $grip) { L 'gripTip' } else { Get-TipText $script:hoverCtrl.Tag }
                 Show-TipForm $txt $script:hoverCtrl
+                $script:tipCtrl = $script:hoverCtrl
             }
         } elseif ($tipForm.Visible) {
             $tipForm.Hide()
+            $script:tipCtrl = $null
         }
     } catch {
         Write-CkLog "Tick error: $($_.Exception.Message)"
