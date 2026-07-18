@@ -27,6 +27,11 @@ Write-Host "== Panel config-lifecycle tests ==" -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { $fail = 1 }
 
 Write-Host ""
+Write-Host "== Installer behaviour tests ==" -ForegroundColor Cyan
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'install.tests.ps1')
+if ($LASTEXITCODE -ne 0) { $fail = 1 }
+
+Write-Host ""
 Write-Host "== Static checks ==" -ForegroundColor Cyan
 foreach ($f in @('claude-buttons.ps1', 'install.ps1')) {
     try { [void][ScriptBlock]::Create((Get-Content (Join-Path $root $f) -Raw)); Write-Host "  ok  $f parses" -ForegroundColor DarkGreen }

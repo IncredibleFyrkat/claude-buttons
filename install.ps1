@@ -124,6 +124,34 @@ function Test-SettingsUsable {
     try { $fs = [IO.File]::Open($settingsPath, 'Open', 'ReadWrite', 'None'); $fs.Close() }
     catch { throw "~/.claude/settings.json is locked (is Claude Code running?). NOTHING has been changed. Close it and re-run." }
 }
+# Measure the REAL nesting depth of the object graph.
+#
+# PS 5.1's ConvertTo-Json does not error when nesting exceeds -Depth: it stringifies the
+# over-deep node into "@{k=v}" or "System.Object[]" and still emits valid JSON, silently
+# destroying MCP server definitions. The obvious guard - searching the serialized text for
+# those markers - is wrong in BOTH directions: it refuses valid configs whose hook commands
+# or env values legitimately contain "@{", and it misses an over-deep array of strings, which
+# collapses to a space-joined string with no marker at all. So measure the structure instead.
+function Get-JsonDepth($o, [int]$d = 0) {
+    if ($d -gt 120) { return $d }                              # cycle guard
+    if ($null -eq $o -or $o -is [string] -or $o -is [ValueType]) { return $d }
+    $max = $d
+    $children = if ($o -is [System.Collections.IDictionary]) { $o.Values }
+                elseif ($o -is [System.Collections.IEnumerable]) { $o }
+                else { $o.PSObject.Properties.Value }
+    foreach ($c in @($children)) {
+        $cd = Get-JsonDepth $c ($d + 1)
+        if ($cd -gt $max) { $max = $cd }
+    }
+    return $max
+}
+function Assert-JsonDepthSafe($obj) {
+    if ((Get-JsonDepth $obj) -ge 100) {
+        throw ("~/.claude/settings.json nests deeper than this installer can safely rewrite. " +
+               "NOTHING has been changed - add the hook manually (see README). " +
+               "Pristine backup: $settingsPath.orig.bak")
+    }
+}
 function Save-Settings($obj) {
     if (Test-Path $settingsPath) {
         # Preserve the PRISTINE original once, write-once: a full install calls
