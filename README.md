@@ -6,7 +6,7 @@ commands as one-click buttons — globally or scoped to a specific chat.
 
 *(Dansk vejledning: se [README.da.md](README.da.md).)*
 
-![The Claude Buttons strip docked in the Claude desktop app's bottom bar, showing Code review, Simplify and Continue pills next to the app's own controls](docs/screenshot.png)
+![The Claude Buttons strip docked in the Claude desktop app's bottom bar: a ⋮ menu followed by pinned command pills and icon buttons, sitting flush next to the app's own Auto / mic controls](docs/screenshot.png)
 
 ## Why
 
@@ -16,9 +16,10 @@ appears only when it's in the foreground.
 
 ## Features
 
-- **Pin any command** as a pill button — instantly, from a right-click menu on the strip (no round-trip through Claude), or via the `/pin` skill.
+- **Pin any command** as a pill button — instantly, from the strip's **⋮ menu** (no round-trip through Claude), or via the `/pin` skill.
 - **Global or per-chat** buttons. Per-chat buttons appear only when that chat is on screen (detected from the app's own accessibility tree) and never auto-send — they insert the text so you review it first.
-- **Self-aligning**: reads the app's own bottom-row buttons via UI Automation and sits on exactly the same line, next to them. Follows resize, fullscreen, and DPI.
+- **Native look**: each strip is a transparent, per-pixel-alpha overlay that sits directly on the bottom bar with no backing box, so the pills read as part of the app's own chrome.
+- **Composer-anchored docking**: the strip locks onto the chat's composer in the app's accessibility tree and sits right after the app's own controls (Auto / + / mic). It follows resize, fullscreen, DPI, and **split / stacked / grid panes** — every visible chat gets its own strip.
 - **Two-click confirm** for destructive buttons (`"confirm": true`).
 - **Icon buttons**: give a button an icon instead of text (`"icon": "mic"`) — a small round button the same size as the app's own mic button. Uses Windows' built-in Fluent icon font (Lucide-style line icons, no downloads).
 - **Toggle (on/off) buttons** (`"toggle": true`): the button stays lit while active, like the app's mic — optionally sending different text on activate/deactivate (`textOn`/`textOff`).
@@ -71,17 +72,27 @@ confirm to arm, one click to cancel. It is never installed silently.
 ## Usage
 
 - Switch to the Claude app — the strip appears in the bottom bar.
-- **Right-click the dot-grip** → *Pin new button* → pick a command (choose scope with the checkboxes at the top).
+- **Click the ⋮ menu** (the kebab at the left of the strip) → *Pin new button* → pick a command from the *global* or *this chat* submenu (scope is chosen in one click).
 - **Left-click** a button to type its command; global buttons also press Enter, per-chat buttons let you review first.
 - **Hover a button** for a themed tooltip showing its command, scope and behavior — add your own explanation with a `"desc"` field in `buttons.json`.
-- **Right-click a button** → rename, edit the text/prompt, set an icon, switch on/off (toggle) mode, move, or remove.
-- **Position** and **Language** live in the same grip menu. *Position → Free placement* lets you drop the strip anywhere with the mouse (it stays anchored to the window); *Auto* re-docks it to the bottom bar.
+- **Right-click a button** → rename, edit the text/prompt, set an icon, switch on/off (toggle) mode, reorder (*Move left / Move right*), or remove.
+- The **⋮ menu** also holds **Language** (English / Dansk), a **Hover tooltips** on/off switch, and **Close panel**. The strip docks itself to the composer — there is no manual placement to fiddle with.
 
 ### Icons
 
-Right-click a button → *Set icon...* and type a name. Available names:
+Right-click a button → *Set icon...* to browse them in a visual picker, or type a name directly.
+The 134 built-in names (all from Windows' Segoe Fluent Icons font — no downloads):
 
-`mic, power, play, pause, stop, refresh, check, x, trash, settings, search, save, code, bug, star, pin, send, bell, clock, sun, moon, zap, home, folder, camera, edit, plus, download, upload, user, mail, globe, lock, heart, flag, calendar, phone, broom, terminal, shield, copy, link`
+- **Core**: `mic, power, play, pause, stop, refresh, check, x, trash, settings, search, save, code, bug, star, pin, send, bell, clock, sun, moon, zap, home, folder, camera, edit, plus, download, upload, user, mail, globe, lock, heart, flag, calendar, phone, broom, terminal, shield, copy, link`
+- **Help / status**: `help, question, info, warning, error`
+- **Actions / editing**: `sync, filter, list, eye, undo, redo, clipboard, file, keyboard, bulb`
+- **Chat / feedback**: `comment, message, thumbup, thumbdown, more`
+- **Arrows / navigation**: `arrow-right, arrow-left, arrow-up, arrow-down, up, down, chevron-left, chevron-right, expand, collapse, move, menu, grid`
+- **Notes / documents**: `note, document, text, book, archive, tag, attach, checklist, brackets, cut`
+- **Media / image**: `image, video, crop, palette, brush, contrast, volume, mute, headphones, record`
+- **People / social**: `people, contacts, badge, smile, chat, share, megaphone, gift, cart`
+- **Devices**: `monitor, laptop, mobile, mouse, devices, wifi, bluetooth, cloud, print, game, car, plane, building`
+- **Misc**: `sparkle, target, sliders, zoom-in, zoom-out, unlock, block, reset, logout, alarm, bell-off, star-fill, location, translate, accessibility, education, click`
 
 You can also give any 4-digit hex codepoint from the Segoe Fluent Icons font. Icon buttons show
 their label and command in the tooltip.
@@ -180,7 +191,7 @@ The strip is a mouse-driven overlay that intentionally never takes keyboard focu
 keystrokes always go to Claude). That has real limits, stated honestly:
 
 - **Screen readers**: buttons expose an accessible role and name (label + scope + on/off state);
-  the grip announces as "Claude Buttons menu".
+  the ⋮ menu button announces as "Claude Buttons menu".
 - **Non-color cues**: per-chat buttons have a brightened border and toggle-on buttons show a filled
   dot — so scope and on/off aren't conveyed by color alone.
 - **Text contrast** is AAA (~8.9–10.9:1).

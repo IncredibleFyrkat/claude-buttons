@@ -8,13 +8,14 @@ kommandoer som ét-kliks-knapper — globalt eller bundet til en bestemt chat.
 
 ## Funktioner
 
-- **Pin en hvilken som helst kommando** som pille-knap — enten fra en højrekliksmenu på strimlen (uden om Claude) eller via `/pin`-skillen.
+- **Pin en hvilken som helst kommando** som pille-knap — enten fra strimlens **⋮-menu** (uden om Claude) eller via `/pin`-skillen.
 - **Global eller per-chat.** Per-chat-knapper vises kun, når den chat er på skærmen, og auto-sender aldrig (de indsætter teksten, så du ser den først).
-- **Ikon-knapper** (`"icon": "power"`) i samme størrelse som appens mic-knap — Windows' indbyggede Segoe Fluent Icons, ingen downloads.
+- **Native udseende:** hver strimmel er et gennemsigtigt overlay (per-pixel alpha) uden baggrunds-boks, så pillerne ligner en del af appens egen bjælke.
+- **Ikon-knapper** (`"icon": "power"`) i samme størrelse som appens mic-knap — 134 navne fra Windows' indbyggede Segoe Fluent Icons, ingen downloads.
 - **On/off-toggle-knapper** (`"toggle": true`) der lyser, mens de er tændt; `stateGlob` kan spejle en filsystem-tilstand, så knappen altid viser sandheden.
 - **Lange standard-prompts:** en knaps tekst kan være en hel prompt; lang/multiline tekst indsættes atomisk via clipboard (dit tidligere clipboard gendannes).
-- **Multi-pane:** i split-/grid-visning får hver chat-pane sin egen strimmel — globale knapper alle steder, chat-knapper under deres egen pane.
-- **To-kliks bekræftelse** på destruktive knapper; **EN/DA** UI; tooltips; fri placering.
+- **Composer-forankret docking:** strimlen låser sig til chattens composer i appens accessibility-træ og sidder lige efter appens egne knapper. I split-/stacked-/grid-visning får hver synlig chat sin egen strimmel.
+- **To-kliks bekræftelse** på destruktive knapper; **EN/DA** UI; tooltips.
 - **Robust:** alt app-afhængigt (accessibility-navne, zoner) kan rettes i `buttons.json` uden kodeændring, så en app-opdatering degraderer pænt.
 
 ## Krav
@@ -50,10 +51,10 @@ annullerer. Der tilføjes en `/shutdown-on-done on|off|status`-kommando, en Stop
 ## Brug
 
 - Skift til Claude-appen — strimlen dukker op i bundbjælken.
-- **Højreklik på prik-grebet** → *Pin new button* → hold over *Only this chat* eller *Global* → klik en kommando.
+- **Klik på ⋮-menuen** (kebab'en yderst til venstre på strimlen) → *Pin new button* → vælg en kommando i undermenuen *Global* eller *Only this chat* (scope vælges i ét klik).
 - **Venstreklik** på en knap for at skrive dens kommando; globale knapper trykker også Enter, chat-knapper lader dig se teksten først.
-- **Højreklik på en knap** → omdøb, redigér tekst, vælg ikon, on/off-tilstand, flyt eller fjern.
-- **Position** og **Sprog** ligger i samme grebs-menu. Skift til dansk under *Language → Dansk*.
+- **Højreklik på en knap** → omdøb, redigér tekst, vælg ikon, on/off-tilstand, flyt (*Move left / Move right*) eller fjern.
+- **⋮-menuen** rummer også **Sprog** (English / Dansk), en **Hover tooltips**-kontakt og **Close panel**. Strimlen docker sig selv til composeren — ingen manuel placering.
 
 ## Fejlsøgning
 
