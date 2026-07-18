@@ -40,6 +40,14 @@ test('toggle status: nothing armed', () => {
   assert.match(out, /Machine-wide switch: off/);
 });
 
+test('unknown toggle verb fails loudly (never silently reports status)', () => {
+  // `toggle of` (a typo for off) must not silently succeed as a status report.
+  const r = toggle('toggle of', 'sTypo');
+  assert.equal(r.code, 1, 'exits non-zero on an unknown verb');
+  assert.match(r.err, /Unknown toggle verb/);
+  assert.doesNotMatch(r.out, /Not armed|Armed for this chat/);
+});
+
 test('request-on creates the .request marker (panel toggle state)', () => {
   toggle('toggle request-on', 'sReq');
   assert.ok(existsSync(join(flagDir(), 'sReq.request')), '.request marker should exist');

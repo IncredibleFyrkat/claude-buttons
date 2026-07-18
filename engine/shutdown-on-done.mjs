@@ -61,7 +61,16 @@ const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 const [mode, ...rest] = process.argv.slice(2);
 
 if (mode === 'toggle') {
-  const action = rest.find((a) => !a.startsWith('--')) ?? 'status';
+  const verb = rest.find((a) => !a.startsWith('--'));
+  const action = verb ?? 'status';   // no verb at all = report status (documented default)
+  const KNOWN = ['on', 'off', 'request-on', 'request-off', 'status'];
+  if (verb && !KNOWN.includes(verb)) {
+    // A mistyped verb must NOT silently fall through to a status report: someone who
+    // typed `toggle of` (meaning off) would believe they had disarmed while the chat
+    // stays armed and the PC still shuts down. Fail loudly on the disarm path instead.
+    console.error(`Unknown toggle verb "${verb}". Valid verbs: ${KNOWN.join(', ')}.`);
+    process.exit(1);
+  }
   const thisTurn = rest.includes('--this-turn');
   const id = process.env.CLAUDE_CODE_SESSION_ID;
   if (!id) {
