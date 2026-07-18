@@ -58,9 +58,25 @@ const machineArmedFresh = () => {
 // truncates first, and this tool cuts power to the machine - so an interrupted write was a
 // realistic way to produce the corrupt flag that (before the fail-closed fix) fired a shutdown.
 const writeFlagAtomic = (p, data) => {
-  const tmp = `${p}.tmp`;
-  writeFileSync(tmp, data);
-  renameSync(tmp, p);
+  // Unique temp name: a shared one lets two interleaved writers rename each other's payload.
+  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, data);
+    for (let i = 0; ; i++) {
+      try { renameSync(tmp, p); return; } catch (e) {
+        // On Windows, rename-over-existing fails with EPERM/EBUSY while ANY process holds the
+        // target open (Defender, a backup agent, an indexer). The plain write it replaced
+        // tolerated that, so an unguarded rename is a reliability REGRESSION. Retry briefly.
+        if (i >= 4 || (e.code !== 'EPERM' && e.code !== 'EBUSY')) throw e;
+      }
+    }
+  } catch (e) {
+    // Never let a flag write crash the hook: an uncaught throw here means the arm silently
+    // fails behind a stack trace, or the counter is not written and the shutdown lands late.
+    rmSync(tmp, { force: true });
+    writeFileSync(p, data);   // last resort: the old, non-atomic path is better than nothing
+    logLine(`atomic flag write fell back to a direct write: ${e.code ?? e}`);
+  }
 };
 
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
@@ -91,6 +107,13 @@ if (mode === 'toggle') {
   }
   if (words.length > 1) {
     console.error(`Unexpected extra argument "${words[1]}". Usage: toggle ${KNOWN.join('|')} [--this-turn]`);
+    process.exit(1);
+  }
+  // A flag with no verb (`toggle --this-turn`) used to fall through to the status report -
+  // which begins "Armed for this chat", i.e. it reads as confirmation of an arm that never
+  // happened. Same silent-success class as the `--off` hole, in the arming direction.
+  if (words.length === 0 && flags.length > 0) {
+    console.error(`"${flags[0]}" needs a verb. Did you mean \`toggle on ${flags[0]}\`?`);
     process.exit(1);
   }
   const verb = words[0];
@@ -139,6 +162,10 @@ if (mode === 'toggle') {
     // asserting "not armed" about a machine that was.
     rmSync(requestPath(id), { force: true });
     rmSync(flagPath(id), { force: true });
+    // ...and the machine switch, which `toggle off` already clears. Leaving it meant the
+    // wake re-armed the chat at the next turn end, so the user read a withdrawal
+    // confirmation and the PC still powered off.
+    rmSync(MACHINE_FLAG, { force: true });
     console.log('Standing shutdown request cleared for this chat (and any arm it authorised).');
   } else if (action === 'off') {
     // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
@@ -189,11 +216,16 @@ if (!id || !existsSync(flagPath(id))) {
   process.exit(0);
 }
 
-// A turn-end that re-enters the Stop hook (any hook returning decision:"block" causes
-// this - including our own MACHINE-ARMED wake below) is still the SAME user-visible turn.
-// Counting invocations instead of turns burned the skip counter twice and fired one
-// response early, i.e. exactly the mid-work shutdown `toggle on` promises not to do.
-if (input.stop_hook_active) process.exit(0);
+// A turn-end that re-enters the Stop hook (any hook returning decision:"block" causes this -
+// including our own MACHINE-ARMED wake below) is still the SAME user-visible turn. A skip may
+// therefore be burned at most ONCE per turn.
+//
+// It must NOT suppress firing outright. Doing that killed the machine-switch feature entirely
+// (its wake IS a decision:"block", so the invocation that would fire always carries
+// stop_hook_active) and - far worse - left the flag armed, so the shutdown the user was
+// promised for THIS turn silently detonated at the end of some unrelated later turn. That
+// moves a power-off from a moment they consented to, to one they did not.
+const sameTurn = input.stop_hook_active === true;
 
 // Fail CLOSED. `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant
 // every truncated / empty / malformed flag powered the PC off. There is no shape of
@@ -212,9 +244,13 @@ const skip =
 
 if (skip === null) {
   // Consume the bad flag so it cannot repeat, and tell the user plainly - silently
-  // disarming would be its own trap ("I armed it and nothing happened").
-  rmSync(flagPath(id), { force: true });
-  rmSync(requestPath(id), { force: true });
+  // disarming would be its own trap ("I armed it and nothing happened"). recursive+try:
+  // a directory-shaped flag made rmSync throw here, killing the hook BEFORE the message
+  // was emitted, so every turn crashed with a raw stack trace and the bad flag survived.
+  try {
+    rmSync(flagPath(id), { force: true, recursive: true });
+    rmSync(requestPath(id), { force: true, recursive: true });
+  } catch {}
   logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
   emit({
     systemMessage:
@@ -223,8 +259,16 @@ if (skip === null) {
   process.exit(0);
 }
 
+// This turn has already been accounted for: either it burned the skip, or it decided not to
+// fire. Do nothing more. Crucially this must be checked BEFORE the skip branch AND before the
+// fire path: a counter decremented 1 -> 0 during THIS turn means "due next turn", not "due
+// now", so firing on the re-entry would still be a turn early. An arm created during the
+// re-entry itself (the MACHINE-ARMED wake path) carries no marker, so it correctly falls
+// through and fires - which is what makes the physical switch work at all.
+if (sameTurn && parsed.consumedInTurn === true) process.exit(0);
+
 if (skip > 0) {
-  writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1 }));
+  writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true }));
   emit({
     systemMessage:
       'Shutdown-on-done armed: the PC will shut down when the next response in this chat finishes.',

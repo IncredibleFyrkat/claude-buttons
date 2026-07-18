@@ -29,9 +29,18 @@ Do the following:
    powershell -NoProfile -ExecutionPolicy Bypass -File "<install-dir>\claude-buttons.ps1" -AddButton "<path-to-temp.json>"
    ```
 
-   It takes the same lock, merges against a fresh read, writes atomically, and prints exactly
-   one of: `ADDED: <label>`, `DUPLICATE: ...` (a button with that text already exists in that
-   scope — report it and stop), or an error on stderr. The panel reloads within ~1 second.
+   It takes the same lock, merges against a fresh read and writes atomically. Delete the temp
+   file afterwards — it contains the user's prompt text.
+
+   **Interpret the result strictly. Never claim success on anything not listed as success:**
+
+   | Exit | Output | Meaning |
+   |---|---|---|
+   | 0 | `ADDED: <label>` | Done. The panel reloads within ~1 second. |
+   | 0 | `DUPLICATE: ...` | Nothing changed — that command is already pinned in that scope. Say so. |
+   | 1 | stderr | The file was locked or unreadable. **Nothing was saved.** Tell the user and offer to retry. |
+   | 2 | stderr | Bad payload (empty, missing file, invalid JSON). **Nothing was saved.** |
+   | anything else, or no output | — | Treat as failure. Do NOT tell the user the button was pinned. |
 7. Confirm briefly: button name + whether it is pinned to this chat or globally.
 
 **If there are no arguments**: show a clickable menu with AskUserQuestion (multiSelect). Offer the most relevant available slash commands as options; then pin the chosen ones as above. Also mention that the fastest way to pin is to right-click the panel's dot-grip and choose "Pin new button".

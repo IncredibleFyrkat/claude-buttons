@@ -20,7 +20,18 @@ Do the following:
    powershell -NoProfile -ExecutionPolicy Bypass -File "<install-dir>\claude-buttons.ps1" -RemoveButton "<path-to-temp.json>"
    ```
 
-   It prints `REMOVED: <n>` or `NOTFOUND: no button matched.` The panel reloads automatically.
+   Delete the temp file afterwards — it contains the user's prompt text.
+
+   **Interpret the result strictly. Never claim success on anything not listed as success:**
+
+   | Exit | Output | Meaning |
+   |---|---|---|
+   | 0 | `REMOVED: 1` | Done. The panel reloads automatically. |
+   | 0 | `NOTFOUND: ...` | Nothing matched, nothing changed. Show the visible buttons instead. |
+   | 3 | `AMBIGUOUS: ...` | Several buttons match exactly. **Nothing was removed.** Show them and ask which one. |
+   | 1 | stderr | The file was locked or unreadable. **Nothing was removed.** Tell the user. |
+   | 2 | stderr | Bad payload. **Nothing was removed.** |
+   | anything else, or no output | — | Treat as failure. Do NOT tell the user the button was removed. |
 4. Confirm briefly. If nothing matches, show the buttons visible in this chat (global + this chat's) instead.
 
 Tip to mention to the user: you can also just right-click a button in the panel and choose "Remove this button".

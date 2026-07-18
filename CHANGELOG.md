@@ -77,7 +77,8 @@ Every fix below ships with a regression test that was verified to **fail** again
 
 - **Two documented config knobs were dead code.** `uiaPaneName` and `uiaSidebarName` were
   parsed and never read again — and the troubleshooting section told users to edit them to
-  recover from a Claude app update. Removed, and troubleshooting now leads with
+  recover from a Claude app update. Removed **from the documentation**; the parsing is kept so
+  an existing `buttons.json` containing them still loads. Troubleshooting now leads with
   `uiaComposerName`, which is the knob that actually matters.
 - **Corrected the contrast and target-size claims.** The stated contrast range did not cover the
   states it described; the target-size note claimed a WCAG failure the code does not commit

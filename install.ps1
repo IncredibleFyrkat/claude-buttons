@@ -52,19 +52,39 @@ function Write-Utf8NoBom([string]$path, [string]$text) {
 # Claude Code. Write to a temp file, prove it parses back, then swap it in atomically.
 function Write-JsonAtomic([string]$path, [string]$text) {
     $enc = New-Object System.Text.UTF8Encoding($false)   # JSON: never a BOM
-    $tmp = "$path.tmp.$PID"
-    [IO.File]::WriteAllText($tmp, $text, $enc)
-    try { [void]([IO.File]::ReadAllText($tmp) | ConvertFrom-Json) }
-    catch {
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        throw "Refusing to write $path - the JSON it produced did not parse back. Your file was NOT modified."
-    }
-    if (Test-Path $path) {
-        $swap = "$path.replacing"
-        [IO.File]::Replace($tmp, $path, $swap)   # single atomic operation on NTFS
-        Remove-Item $swap -Force -ErrorAction SilentlyContinue
-    } else {
-        Move-Item $tmp $path -Force
+    $tmp  = "$path.tmp.$PID"
+    $swap = "$path.replacing.$PID"   # per-PID: a fixed name collides between concurrent runs,
+                                     # and a stale read-only one wedges every future write
+    try {
+        [IO.File]::WriteAllText($tmp, $text, $enc)
+        # Prove it parses back AND is actually an object. ConvertFrom-Json returns $null for
+        # '', '   ' and 'null' without throwing, and `$null | ConvertTo-Json` is the empty
+        # string - so a null object would otherwise be written as a 0-byte file and certified
+        # valid by its own safety net. That is the exact corruption this function exists to stop.
+        $parsed = $null
+        try { $parsed = [IO.File]::ReadAllText($tmp) | ConvertFrom-Json } catch {
+            throw "Refusing to write $path - the JSON it produced did not parse back. Your file was NOT modified."
+        }
+        if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
+            throw "Refusing to write $path - the JSON it produced was empty or not an object. Your file was NOT modified."
+        }
+        if (Test-Path $path) {
+            Remove-Item $swap -Force -ErrorAction SilentlyContinue
+            # Replace is atomic, but unlike WriteAllText it fails if ANY other process holds
+            # the file open - even a reader. Retry briefly: Defender, a backup agent or an
+            # editor holding a transient handle is common and self-clearing.
+            $done = $false
+            for ($i = 0; $i -lt 5 -and -not $done; $i++) {
+                try { [IO.File]::Replace($tmp, $path, $swap); $done = $true }
+                catch { if ($i -eq 4) { throw }; Start-Sleep -Milliseconds (120 * ($i + 1)) }
+            }
+            Remove-Item $swap -Force -ErrorAction SilentlyContinue
+        } else {
+            Move-Item $tmp $path -Force
+        }
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # never leave .tmp litter behind
+        throw
     }
 }
 
@@ -88,8 +108,19 @@ function Get-Settings {
 # Failing here costs nothing, because nothing has happened yet.
 function Test-SettingsUsable {
     if (-not (Test-Path $settingsPath)) { return }
-    try { [void](Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    $parsed = $null
+    try { $parsed = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw "~/.claude/settings.json is not valid JSON. NOTHING has been changed. Fix or remove it, then re-run." }
+    # '' , '   ' and 'null' all parse to $null WITHOUT throwing, so a 0-byte or null-only
+    # settings.json used to walk straight past this gate and then abort the run half-way
+    # through with "Cannot index into a null array" - after files had already been deleted.
+    if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
+        throw "~/.claude/settings.json is empty or is not a JSON object. NOTHING has been changed. Restore it (see $settingsPath.orig.bak) or delete it, then re-run."
+    }
+    # Check nesting HERE, before anything is deleted or written. Doing it at write time meant
+    # the throw landed after the uninstall had already removed the skills and the engine,
+    # stranding the user with hooks pointing at files that no longer exist.
+    Assert-JsonDepthSafe $parsed
     try { $fs = [IO.File]::Open($settingsPath, 'Open', 'ReadWrite', 'None'); $fs.Close() }
     catch { throw "~/.claude/settings.json is locked (is Claude Code running?). NOTHING has been changed. Close it and re-run." }
 }
@@ -104,15 +135,13 @@ function Save-Settings($obj) {
     }
     # PS 5.1's ConvertTo-Json does NOT error when nesting exceeds -Depth: it stringifies the
     # over-deep node into "@{k=v}" or "System.Object[]", silently destroying MCP server
-    # definitions and other nested config while still emitting valid JSON. Depth alone is
-    # therefore not a fix - refuse to write anything showing that stringification.
-    $json = $obj | ConvertTo-Json -Depth 100
-    if ($json -match '"@\{' -or $json -match '"System\.(Object\[\]|Collections)') {
-        throw ("settings.json is nested deeper than this installer can safely rewrite. " +
-               "Your file was NOT modified - add the hook manually (see README). " +
-               "Pristine backup: $settingsPath.orig.bak")
-    }
-    Write-JsonAtomic $settingsPath $json
+    # definitions while still emitting valid JSON. The depth is checked on the OBJECT GRAPH,
+    # not on the serialized text: an earlier version of this guard searched the text for
+    # "@{ and refused perfectly valid configs, because a hook command, an env value or a
+    # statusLine may legitimately contain those characters. String content and structural
+    # damage are indistinguishable once serialized.
+    Assert-JsonDepthSafe $obj
+    Write-JsonAtomic $settingsPath ($obj | ConvertTo-Json -Depth 100)
 }
 function Ensure-HookArray($settings, [string]$event) {
     if (-not $settings.PSObject.Properties['hooks']) { $settings | Add-Member hooks (New-Object psobject) -Force }

@@ -196,10 +196,11 @@ keystrokes always go to Claude). That has real limits, stated honestly:
   the ⋮ menu button announces as "Claude Buttons menu".
 - **Non-color cues**: per-chat buttons have a brightened border and toggle-on buttons show a filled
   dot — so scope and on/off aren't conveyed by color alone.
-- **Text contrast**: label text is ~8.9:1 on a resting pill and ~11.2:1 on the bare bar (both
-  AAA). A lit toggle draws its label in white on the active fill at ~5.1:1 (AA), and the
-  active fill separates from the bar at ~3.3:1 (1.4.11). These pairs are asserted by
-  `tests\panel.tests.ps1`, so the numbers cannot drift away from the code.
+- **Text contrast**: a resting button has no background of its own, so its label sits on the
+  app's bar at ~11.2:1 (AAA). A lit toggle draws its label in white on the active fill at
+  ~5.1:1 (AA); the active fill separates from the bar at ~3.3:1 and the filled state dot from
+  the fill at ~3.2:1 (both 1.4.11). **The three toggle figures are asserted by
+  `tests\panel.tests.ps1`** and cannot drift away from the code; the resting figure is not.
 - **Keyboard-only / AT users**: the strip itself is not keyboard-operable. Use the `/pin` and
   `/unpin` skills (and hand-editing `buttons.json`) as the equivalent path.
 - **Target size**: buttons are 27×27 logical px (DPI-scaled), which meets WCAG 2.2 SC 2.5.8

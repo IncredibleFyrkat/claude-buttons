@@ -138,6 +138,13 @@ if ($togFill -and $togFore -and $bar) {
     $cue = Ratio $togFill $bar
     Check ("toggle-ON label is readable: {0:N2}:1 >= 4.5 (WCAG 1.4.3)" -f $fg) ($fg -ge 4.5)
     Check ("toggle-ON state cue holds: {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $cue) ($cue -ge 3.0)
+    # The filled dot is the NON-COLOUR cue for the on-state, and it was failing at 2.93:1
+    # before the fill was darkened - it passes now only by 0.20. Assert it, or the next fill
+    # tweak silently re-breaks the one cue a colour-blind user relies on.
+    $dot = ArgbFrom 'FillEllipse\(b, dx.*?\r?\n?.*?Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+    if (-not $dot) { $dot = @(236, 200, 130) }   # literal in PillButton's toggled paint path
+    $dotCue = Ratio $dot $togFill
+    Check ("toggle-ON dot (non-colour cue): {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $dotCue) ($dotCue -ge 3.0)
 }
 
 # --- Docs must describe code that exists ---
@@ -182,7 +189,17 @@ function Invoke-CbCli([string]$json, [string]$switchName, [string]$startCfg) {
     # PowerShell argument parsing once the text contains quotes.
     $pay = Join-Path $dir 'payload.json'
     [IO.File]::WriteAllText($pay, $json, (New-Object System.Text.UTF8Encoding($false)))
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') $switchName $pay 2>&1
+    # Redirect USERPROFILE: the panel writes ~/.claude/claude-buttons-path.txt on a real launch,
+    # and this test previously repointed the DEVELOPER's live install marker at a temp folder
+    # that is deleted moments later - breaking /pin and /unpin on their own machine, silently,
+    # on every test run. Belt and braces alongside the guard in the script itself.
+    $fakeHome = Join-Path $dir 'home'
+    New-Item -ItemType Directory -Force -Path (Join-Path $fakeHome '.claude') | Out-Null
+    $prevHome = $env:USERPROFILE
+    try {
+        $env:USERPROFILE = $fakeHome
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') $switchName $pay 2>&1
+    } finally { $env:USERPROFILE = $prevHome }
     $after = Get-Content (Join-Path $dir 'buttons.json') -Raw
     Remove-Item $dir -Recurse -Force
     [pscustomobject]@{ Out = "$out"; Labels = (($after | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ',' }
