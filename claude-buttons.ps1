@@ -2055,8 +2055,7 @@ $timer.add_Tick({
         # then pulls Claude forward and focuses that pane's composer before typing.
         $show = ($script:target -ne [IntPtr]::Zero) -and
                 (-not [CkWin]::IsIconic($script:target)) -and
-                [CkWin]::IsWindowVisible($script:target) -and
-                (-not $script:composerLost)   # a Claude modal/menu is covering the composers
+                [CkWin]::IsWindowVisible($script:target)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
@@ -2113,6 +2112,20 @@ $timer.add_Tick({
         if ([WinHook]::Consume()) { $script:uiaLast = [DateTime]'2000-01-01'; $script:uiaStable = 0 }
         Update-UiaInfo
         if ($script:uiaDirty) { $script:uiaDirty = $false; $dirty = $true }
+
+        # A Claude modal/menu is covering the composers: hide every strip, but keep the mirrors
+        # alive and KEEP POLLING. This deliberately sits AFTER Update-UiaInfo - gating it in the
+        # $show check above would return before the UIA read, so the strips could never notice
+        # the dialog closing and would stay hidden forever.
+        if ($script:composerLost) {
+            if ($form.Visible) { $form.Hide() }
+            foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
+            if ($tipForm.Visible) { $tipForm.Hide() }
+            if ($gripMenu.Visible) { $gripMenu.Close() }
+            if ($btnMenu.Visible) { $btnMenu.Close() }
+            $script:uiaInterval = 400   # re-check often so they come back promptly
+            return
+        }
 
         # One mirror strip per ADDITIONAL pane (side-by-side / grid view)
         $wantMirrors = [Math]::Max(0, $script:panes.Count - 1)
