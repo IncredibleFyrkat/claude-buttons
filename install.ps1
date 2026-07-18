@@ -272,6 +272,6 @@ Start-Process wscript.exe -ArgumentList "`"$(Join-Path $InstallDir 'Launch.vbs')
 Write-Host ""
 Write-Host "Done. Claude Buttons is running." -ForegroundColor Green
 Write-Host "  - Switch to the Claude desktop app; the strip appears in its bottom bar."
-Write-Host "  - Right-click the dot-grip to pin buttons."
+Write-Host "  - Click the kebab (three dots) at the left of the strip to pin buttons."
 Write-Host "  - Restart the Claude app once so the /pin and /unpin skills load."
 Write-Host "  - Uninstall anytime:  powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall"
