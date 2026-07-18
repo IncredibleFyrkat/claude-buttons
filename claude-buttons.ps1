@@ -1,4 +1,24 @@
-﻿param([switch]$SmokeTest)
+﻿param([switch]$SmokeTest, $EscapeProbe = $null)
+
+# Encode text into a SendKeys string: newlines become Shift+Enter (a soft line break, not
+# a submit) and SendKeys metacharacters are escaped to their literal form. This decides
+# EXACTLY which keystrokes get injected into the Claude window, so it is defined first and
+# has a test hook: `-EscapeProbe <text>` prints the encoding and exits before the UI builds,
+# letting it be unit-tested without a window or message loop.
+function Escape-SendKeys([string]$s) {
+    $s = $s -replace "`r`n", "`n" -replace "`r", "`n"
+    $out = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        if ($ch -eq "`n") { [void]$out.Append('+{ENTER}') }  # Shift+Enter = newline without sending
+        elseif ('+^%~(){}[]'.Contains([string]$ch)) { [void]$out.Append('{' + $ch + '}') }
+        else { [void]$out.Append($ch) }
+    }
+    $out.ToString()
+}
+# -EscapeProbe <path> reads the raw input from a FILE (a file preserves newlines and
+# metacharacters that command-line argument passing would mangle), prints the encoding,
+# and exits before anything else runs.
+if ($null -ne $EscapeProbe) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::ReadAllText([string]$EscapeProbe)))); exit 0 }
 # Claude Buttons - a slim button strip that docks onto the Claude desktop app's bottom bar.
 # - Visible only when the Claude window itself is in the foreground
 # - Right-click the dot-grip for the menu (pin / position / language / close)
@@ -674,16 +694,8 @@ function Show-IconPicker([string]$current) {
     return $out
 }
 
-function Escape-SendKeys([string]$s) {
-    $s = $s -replace "`r`n", "`n" -replace "`r", "`n"
-    $out = New-Object System.Text.StringBuilder
-    foreach ($ch in $s.ToCharArray()) {
-        if ($ch -eq "`n") { [void]$out.Append('+{ENTER}') }  # Shift+Enter = newline without sending
-        elseif ('+^%~(){}[]'.Contains([string]$ch)) { [void]$out.Append('{' + $ch + '}') }
-        else { [void]$out.Append($ch) }
-    }
-    $out.ToString()
-}
+# Escape-SendKeys is defined at the top of the script (it is pure and the -EscapeProbe
+# test hook needs it before any other top-level code runs).
 
 function Get-ShortLabel($b) {
     if ($b.short) { return [string]$b.short }
