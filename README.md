@@ -151,6 +151,7 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `targetProcess` | `"claude"` | Process name that must own the window. |
 | `uiaPaneMatch` | `" pane$"` | Regex; every Group whose accessibility name matches is treated as a chat pane (matches `Primary pane`, `Secondary pane`…). |
 | `uiaPaneName` | `"Primary pane"` | Legacy exact pane name (fallback). |
+| `uiaComposerName` | `"Prompt"` | Accessibility name of the chat composer the strip docks to. Change it here if a Claude update renames or localizes it. |
 | `uiaSidebarName` | `"Sidebar"` | Sidebar name, used to derive the chat area if no pane matches. |
 | `zoneTop` / `zoneBottom` | `45` / `55` | Logical-px zones where the chat title tab / bottom button row live. |
 | `fallbackRow` | `33` | Strip center above the window bottom when the button row can't be measured. |

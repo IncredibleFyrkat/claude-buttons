@@ -77,6 +77,21 @@ Check 'CRLF and CR both normalize to Shift+Enter' ((Esc "a`r`nb`rc") -eq 'a+{ENT
 Check 'a slash command is not mangled' ((Esc '/shutdown-on-done on') -eq '/shutdown-on-done on')
 Check 'empty text yields empty output' ((Esc '') -eq '')
 
+# --- Tick-ordering invariant: the modal-hide must never latch the strips off ---
+# Regression guard for the v1.7.0 deadlock. `composerLost` was part of the $show gate, and that
+# gate's early `return` fires BEFORE Update-UiaInfo - the only place that ever clears the flag.
+# So the first Claude modal that hid the strips kept them hidden until the panel was restarted.
+# Two source invariants keep it fixed; they are checked statically because the live tick needs a
+# real Claude window (the same blind spot that let the bug ship).
+$src = @(Get-Content $panel)
+$showLine = ($src | Select-String -Pattern '^\s*\$show = ' | Select-Object -First 1).LineNumber
+$uiaLine  = ($src | Select-String -Pattern '^\s*Update-UiaInfo\s*$' | Select-Object -First 1).LineNumber
+$hideLine = ($src | Select-String -Pattern '^\s*if \(\$script:composerLost\)' | Select-Object -First 1).LineNumber
+
+$showExpr = if ($showLine) { ($src[($showLine - 1)..([Math]::Min($showLine + 4, $src.Count - 1))] -join ' ') } else { '' }
+Check 'the $show gate does not consult composerLost (else the strips latch off)' (($showLine -gt 0) -and ($showExpr -notmatch 'composerLost'))
+Check 'the modal-hide runs AFTER Update-UiaInfo (so the flag can clear again)' (($uiaLine -gt 0) -and ($hideLine -gt 0) -and ($hideLine -gt $uiaLine))
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

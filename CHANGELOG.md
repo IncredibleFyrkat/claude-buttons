@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.1 — 2026-07-18
+
+Follow-up fixes from [@RasmusKD](https://github.com/RasmusKD) (PR #3). **Two of these are
+regressions in 1.7.0 as shipped** — upgrade if you installed 1.7.0.
+
+- **Strips could stay hidden forever after a Claude modal closed.** `composerLost` was part of
+  the `$show` gate, and that gate's early `return` fires *before* `Update-UiaInfo` — the only
+  place that clears the flag. So the first modal/menu that hid the strips kept them hidden until
+  the panel was restarted. The hide now runs after the UIA read, mirrors stay alive, and the
+  re-check pins to 400ms while hidden. A regression test now guards both source invariants.
+- **The icon picker crashed on click.** The 1.7.0 fuzzy-search rewrite wrapped the grid builder
+  in `.GetNewClosure()`, which rebinds `$script:` to the closure's own module scope, so
+  `$script:iconDlg` / `$script:iconPick` were `$null` in the click handler. Rebuilt without
+  closures, on the idiom the rest of the file uses.
+- **Send could target the wrong pane.** The send path re-derived its composer by nearest-rect
+  score, which in a tight grid can pick a neighbouring pane. Strips now focus the composer they
+  are bound to; the geometric search remains a logged fallback for a dead element.
+- **Clipboard privacy.** Button prompts were enrolled into Windows clipboard history (Win+V) and
+  Cloud Clipboard sync — and restoring the previous clipboard does *not* remove the history
+  entry. Payloads now carry `ExcludeClipboardContentFromMonitorProcessing`,
+  `CanIncludeInClipboardHistory=0` and `CanUploadToCloudClipboard=0`, and the restore is skipped
+  (and logged) if another app wrote to the clipboard mid-send.
+- **Shift-click inserts without sending**, so a prompt can be extended before it goes. Toggles
+  deliberately do not flip on a Shift-click (the command is parked, not executed).
+- **A large pasted prompt no longer makes the strip vanish.** The composer's fixed 220px height
+  ceiling stopped matching once the box grew; it now scales to 60% of the window height.
+- **The strip tracks a growing composer live.** The dock point is stored relative to the composer
+  so each tick can refresh geometry from one cached rectangle instead of redoing the tree walk.
+- **`uiaComposerName`** is configurable in `buttons.json`, so an aria-label rename on Claude's
+  side is self-healable without a code change.
+- Toggles now flip *after* delivery rather than before, so a failed paste plus an aborted
+  fallback can no longer leave a button lit with nothing sent.
+
 ## 1.7.0 — 2026-07-18
 
 Incorporates the community rework from [@RasmusKD](https://github.com/RasmusKD) (PR #2) — thank you.
