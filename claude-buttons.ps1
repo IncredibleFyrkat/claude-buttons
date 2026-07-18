@@ -851,6 +851,28 @@ function Get-IconGlyph([string]$name) {
 
 # Visual icon picker: a grid of the actual glyphs. Returns the chosen name,
 # '' for "no icon (text label)", or $null on cancel.
+# Fuzzy match score for the icon search: lower is better, $null means "no match".
+# Ranks exact > prefix > substring > subsequence (chars in order with gaps), so typing
+# "arw" finds arrow-* and "img" finds image without needing the exact name.
+function Get-IconMatchScore([string]$needle, [string]$name) {
+    if ([string]::IsNullOrWhiteSpace($needle)) { return 0 }
+    $n = ($needle.Trim().ToLower() -replace '\s', '')
+    $h = $name.ToLower()
+    if ($h -eq $n) { return 0 }
+    if ($h.StartsWith($n)) { return 1 }
+    $idx = $h.IndexOf($n)
+    if ($idx -ge 0) { return 10 + $idx }
+    $i = 0; $gaps = 0; $last = -1
+    for ($k = 0; $k -lt $h.Length -and $i -lt $n.Length; $k++) {
+        if ($h[$k] -eq $n[$i]) {
+            if ($last -ge 0) { $gaps += ($k - $last - 1) }
+            $last = $k; $i++
+        }
+    }
+    if ($i -eq $n.Length) { return 100 + $gaps }
+    return $null
+}
+
 function Show-IconPicker([string]$current) {
     if (-not $script:iconFont) { return $null }
     $dlg = New-Object System.Windows.Forms.Form
@@ -860,18 +882,26 @@ function Show-IconPicker([string]$current) {
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.StartPosition = 'CenterScreen'; $dlg.TopMost = $true
     $dlg.BackColor = [System.Drawing.Color]::FromArgb(40, 39, 37)
-    $dlg.ClientSize = New-Object System.Drawing.Size((S 400), (S 320))
+    $dlg.ClientSize = New-Object System.Drawing.Size((S 400), (S 356))
+    $search = New-Object System.Windows.Forms.TextBox
+    $search.Location = New-Object System.Drawing.Point((S 8), (S 8))
+    $search.Size = New-Object System.Drawing.Size((S 384), (S 24))
+    $search.BackColor = [System.Drawing.Color]::FromArgb(30, 29, 28)
+    $search.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
+    $search.BorderStyle = 'FixedSingle'
+    $search.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $flow = New-Object System.Windows.Forms.FlowLayoutPanel
-    $flow.Location = New-Object System.Drawing.Point((S 8), (S 8))
-    $flow.Size = New-Object System.Drawing.Size((S 384), (S 268))
+    $flow.Location = New-Object System.Drawing.Point((S 8), (S 40))
+    $flow.Size = New-Object System.Drawing.Size((S 384), (S 272))
     $flow.AutoScroll = $true
     $flow.BackColor = $dlg.BackColor
     $script:iconPick = $null
     $bigIcon = New-Object System.Drawing.Font($script:iconFontName, 15)
     $pickTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
     # "No icon" first, then all mapped icons
-    $entries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
-    foreach ($e in $entries) {
+    $allEntries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
+    $addIconBtn = {
+        param($e)
         $ib = New-Object System.Windows.Forms.Button
         $ib.Width = S 46; $ib.Height = S 46
         $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
@@ -908,13 +938,32 @@ function Show-IconPicker([string]$current) {
         $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
         $pickTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
         [void]$flow.Controls.Add($ib)
-    }
+    }.GetNewClosure()
+    # Rebuilt on every keystroke: filter by fuzzy score, best match first. "No icon" only shows
+    # on an empty query so it never outranks a real hit. GetNewClosure so the TextChanged
+    # handler can still see these locals (a plain event scriptblock cannot).
+    $fill = {
+        $q = [string]$search.Text
+        $flow.SuspendLayout()
+        $old = @($flow.Controls)
+        $flow.Controls.Clear()
+        foreach ($o in $old) { $o.Dispose() }
+        $matches = if ([string]::IsNullOrWhiteSpace($q)) { $allEntries } else {
+            $allEntries | Where-Object { $_.name } |
+                ForEach-Object { $sc = Get-IconMatchScore $q $_.name; if ($null -ne $sc) { [pscustomobject]@{ e = $_; s = $sc } } } |
+                Sort-Object s, @{ e = { $_.e.name } } | ForEach-Object { $_.e }
+        }
+        foreach ($m in @($matches)) { & $addIconBtn $m }
+        $flow.ResumeLayout()
+    }.GetNewClosure()
+    & $fill                                                  # initial (unfiltered) grid
+    $search.add_TextChanged({ & $fill }.GetNewClosure())      # live fuzzy filter as you type
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
     $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56)
     $cancel.ForeColor = [System.Drawing.Color]::FromArgb(220, 216, 208)
-    $cancel.Location = New-Object System.Drawing.Point((S 300), (S 284)); $cancel.Size = New-Object System.Drawing.Size((S 92), (S 28))
-    $dlg.Controls.AddRange(@($flow, $cancel))
+    $cancel.Location = New-Object System.Drawing.Point((S 300), (S 320)); $cancel.Size = New-Object System.Drawing.Size((S 92), (S 28))
+    $dlg.Controls.AddRange(@($search, $flow, $cancel))
     $dlg.CancelButton = $cancel
     # Make sure the dialog appears in front and takes focus (the panel window never activates,
     # so a child dialog can otherwise open behind and block the panel modally out of sight).
@@ -1108,6 +1157,11 @@ function Update-UiaInfo {
         # flip their order and swap strips), then left-to-right by X within each row.
         $composers = @(Get-Composers $root | Sort-Object @{ e = { [int]($_.Y / 50) } }, @{ e = { $_.X } })
         $newPanes = @()
+        # Once composer detection has worked, losing it means the composers left the tree - a
+        # Claude modal/menu is up. Do NOT fall back to legacy positioning then: that parks the
+        # strips at the pane's left edge on top of the dialog. Hide them instead.
+        if ($composers.Count -gt 0) { $script:composerSeen = $true; $script:composerLost = $false }
+        elseif ($script:composerSeen) { $script:composerLost = $true }
         if ($composers.Count -gt 0) {
             # All buttons once (cached); per composer, find its control row (the Auto/+/mic bar
             # just below the input) so we dock the strip AFTER that left cluster, on that row -
@@ -1124,12 +1178,20 @@ function Update-UiaInfo {
                         $rowBtns += [pscustomobject]@{ X = [double]$bb.X; R = [double]($bb.X + $bb.Width); CY = $bcy }
                     }
                 }
+                # Drop wrapper nodes: a "button" whose rect fully contains a smaller one in the
+                # same row is a grouping element, not a control. It shows up only in some reads,
+                # and its far right edge was dragging the dock past the mic (random displacement).
+                $rowBtns = @($rowBtns | Where-Object {
+                    $a = $_
+                    -not ($rowBtns | Where-Object { $_ -ne $a -and $_.X -ge $a.X -and $_.R -le $a.R -and (($_.R - $_.X) -lt ($a.R - $a.X)) })
+                })
                 # Dock after the CONTIGUOUS left cluster (Auto/+/mic/...), not the rightmost
-                # button: walk left-to-right and stop at the first big gap, so a control that
-                # only appears while typing (send/stop, further right) can't drag us to center.
+                # button: walk left-to-right and stop at the first real gap. The genuine controls
+                # sit ~6px apart, so a tight threshold keeps out anything further right (a send/
+                # stop control that appears while typing, or the model label).
                 $rightEdge = $c.X; $sumY = 0.0; $n = 0
                 foreach ($rb in ($rowBtns | Sort-Object X)) {
-                    if ($n -eq 0 -or $rb.X -le ($rightEdge + (SW 60))) {
+                    if ($n -eq 0 -or $rb.X -le ($rightEdge + (SW 20))) {
                         if ($rb.R -gt $rightEdge) { $rightEdge = $rb.R }
                         $sumY += $rb.CY; $n++
                     } else { break }
@@ -1141,8 +1203,15 @@ function Update-UiaInfo {
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
                     Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
                     DockX = $dockX; DockY = $dockY
+                    # Did we find the control-row buttons we dock after? When a Claude modal
+                    # (settings, connectors, a menu) is open they leave the tree, which both
+                    # slides the strip to the pane's left edge and means the composer is not
+                    # really usable - so the strip hides instead of floating over the dialog.
+                    Anchored = ($n -gt 0)
                 }
             }
+        } elseif ($script:composerSeen) {
+            # Composers were there and vanished (modal/menu open): no panes -> every strip hides.
         } else {
             # Fallback (accessibility not yet built, or an unexpected layout): legacy pane groups.
             $allGroups = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)
@@ -1167,7 +1236,7 @@ function Update-UiaInfo {
             $script:leftEdgeOff = $p0.LeftOff
             $script:paneBottomOff = $p0.BottomOff
             $script:paneComposer = $p0.Composer   # composer rect (screen px) for the primary strip
-            if ($p0.Cx) { $script:paneCRect = @{ X = $p0.Cx; Y = $p0.Cy; W = $p0.Cw; H = $p0.Ch; DockX = $p0.DockX; DockY = $p0.DockY } } else { $script:paneCRect = $null }
+            if ($p0.Cx) { $script:paneCRect = @{ X = $p0.Cx; Y = $p0.Cy; W = $p0.Cw; H = $p0.Ch; DockX = $p0.DockX; DockY = $p0.DockY; Anchored = $p0.Anchored } } else { $script:paneCRect = $null }
             if ($p0.Title -ne $script:uiaTitle) { $script:uiaTitle = $p0.Title; $script:uiaDirty = $true }
         } else {
             $script:paneRect = $null; $script:rowCenterOff = $null; $script:leftEdgeOff = $null; $script:paneBottomOff = 0
@@ -1986,7 +2055,8 @@ $timer.add_Tick({
         # then pulls Claude forward and focuses that pane's composer before typing.
         $show = ($script:target -ne [IntPtr]::Zero) -and
                 (-not [CkWin]::IsIconic($script:target)) -and
-                [CkWin]::IsWindowVisible($script:target)
+                [CkWin]::IsWindowVisible($script:target) -and
+                (-not $script:composerLost)   # a Claude modal/menu is covering the composers
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
@@ -2104,7 +2174,12 @@ $timer.add_Tick({
         # Probe on the control row just LEFT of the strip (over Claude's mic) - that's adjacent
         # to the strip, so coverage of the strip is detected immediately, not only once the
         # composer's center gets covered.
-        $mainVis = if ($script:paneCRect) { Test-PaneVisible ([int]($script:paneCRect.DockX - 5)) ([int]$script:paneCRect.DockY) } else { $true }
+        $mainVis = $true
+        if ($script:paneCRect) {
+            # Anchor gone = a Claude modal/menu is over the composer: hide rather than drift left.
+            if (-not $script:paneCRect.Anchored) { $mainVis = $false }
+            else { $mainVis = Test-PaneVisible ([int]($script:paneCRect.DockX - 5)) ([int]$script:paneCRect.DockY) }
+        }
         if (-not $mainVis) {
             if ($form.Visible) { $form.Hide() }
         } else {
@@ -2141,7 +2216,11 @@ $timer.add_Tick({
             $my = [Math]::Max($r.Top + 4, [Math]::Min($my, $r.Bottom - $mForm.Height - 2))
             # Hide this mirror if its pane on Claude is covered by another app (probe just
             # left of the strip, on the control row - see the primary strip above).
-            $mVis = if ($pi.Cx) { Test-PaneVisible ([int]($pi.DockX - 5)) ([int]$pi.DockY) } else { $true }
+            $mVis = $true
+            if ($pi.Cx) {
+                if (-not $pi.Anchored) { $mVis = $false }   # Claude modal over this pane's composer
+                else { $mVis = Test-PaneVisible ([int]($pi.DockX - 5)) ([int]$pi.DockY) }
+            }
             if (-not $mVis) {
                 if ($mForm.Visible) { $mForm.Hide() }
             } else {
