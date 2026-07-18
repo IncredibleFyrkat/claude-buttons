@@ -158,7 +158,12 @@ function Get-JsonDepth($o, [int]$d = 0) {
     return $max
 }
 function Assert-JsonDepthSafe($obj) {
-    if ((Get-JsonDepth $obj) -ge 100) {
+    # Threshold calibrated by measurement, not by matching -Depth: with `-Depth 100`,
+    # ConvertTo-Json actually starts stringifying at depth 102, and ConvertFrom-Json refuses
+    # to parse at 102 as well - so the corruption window is unreachable from a settings.json
+    # file at all. Blocking at 100 was over-strict by exactly 2 in the safe direction; 102
+    # matches where the damage really begins.
+    if ((Get-JsonDepth $obj) -ge 102) {
         throw ("~/.claude/settings.json nests deeper than this installer can safely rewrite. " +
                "NOTHING has been changed - add the hook manually (see README). " +
                "Pristine backup: $settingsPath.orig.bak")

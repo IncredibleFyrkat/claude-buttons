@@ -54,6 +54,9 @@ const machineArmedFresh = () => {
   return true;
 };
 
+// Backing store for Atomics.wait, used as a CPU-free synchronous sleep in the retry below.
+const SLEEP_LOCK = new Int32Array(new SharedArrayBuffer(4));
+
 // Write via temp + rename so the flag is never observed half-written. A bare writeFileSync
 // truncates first, and this tool cuts power to the machine - so an interrupted write was a
 // realistic way to produce the corrupt flag that (before the fail-closed fix) fired a shutdown.
@@ -70,8 +73,10 @@ const writeFlagAtomic = (p, data) => {
         // real backoff - a retry loop with no delay completes in microseconds and cannot
         // outlast the transient hold it exists to survive.
         if (i >= 4 || (e.code !== 'EPERM' && e.code !== 'EBUSY')) throw e;
-        const until = Date.now() + 120 * (i + 1);
-        while (Date.now() < until) { /* deliberate sync sleep: this path must not go async */ }
+        // Atomics.wait, not a spin loop: this path must stay synchronous (the hook has no
+        // event loop to yield to), but a busy-wait over the full 1.2s schedule measured at
+        // 98.9% of one core. This blocks the thread for the same wall time at ~0% CPU.
+        Atomics.wait(SLEEP_LOCK, 0, 0, 120 * (i + 1));
       }
     }
   } catch (e) {
@@ -95,6 +100,14 @@ const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // fire. Carries no logic; external UIs (button panels) read it for toggle state.
 const requestPath = (id) => join(FLAG_DIR, `${id}.request`);
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
+
+// Whether the Stop hook is re-entering within the same user-visible turn. ONE normalizer used
+// at BOTH read sites, so they cannot disagree. `=== true` was too strict (a harness sending 1
+// or "true" made a re-entry look like a fresh turn, firing a turn early); bare truthiness was
+// too loose (the string "false" is truthy in JS, so a fresh turn could look like a re-entry and
+// wedge the flag forever). Accept only values that actually mean true.
+const isHookActive = (v) =>
+  v === true || v === 1 || (typeof v === 'string' && /^(1|true|yes)$/i.test(v.trim()));
 
 const [mode, ...rest] = process.argv.slice(2);
 
@@ -216,7 +229,7 @@ if (!id || !existsSync(flagPath(id))) {
   // Machine-wide switch: no file heuristic can know whether a session is truly
   // finished (background shells, pending wakeups), so wake the model at turn-end
   // and let it judge; it arms the real per-session flag when everything is done.
-  if (machineArmedFresh() && !input.stop_hook_active) {
+  if (machineArmedFresh() && !isHookActive(input.stop_hook_active)) {
     logLine(`MACHINE-ARMED wake sent to session ${id ?? '(none)'}`);
     emit({
       decision: 'block',
@@ -236,11 +249,7 @@ if (!id || !existsSync(flagPath(id))) {
 // stop_hook_active) and - far worse - left the flag armed, so the shutdown the user was
 // promised for THIS turn silently detonated at the end of some unrelated later turn. That
 // moves a power-off from a moment they consented to, to one they did not.
-// Truthy, not === true: line ~208 tests this field truthily, and a strict check here would
-// disagree with it if the harness ever sent 1 or "true" - treating a re-entry as a fresh turn
-// and firing a turn early. In a file whose whole principle is fail-closed, the permissive
-// reading is the safe one, because it can only ever DELAY a shutdown.
-const sameTurn = Boolean(input.stop_hook_active);
+const sameTurn = isHookActive(input.stop_hook_active);   // normalizer defined at module scope
 
 // Fail CLOSED. `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant
 // every truncated / empty / malformed flag powered the PC off. There is no shape of
@@ -293,9 +302,26 @@ if (skip > 0) {
 
 // One-shot: consume the flags before firing so a misfire can never repeat and
 // the machine switch does not re-trigger after the next boot.
-rmSync(flagPath(id), { force: true });
-rmSync(requestPath(id), { force: true });
-rmSync(MACHINE_FLAG, { force: true });
+//
+// Guarded, for the same reason writeFlagAtomic is: a transient Windows lock (Defender, an
+// indexer, a backup agent) made these throw, which crashed the hook with a raw stack trace,
+// emitted NO systemMessage, and left the flag ARMED - so the power-off silently relocated to
+// an arbitrary later turn. That is the exact harm this file's own comments call out as the
+// worst outcome. If the flags cannot be consumed we must NOT fire: firing without consuming
+// them could repeat after a reboot, which is worse than a shutdown that did not happen.
+try {
+  rmSync(flagPath(id), { force: true });
+  rmSync(requestPath(id), { force: true });
+  rmSync(MACHINE_FLAG, { force: true });
+} catch (e) {
+  logLine(`could not consume flags for session ${id} (${e.code ?? e}); NOT shutting down`);
+  emit({
+    systemMessage:
+      'Shutdown-on-done: the arm flag could not be cleared, so the PC was NOT shut down ' +
+      '(firing without consuming it could repeat after a reboot). Re-arm if you still want it.',
+  });
+  process.exit(0);
+}
 
 if (process.env.SHUTDOWN_ON_DONE_DRYRUN === '1') {
   emit({ systemMessage: '[dry-run] Chat done; would start PC shutdown now.' });

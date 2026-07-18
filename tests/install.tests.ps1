@@ -107,11 +107,29 @@ Check 'depth guard rejects a genuinely over-deep ARRAY (with the right error)' (
 $a10 = @('x'); for ($i = 0; $i -lt 10; $i++) { $a10 = @(, $a10) }
 Check 'a 10-deep array measures 11, not 6 (no pipeline unrolling)' ((Get-JsonDepth $a10) -eq 11)
 
-# The pre-flight must run the depth check itself - checking it only at write time put the
-# throw AFTER uninstall had already deleted the skills and engine.
-Set-Settings ($deep | ConvertTo-Json -Depth 100 -Compress)
-$r = Try-Call { Test-SettingsUsable }
-Check 'the pre-flight runs the depth check (before anything is deleted)' ($r.Threw)
+# The REJECT path must be enforced by Save-Settings, not merely by the helper. Testing only
+# the helper is what let rounds 1 and 2 ship: deleting the `Assert-JsonDepthSafe $obj` call
+# from Save-Settings left the whole suite green while the write path was unprotected.
+Set-Settings '{"precious":"data"}'
+$r = Try-Call { Save-Settings $deep }
+Check 'Save-Settings itself REFUSES an over-deep object (not just the helper)' `
+    ($r.Threw -and ($r.Msg -match 'nests deeper'))
+Check 'a refused Save-Settings leaves the file untouched' ((Get-Content $settingsPath -Raw) -eq '{"precious":"data"}')
+
+# Hashtable input: a separate branch of Get-JsonDepth that nothing exercised. Unreachable from
+# ConvertFrom-Json (which yields PSCustomObject) but reachable from any caller that builds one.
+Check 'Get-JsonDepth measures IDictionary depth too' ((Get-JsonDepth @{a=@{b=@{c=@{d=1}}}}) -eq 4)
+
+# The pre-flight also runs the depth check, so the throw lands before anything is deleted
+# rather than half-way through an uninstall. NOT tested via a file, and deliberately so:
+# measurement shows ConvertTo-Json only corrupts at depth 102, and ConvertFrom-Json REFUSES to
+# parse at 102 - so a settings.json that would trip the guard cannot be read in the first place
+# and Get-Settings rejects it earlier with "not valid JSON". The pre-flight's depth call is
+# belt-and-braces for non-file callers. Asserting it here via a crafted file would produce a
+# test that passes for the wrong reason, which is the failure mode this suite exists to avoid.
+Check 'Test-SettingsUsable invokes the depth guard (unreachable from a file - see comment)' `
+    ([bool]([regex]::Match((Get-Content $install -Raw),
+        '(?s)function Test-SettingsUsable.*?Assert-JsonDepthSafe').Success))
 
 # ---- Test-SettingsUsable ----------------------------------------------------------------
 Set-Settings '{"valid":true}'
