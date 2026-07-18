@@ -109,9 +109,12 @@ Check 'composerLost is cleared somewhere (else it latches on forever)' ($clearsF
 $verMatch = [regex]::Match(($src -join "`n"), "(?m)^\`$CB_VERSION\s*=\s*'([^']+)'")
 Check 'CB_VERSION is defined' ($verMatch.Success)
 $ver = $verMatch.Groups[1].Value
-$chgTop = [regex]::Match((Get-Content (Join-Path $repo 'CHANGELOG.md') -Raw), '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+)')
-Check 'CHANGELOG has a versioned top heading' ($chgTop.Success)
-Check "CB_VERSION ($ver) matches the newest CHANGELOG heading ($($chgTop.Groups[1].Value))" ($ver -eq $chgTop.Groups[1].Value)
+# Compare against the HIGHEST version in the file, not the first heading in file order: a
+# newer section appended at the bottom would otherwise pass silently.
+$chgAll = [regex]::Matches((Get-Content (Join-Path $repo 'CHANGELOG.md') -Raw), '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+)')
+Check 'CHANGELOG has at least one versioned heading' ($chgAll.Count -gt 0)
+$newest = ($chgAll | ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending)[0].ToString()
+Check "CB_VERSION ($ver) matches the newest CHANGELOG version ($newest)" ($ver -eq $newest)
 
 # --- Contrast invariants ---
 # The README states a contrast figure, and a lit toggle used to measure 1.96:1 against it -
@@ -141,10 +144,20 @@ if ($togFill -and $togFore -and $bar) {
     # The filled dot is the NON-COLOUR cue for the on-state, and it was failing at 2.93:1
     # before the fill was darkened - it passes now only by 0.20. Assert it, or the next fill
     # tweak silently re-breaks the one cue a colour-blind user relies on.
-    $dot = ArgbFrom 'FillEllipse\(b, dx.*?\r?\n?.*?Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
-    if (-not $dot) { $dot = @(236, 200, 130) }   # literal in PillButton's toggled paint path
-    $dotCue = Ratio $dot $togFill
-    Check ("toggle-ON dot (non-colour cue): {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $dotCue) ($dotCue -ge 3.0)
+    #
+    # NOTE ON THE SHAPE OF THIS CHECK: the first version of it had the regex written in the
+    # wrong source order, so it never matched - and because it fell back to a hardcoded
+    # literal on failure, it silently compared two constants written in this file and asserted
+    # nothing about the code at all. A parse failure must FAIL the test, never substitute the
+    # expected answer. There is no fallback here for that reason.
+    $dotMatches = [regex]::Matches(($src -join "`n"),
+        'new SolidBrush\(Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)\)+\s*\r?\n\s*g\.FillEllipse')
+    Check 'the toggle dot colour is parseable from BOTH paint paths' ($dotMatches.Count -ge 2)
+    foreach ($dm in $dotMatches) {
+        $dot = @([int]$dm.Groups[1].Value, [int]$dm.Groups[2].Value, [int]$dm.Groups[3].Value)
+        $dotCue = Ratio $dot $togFill
+        Check ("toggle-ON dot (non-colour cue): {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $dotCue) ($dotCue -ge 3.0)
+    }
 }
 
 # --- Docs must describe code that exists ---
@@ -161,8 +174,13 @@ $perButton = @('label','short','text','submit','confirm','icon','toggle','textOn
 $dead = @()
 foreach ($f in ($documented | Sort-Object -Unique)) {
     if ($perButton -contains $f) { continue }   # per-button fields are read off the button object
-    $uses = ([regex]::Matches($srcText, [regex]::Escape("script:$f"))).Count
-    if ($uses -gt 0 -and $uses -lt 3) { $dead += "$f ($uses refs)" }
+    # Count the bare identifier, not "$script:<name>": some fields are read through an implicit
+    # script-scope variable ($targetTitle) and counting only the qualified form reported them as
+    # dead. A live field appears at least 3 times - default, config override, and a real use.
+    # A dead one appears exactly twice (default + override), which is what this catches.
+    # 0 refs is the WORST case (documented but never even parsed) and must not be skipped.
+    $uses = ([regex]::Matches($srcText, "\b$([regex]::Escape($f))\b")).Count
+    if ($uses -lt 3) { $dead += "$f ($uses refs)" }
 }
 Check ("no documented config field is dead code" + $(if ($dead) { ": $($dead -join ', ')" } else { '' })) ($dead.Count -eq 0)
 
@@ -220,6 +238,53 @@ Check 'CLI remove deletes the matching button' (($r.Out -match 'REMOVED') -and (
 $r = Invoke-CbCli '{"label":"Ghost","text":"/ghost"}' '-RemoveButton' $start
 Check 'CLI remove of a missing button reports NOTFOUND' ($r.Out -match 'NOTFOUND')
 Check 'a DECLINED remove leaves the file intact' ($r.Labels -eq 'Kept')
+
+# --- Does the lock actually LOCK? (QA-2/QA-3) ---
+# The battery above proves add/remove works with a single writer. It does NOT prove the mutex
+# does anything: with the lock removed entirely, every one of those assertions still passed.
+# This is the test that fails if the merge protocol is dropped. A second writer takes the same
+# named mutex, holds it while it appends a button, and releases; the CLI must BLOCK, then merge
+# against the file as it is AFTER that write - not against the copy it read before.
+$dir = Join-Path ([IO.Path]::GetTempPath()) ("cb-lock-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force -Path (Join-Path $dir 'home\.claude') | Out-Null
+Copy-Item $panel  (Join-Path $dir 'claude-buttons.ps1') -Force
+Copy-Item $defCfg (Join-Path $dir 'buttons.default.json') -Force
+$cfgFile = Join-Path $dir 'buttons.json'
+[IO.File]::WriteAllText($cfgFile, '{"schemaVersion":1,"buttons":[{"label":"Start","text":"/start"}]}',
+                        (New-Object System.Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText((Join-Path $dir 'pay.json'), '{"label":"FromCli","text":"/cli"}',
+                        (New-Object System.Text.UTF8Encoding($false)))
+
+$holder = Start-Job -ArgumentList $cfgFile -ScriptBlock {
+    param($cfg)
+    $m = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
+    [void]$m.WaitOne(5000)
+    try {
+        # READ, then think, then write - the classic lost-update shape, and exactly what the
+        # skills used to do by hand. Without the lock the CLI's write lands inside this gap
+        # and is overwritten by the stale copy read before it.
+        $o = Get-Content $cfg -Raw | ConvertFrom-Json
+        Start-Sleep -Milliseconds 1200
+        $b = [pscustomobject]@{ label = 'FromPanel'; text = '/panel' }
+        $o.buttons = @($o.buttons) + $b
+        [IO.File]::WriteAllText($cfg, ($o | ConvertTo-Json -Depth 100),
+                                (New-Object System.Text.UTF8Encoding($false)))
+    } finally { $m.ReleaseMutex() }
+}
+Start-Sleep -Milliseconds 300                   # let the job take the mutex first
+$prevHome = $env:USERPROFILE
+try {
+    $env:USERPROFILE = Join-Path $dir 'home'
+    $lockOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') `
+                   -AddButton (Join-Path $dir 'pay.json') 2>&1
+} finally { $env:USERPROFILE = $prevHome }
+Wait-Job $holder -Timeout 20 | Out-Null
+Remove-Job $holder -Force
+$finalLabels = ((Get-Content $cfgFile -Raw | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ','
+Remove-Item $dir -Recurse -Force
+
+Check 'the CLI waits for the lock and reports success' ("$lockOut" -match 'ADDED')
+Check "a concurrent writer's button SURVIVES the CLI write (got: $finalLabels)" ($finalLabels -eq 'Start,FromPanel,FromCli')
 
 # The skills must route through the locked entry point, not edit the JSON themselves.
 foreach ($s in @('pin', 'unpin')) {

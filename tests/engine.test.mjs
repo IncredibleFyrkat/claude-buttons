@@ -102,7 +102,7 @@ test('toggle off is per-chat: cancelling one chat leaves other armed chats intac
 test('Stop hook: skip counter decrements without firing', () => {
   writeFileSync(join(flagDir(), 'sSkip.json'), JSON.stringify({ skip: 1 }));
   const { out } = stop({ session_id: 'sSkip' });
-  assert.match(out, /armed/i);
+  assert.match(out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
   assert.doesNotMatch(out, /shutting down|would start/i);
   assert.equal(JSON.parse(readFileSync(join(flagDir(), 'sSkip.json'), 'utf8')).skip, 0);
 });
@@ -192,7 +192,7 @@ test('a re-entered Stop hook does not burn the grace turn', () => {
   const id = 'sReenter';
   writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 1 }));
   const first = stop({ session_id: id });
-  assert.match(first.out, /armed/i);
+  assert.match(first.out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
   const second = stop({ session_id: id, stop_hook_active: true });
   assert.doesNotMatch(second.out, /would start PC shutdown/, 'must not fire on re-entry');
   assert.equal(JSON.parse(readFileSync(join(flagDir(), `${id}.json`), 'utf8')).skip, 0,
