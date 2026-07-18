@@ -361,6 +361,7 @@ public class CkWin {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     public struct POINT { public int X, Y; }
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
@@ -597,6 +598,10 @@ if ($script:config.uiaPaneName) { $script:uiaPaneName = [string]$script:config.u
 # Matches EVERY chat pane in split/grid view: "Primary pane", "Secondary pane", "Tertiary pane"...
 $script:uiaPaneMatch = ' pane$'
 if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config.uiaPaneMatch }
+# Accessible name of the chat composer. Overridable like every other app-dependent name, so a
+# rename or localization on Claude's side can be self-healed from buttons.json.
+$script:uiaComposerName = 'Prompt'
+if ($script:config.uiaComposerName) { $script:uiaComposerName = [string]$script:config.uiaComposerName }
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
@@ -627,6 +632,7 @@ $script:strings = @{
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
+        tipShift = 'Shift-click: insert without sending'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
@@ -646,6 +652,7 @@ $script:strings = @{
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
+        tipShift = 'Shift-klik: indsæt uden at sende'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
@@ -873,6 +880,63 @@ function Get-IconMatchScore([string]$needle, [string]$name) {
     return $null
 }
 
+# Repopulate the picker grid, filtered by the search box. Plain function using $script:
+# state - NOT a closure: GetNewClosure() rebinds $script: to the closure's own module scope,
+# which silently broke $script:iconDlg/$script:iconPick inside the click handler.
+function Fill-IconGrid {
+    $flow = $script:iconFlow
+    if (-not $flow) { return }
+    $q = [string]$script:iconSearch.Text
+    $flow.SuspendLayout()
+    $old = @($flow.Controls)
+    $flow.Controls.Clear()
+    foreach ($o in $old) { $o.Dispose() }
+    # Best match first; "No icon" only on an empty query so it never outranks a real hit.
+    $matches = if ([string]::IsNullOrWhiteSpace($q)) { $script:iconEntries } else {
+        $script:iconEntries | Where-Object { $_.name } |
+            ForEach-Object { $sc = Get-IconMatchScore $q $_.name; if ($null -ne $sc) { [pscustomobject]@{ e = $_; s = $sc } } } |
+            Sort-Object s, @{ e = { $_.e.name } } | ForEach-Object { $_.e }
+    }
+    foreach ($e in @($matches)) {
+        $ib = New-Object System.Windows.Forms.Button
+        $ib.Width = S 46; $ib.Height = S 46
+        $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
+        $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
+        $ib.BackColor = if ($e.name -eq $script:iconCurrent) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
+        $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
+        if ($e.glyph) {
+            # Draw the glyph with the SAME faux-bold the strip uses, so the picker previews the
+            # true stroke weight; the offset scales with this larger font to match proportionally.
+            $ib.Font = $script:iconBig; $ib.Text = ''
+            $ib.add_Paint({
+                param($src, $pe)
+                $gl = Get-IconGlyph ([string]$this.Tag)
+                if (-not $gl) { return }
+                $gr = $pe.Graphics
+                $gr.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+                $sf = New-Object System.Drawing.StringFormat
+                $sf.Alignment = [System.Drawing.StringAlignment]::Center
+                $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+                $br = New-Object System.Drawing.SolidBrush($this.ForeColor)
+                $o = 0.3 * ($this.Font.Size / 9.0)
+                foreach ($d in @(@(-$o, 0.0), @($o, 0.0), @(0.0, -$o), @(0.0, $o), @(0.0, 0.0))) {
+                    $r = New-Object System.Drawing.RectangleF($d[0], $d[1], $this.Width, $this.Height)
+                    $gr.DrawString($gl, $this.Font, $br, $r, $sf)
+                }
+                $br.Dispose(); $sf.Dispose()
+            })
+        }
+        else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
+        $ib.Tag = $e.name
+        # No closure: $this must resolve to the clicked button at event time, and $script: must
+        # reach the real script scope so the dialog refs below are visible.
+        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
+        $script:iconTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
+        [void]$flow.Controls.Add($ib)
+    }
+    $flow.ResumeLayout()
+}
+
 function Show-IconPicker([string]$current) {
     if (-not $script:iconFont) { return $null }
     $dlg = New-Object System.Windows.Forms.Form
@@ -896,68 +960,15 @@ function Show-IconPicker([string]$current) {
     $flow.AutoScroll = $true
     $flow.BackColor = $dlg.BackColor
     $script:iconPick = $null
-    $bigIcon = New-Object System.Drawing.Font($script:iconFontName, 15)
-    $pickTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
+    $script:iconBig = New-Object System.Drawing.Font($script:iconFontName, 15)
+    $script:iconTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
+    $script:iconSearch = $search
+    $script:iconFlow = $flow
+    $script:iconCurrent = $current
     # "No icon" first, then all mapped icons
-    $allEntries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
-    $addIconBtn = {
-        param($e)
-        $ib = New-Object System.Windows.Forms.Button
-        $ib.Width = S 46; $ib.Height = S 46
-        $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
-        $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
-        $ib.BackColor = if ($e.name -eq $current) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
-        $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
-        if ($e.glyph) {
-            # Draw the glyph ourselves with the SAME faux-bold the strip uses, so the picker
-            # previews the true stroke weight instead of a thinner plain-rendered glyph. The
-            # offset scales with the picker's larger font so the weight matches proportionally.
-            $ib.Font = $bigIcon; $ib.Text = ''
-            $ib.add_Paint({
-                param($src, $pe)
-                $gl = Get-IconGlyph ([string]$this.Tag)
-                if (-not $gl) { return }
-                $gr = $pe.Graphics
-                $gr.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
-                $sf = New-Object System.Drawing.StringFormat
-                $sf.Alignment = [System.Drawing.StringAlignment]::Center
-                $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-                $br = New-Object System.Drawing.SolidBrush($this.ForeColor)
-                $o = 0.3 * ($this.Font.Size / 9.0)
-                foreach ($d in @(@(-$o, 0.0), @($o, 0.0), @(0.0, -$o), @(0.0, $o), @(0.0, 0.0))) {
-                    $r = New-Object System.Drawing.RectangleF($d[0], $d[1], $this.Width, $this.Height)
-                    $gr.DrawString($gl, $this.Font, $br, $r, $sf)
-                }
-                $br.Dispose(); $sf.Dispose()
-            })
-        }
-        else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
-        $ib.Tag = $e.name
-        # No GetNewClosure: $this must resolve to the clicked button at event time,
-        # and each button's own name is stored in its Tag.
-        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
-        $pickTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
-        [void]$flow.Controls.Add($ib)
-    }.GetNewClosure()
-    # Rebuilt on every keystroke: filter by fuzzy score, best match first. "No icon" only shows
-    # on an empty query so it never outranks a real hit. GetNewClosure so the TextChanged
-    # handler can still see these locals (a plain event scriptblock cannot).
-    $fill = {
-        $q = [string]$search.Text
-        $flow.SuspendLayout()
-        $old = @($flow.Controls)
-        $flow.Controls.Clear()
-        foreach ($o in $old) { $o.Dispose() }
-        $matches = if ([string]::IsNullOrWhiteSpace($q)) { $allEntries } else {
-            $allEntries | Where-Object { $_.name } |
-                ForEach-Object { $sc = Get-IconMatchScore $q $_.name; if ($null -ne $sc) { [pscustomobject]@{ e = $_; s = $sc } } } |
-                Sort-Object s, @{ e = { $_.e.name } } | ForEach-Object { $_.e }
-        }
-        foreach ($m in @($matches)) { & $addIconBtn $m }
-        $flow.ResumeLayout()
-    }.GetNewClosure()
-    & $fill                                                  # initial (unfiltered) grid
-    $search.add_TextChanged({ & $fill }.GetNewClosure())      # live fuzzy filter as you type
+    $script:iconEntries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
+    Fill-IconGrid                                     # initial (unfiltered) grid
+    $search.add_TextChanged({ Fill-IconGrid })        # live fuzzy filter as you type
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
     $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56)
@@ -967,12 +978,12 @@ function Show-IconPicker([string]$current) {
     $dlg.CancelButton = $cancel
     # Make sure the dialog appears in front and takes focus (the panel window never activates,
     # so a child dialog can otherwise open behind and block the panel modally out of sight).
-    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($flow.Handle); $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($script:iconFlow.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
-    $pickTip.Dispose(); $bigIcon.Dispose()
+    $script:iconTip.Dispose(); $script:iconBig.Dispose()
     $dlg.Dispose()
-    $script:iconDlg = $null
+    $script:iconDlg = $null; $script:iconFlow = $null; $script:iconSearch = $null; $script:iconEntries = $null
     return $out
 }
 
@@ -1116,13 +1127,19 @@ function Enable-WebA11y {
 function Get-Composers($root) {
     $out = @()
     try {
+        # Height ceiling scales with the window. The composer GROWS as you type or paste, and a
+        # fixed 220px cap made a large pasted prompt stop matching - the pane dropped out and its
+        # strip vanished until the text was sent. Anything taller than most of the window is a
+        # container rather than an input, so cap at 60% of the window height.
+        $maxH = 700
+        try { $rb = $root.Current.BoundingRectangle; if ($rb.Height -gt 100) { $maxH = [int]($rb.Height * 0.6) } } catch {}
         $grpT  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
-        $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Prompt')
+        $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaComposerName)
         $cond  = New-Object System.Windows.Automation.AndCondition($grpT, $nameC)
         $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
         foreach ($e in $els) {
             $b = $e.Current.BoundingRectangle
-            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt 220) { continue }
+            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt $maxH) { continue }
             $out += [pscustomobject]@{ El = $e; X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height }
         }
     } catch {}
@@ -1203,6 +1220,10 @@ function Update-UiaInfo {
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
                     Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
                     DockX = $dockX; DockY = $dockY
+                    # Dock point stored RELATIVE to the composer, so the per-tick geometry
+                    # refresh can recompute it live without redoing the expensive tree walk.
+                    DockDX = $dockX - [int]$c.X
+                    DockDY = $dockY - [int]($c.Y + $c.H)
                     # Did we find the control-row buttons we dock after? When a Claude modal
                     # (settings, connectors, a menu) is open they leave the tree, which both
                     # slides the strip to the pane's left edge and means the composer is not
@@ -1324,9 +1345,11 @@ function Render-StripFor($ctrl) {
 # ---------- UI ----------
 $form = New-Object LayeredForm
 $form.Text = 'Claude Buttons'
-# TopMost: keeps the strip rock-steady above Claude with no tab-over flash. Trade-off: it
-# can show over a window that fully covers Claude (a floating overlay can't have both).
 $form.TopMost = $true
+# TopMost + the occlusion probe below. Do NOT try to attach these to Claude's owner chain
+# (GWLP_HWNDPARENT): it hung claude.exe (Windows "stopped communicating", event 1002) because
+# this UI thread blocks on synchronous UIA/SendKeys work, and the window manager then waits on
+# it for the owner chain's z-order/activation. Verified by crash log, not theory.
 $form.FormBorderStyle = 'None'
 $form.ShowInTaskbar = $false
 $form.AutoSize = $true
@@ -1398,7 +1421,9 @@ function Get-TipText($b) {
     $enter = if ($b.toggle) { L 'tipToggle' } elseif ($b.submit -and -not $b.chat) { L 'tipSends' } else { L 'tipInserts' }
     $out = ''
     if ($b.desc) { $out = "$($b.desc)`n" }
-    "$out$head`n$scope - $enter`n$(L 'tipRemove')"
+    # Only advertise Shift-click on buttons that would otherwise send.
+    $shiftHint = if ($b.submit -and -not $b.chat) { "`n$(L 'tipShift')" } else { '' }
+    "$out$head`n$scope - $enter$shiftHint`n$(L 'tipRemove')"
 }
 
 # Grip
@@ -1705,6 +1730,22 @@ function Test-TargetForeground {
 # The composer sits just above the clicked strip, so we pick the editable control that is
 # above the strip and nearest it horizontally. Fails safe: if none is found, focus is left
 # alone and the send proceeds exactly as before (no regression).
+# The pane a strip is BOUND to (main strip = first pane, mirror i = pane i+1). The send path
+# must target this pane's own composer element, not re-derive one from geometry: in a tight
+# grid an adjacent pane's composer can score closer and the text lands in the wrong chat.
+function Get-PaneForForm($frm) {
+    if (-not $frm) { return $null }
+    if ($frm -eq $form) { if ($script:panes.Count -gt 0) { return $script:panes[0] }; return $null }
+    for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
+        if ($script:mirrors[$i].Form -eq $frm) {
+            $idx = $i + 1
+            if ($idx -lt $script:panes.Count) { return $script:panes[$idx] }
+            return $null
+        }
+    }
+    return $null
+}
+
 function Focus-ChatInput($stripCenterX, $stripTopY) {
     try {
         if ($script:target -eq [IntPtr]::Zero) { return }
@@ -1778,6 +1819,9 @@ function Set-ToggleFace($item, [bool]$on) {
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    # Shift-click = insert the text but do NOT press Enter, so it can be edited or extended
+    # first. Read it up front: Shift may be released during the focus + paste round-trip.
+    $holdShift = ([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) -ne 0
     if ($tipForm.Visible) { $tipForm.Hide() }
     try {
         $item = $btn.Tag
@@ -1818,7 +1862,19 @@ function Invoke-PillClick($btn) {
             # foreground with another chat focused it passes instantly and the first characters
             # go to the wrong chat. Abort if focus never lands rather than type into the wrong box.
             $sf = $btn.FindForm()
-            $composerEl = if ($sf) { Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top } else { $null }
+            # Target the composer this strip is BOUND to. Geometric re-discovery is only a
+            # fallback for a dead element - picking by nearest-rect can select the neighbouring
+            # pane's composer in a tight grid and send the text to the wrong chat.
+            $composerEl = $null
+            $pane = Get-PaneForForm $sf
+            if ($pane -and $pane.Composer) {
+                try { $pane.Composer.SetFocus(); $composerEl = $pane.Composer }
+                catch { $composerEl = $null }   # element died (pane closed/re-mounted)
+            }
+            if (-not $composerEl -and $sf) {
+                Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
+                $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
+            }
             if (-not (Wait-ComposerFocus $composerEl)) {
                 Write-CkLog 'Send aborted: focus never landed in this pane composer'
                 return
@@ -1834,7 +1890,6 @@ function Invoke-PillClick($btn) {
             # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
             # it clobbered, and restore it in finally so it survives an exception.
             if (-not (Test-TargetForeground)) { return }
-            if ($isToggle) { Set-ToggleFace $item $newOn }   # H7: flip only now, right before the send
             $backup = $null; $snapOk = $false; $pasted = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
@@ -1842,24 +1897,54 @@ function Invoke-PillClick($btn) {
                 if ($old) { foreach ($fmt in $old.GetFormats()) { try { $backup.SetData($fmt, $old.GetData($fmt)) } catch {} } }
                 $snapOk = $true   # empty snapshot = "was empty"; restoring it re-empties correctly
             } catch { $snapOk = $false }
+            $seqAfterSet = $null
             try {
-                [System.Windows.Forms.Clipboard]::SetText(($textToSend -replace "`r`n", "`n"))
+                # Mark the payload so Windows keeps it OUT of clipboard history (Win+V) and out
+                # of Cloud Clipboard sync. Button prompts are standing text the user never chose
+                # to copy; without this every click is archived and may sync to their other
+                # devices. Restoring the old clipboard does not remove a history entry.
+                $dobj = New-Object System.Windows.Forms.DataObject
+                $dobj.SetText(($textToSend -replace "`r`n", "`n"))
+                foreach ($fmt in @('ExcludeClipboardContentFromMonitorProcessing',
+                                   'CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard')) {
+                    try {
+                        $ms = New-Object System.IO.MemoryStream
+                        $ms.Write([byte[]]@(0, 0, 0, 0), 0, 4)
+                        $dobj.SetData($fmt, $ms)
+                    } catch {}
+                }
+                [System.Windows.Forms.Clipboard]::SetDataObject($dobj, $true)
+                $seqAfterSet = [CkWin]::GetClipboardSequenceNumber()
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
                 $pasted = $true
                 Start-Sleep -Milliseconds 90   # let the paste land in the composer
             } catch {
                 Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
             } finally {
-                # M1: always restore the full prior clipboard. If the snapshot itself failed we
-                # leave our text rather than guess (can't safely reconstruct unknown content).
-                if ($snapOk) { try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {} }
+                # M1: restore the full prior clipboard - but only if nothing else wrote to it
+                # meanwhile, or we would clobber another app's copy with stale content. If the
+                # snapshot itself failed we leave our text rather than guess.
+                if ($snapOk) {
+                    $seqNow = [CkWin]::GetClipboardSequenceNumber()
+                    if ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet) {
+                        try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {}
+                    } else {
+                        Write-CkLog 'Clipboard changed by another app mid-send; left it alone'
+                    }
+                }
             }
             if (-not $pasted) {
                 if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
                 [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
             }
-            # Per-chat buttons never auto-send: the user must see the text before Enter
-            if ($item.submit -and -not $item.chat) {
+            # F4: flip the toggle only once the text is actually delivered. Flipping before the
+            # send left it inverted with nothing sent whenever the paste threw and the typing
+            # fallback then aborted on the foreground re-check. On a Shift-click the command is
+            # only parked in the box, not run, so the state must not flip either.
+            if ($isToggle -and -not $holdShift) { Set-ToggleFace $item $newOn }
+            # Per-chat buttons never auto-send: the user must see the text before Enter.
+            # Shift-click suppresses the send too, leaving the text ready to edit.
+            if ($item.submit -and -not $item.chat -and -not $holdShift) {
                 Start-Sleep -Milliseconds 90
                 if (-not (Test-TargetForeground)) { return }
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
@@ -2055,8 +2140,7 @@ $timer.add_Tick({
         # then pulls Claude forward and focuses that pane's composer before typing.
         $show = ($script:target -ne [IntPtr]::Zero) -and
                 (-not [CkWin]::IsIconic($script:target)) -and
-                [CkWin]::IsWindowVisible($script:target) -and
-                (-not $script:composerLost)   # a Claude modal/menu is covering the composers
+                [CkWin]::IsWindowVisible($script:target)
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
@@ -2114,6 +2198,20 @@ $timer.add_Tick({
         Update-UiaInfo
         if ($script:uiaDirty) { $script:uiaDirty = $false; $dirty = $true }
 
+        # A Claude modal/menu is covering the composers: hide every strip, but keep the mirrors
+        # alive and KEEP POLLING. This deliberately sits AFTER Update-UiaInfo - gating it in the
+        # $show check above would return before the UIA read, so the strips could never notice
+        # the dialog closing and would stay hidden forever.
+        if ($script:composerLost) {
+            if ($form.Visible) { $form.Hide() }
+            foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
+            if ($tipForm.Visible) { $tipForm.Hide() }
+            if ($gripMenu.Visible) { $gripMenu.Close() }
+            if ($btnMenu.Visible) { $btnMenu.Close() }
+            $script:uiaInterval = 400   # re-check often so they come back promptly
+            return
+        }
+
         # One mirror strip per ADDITIONAL pane (side-by-side / grid view)
         $wantMirrors = [Math]::Max(0, $script:panes.Count - 1)
         while ($script:mirrors.Count -lt $wantMirrors) {
@@ -2127,6 +2225,28 @@ $timer.add_Tick({
             $dirty = $true
         }
         if ($dirty) { Rebuild-Buttons }
+
+        # LIVE geometry, every tick. Discovering which panes exist needs a full tree walk, which
+        # is expensive and therefore throttled - but where they ARE must never lag, or the strip
+        # trails behind a composer that just grew from typing/pasting. Re-reading one cached
+        # element's rectangle per pane is cheap, and the dock point is stored relative to the
+        # composer, so this tracks it exactly without redoing the walk.
+        foreach ($pn in $script:panes) {
+            if (-not $pn.Composer -or $null -eq $pn.DockDX) { continue }
+            try {
+                $cb = $pn.Composer.Current.BoundingRectangle
+                if ($cb.Width -gt 0 -and $cb.Height -gt 0) {
+                    $pn.Cx = [int]$cb.X; $pn.Cy = [int]$cb.Y
+                    $pn.Cw = [int]$cb.Width; $pn.Ch = [int]$cb.Height
+                    $pn.DockX = [int]$cb.X + $pn.DockDX
+                    $pn.DockY = [int]($cb.Y + $cb.Height) + $pn.DockDY
+                }
+            } catch {}
+        }
+        if ($script:panes.Count -gt 0 -and $script:panes[0].Cx) {
+            $p0 = $script:panes[0]
+            $script:paneCRect = @{ X = $p0.Cx; Y = $p0.Cy; W = $p0.Cw; H = $p0.Ch; DockX = $p0.DockX; DockY = $p0.DockY; Anchored = $p0.Anchored }
+        }
 
         $r = New-Object CkWin+RECT
         if (-not [CkWin]::GetWindowRect($script:target, [ref]$r)) { return }
