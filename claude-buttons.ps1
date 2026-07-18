@@ -1784,7 +1784,7 @@ function Wait-PasteLanded($el, [string]$text, [int]$timeoutMs = 1500) {
             $readable = $true
             if (($now -replace "`r`n", "`n").Contains($probe)) { return $true }
         }
-        Start-Sleep -Milliseconds 20
+        Start-Sleep -Milliseconds 10
     }
     if (-not $readable) { return $null }   # unverifiable, not a confirmed failure
     return $false
@@ -1995,7 +1995,9 @@ function Invoke-PillClick($btn) {
             # Per-chat buttons never auto-send: the user must see the text before Enter.
             # Shift-click suppresses the send too, leaving the text ready to edit.
             if ($item.submit -and -not $item.chat -and -not $holdShift) {
-                Start-Sleep -Milliseconds 90
+                # No wait here: the read-back already proved the text is in the composer, so the
+                # editor has processed it and Enter can go immediately. This sleep used to be the
+                # ONLY thing standing between paste and submit - verification supersedes it.
                 if (-not (Test-TargetForeground)) { return }
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
             }
