@@ -228,6 +228,58 @@ public class CkWin {
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
+# WinEvent hooks: let Windows tell us when the Claude window is moved/resized, shown/
+# hidden, or (de)foregrounded, instead of polling those every tick. The callback only
+# flips a Dirty flag; the timer consumes it to run the expensive window/UIA/reposition
+# work on demand (with a slow backstop, so a missed event just means a slightly-late
+# reposition rather than a stall). The delegate is held in a C# STATIC field on purpose:
+# a PowerShell-side delegate would be GC-collected while Windows still holds the native
+# pointer and crash the process on the next event - the classic PS 5.1 callback footgun.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinHook {
+    delegate void WinEventDelegate(IntPtr hHook, uint ev, IntPtr hwnd, int idObj, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr hmod, WinEventDelegate cb, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    // SHOW..NAMECHANGE spans show/hide/reorder/focus/location/name - i.e. Claude being
+    // moved, resized, shown/hidden, or switching the displayed chat (its title changes).
+    const uint EVENT_OBJECT_SHOW = 0x8002, EVENT_OBJECT_NAMECHANGE = 0x800C;
+    const uint OUTOFCONTEXT = 0x0000, SKIPOWNPROCESS = 0x0002;
+    static WinEventDelegate _cb;   // rooted here so the GC never frees the native callback
+    static IntPtr _hFg, _hObj;
+    // volatile: the callback runs on our message-loop thread, but a plain field could be
+    // cached; volatile guarantees the timer sees the latest value.
+    static volatile bool _dirty = true;   // start dirty so the first tick positions
+    public static uint TargetPid = 0;     // set by the panel so LOCATIONCHANGE noise from
+                                          // other apps is ignored (Claude has multiple procs,
+                                          // so 0 = accept all until the panel narrows it).
+    static void OnEvent(IntPtr hHook, uint ev, IntPtr hwnd, int idObj, int idChild, uint thread, uint time) {
+        // Foreground changes always matter (Claude gaining/losing focus). Object events
+        // (move/resize/show/hide) fire constantly across the desktop, so when we know
+        // Claude's PID, ignore object events from other processes.
+        if (ev != EVENT_SYSTEM_FOREGROUND && TargetPid != 0) {
+            uint pid; GetWindowThreadProcessId(hwnd, out pid);
+            if (pid != TargetPid) return;
+        }
+        _dirty = true;
+    }
+    public static void Start() {
+        _cb = OnEvent;
+        _hFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _cb, 0, 0, OUTOFCONTEXT | SKIPOWNPROCESS);
+        _hObj = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_NAMECHANGE, IntPtr.Zero, _cb, 0, 0, OUTOFCONTEXT | SKIPOWNPROCESS);
+    }
+    public static void Stop() {
+        try { if (_hFg != IntPtr.Zero) UnhookWinEvent(_hFg); if (_hObj != IntPtr.Zero) UnhookWinEvent(_hObj); } catch {}
+    }
+    // Returns true (and clears) if an event arrived since the last call.
+    public static bool Consume() { bool d = _dirty; _dirty = false; return d; }
+    public static void Touch() { _dirty = true; }   // force the next tick to do full work
+}
+"@
+
 [CkDpi]::Enable()
 # Startup scale from the primary monitor; updated per-window once the target is found.
 $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
@@ -1506,6 +1558,8 @@ $timer.add_Tick({
                 $p = [uint32]0
                 [void][CkWin]::GetWindowThreadProcessId($script:target, [ref]$p)
                 $script:targetPid = $p
+                [WinHook]::TargetPid = $p   # scope object-event noise to Claude's process
+                [WinHook]::Touch()          # a freshly (re)found window needs a full pass
             }
         }
         $ourUiOpen = $gripMenu.Visible -or $btnMenu.Visible -or ($null -ne $script:iconDlg) -or $script:moveMode
@@ -1561,7 +1615,13 @@ $timer.add_Tick({
             $exp = ([DateTime]::UtcNow - $script:activeTs).TotalMinutes -gt 10
         }
         if ($exp -ne $script:activeExpired) { $script:activeExpired = $exp; $dirty = $true }
-        # Read the displayed chat + chat area from the app's UI (cached, backs off when stable)
+        # Read the displayed chat + chat area from the app's UI (cached, backs off when stable).
+        # A Claude window event (move/resize/show/hide/name/foreground) lets this walk run
+        # NOW instead of waiting out its 1.5s->5s stability backoff, so the strip re-aligns
+        # promptly after Claude moves or the displayed chat switches. When no event arrived,
+        # the existing backoff stands untouched - events only ever make it re-read SOONER,
+        # never more often while nothing is happening, so idle cost is unchanged.
+        if ([WinHook]::Consume()) { $script:uiaLast = [DateTime]'2000-01-01'; $script:uiaStable = 0 }
         Update-UiaInfo
         if ($script:uiaDirty) { $script:uiaDirty = $false; $dirty = $true }
 
@@ -1696,6 +1756,8 @@ $created = $false
 $script:mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeButtonsPanel', [ref]$created)
 if (-not $created) { Write-CkLog 'Another instance is already running - exiting' ; exit 0 }
 
+[WinHook]::Start()   # let Windows push window move/resize/foreground/chat-switch events
 $timer.Start()
 [System.Windows.Forms.Application]::Run($form)
 $timer.Stop()
+[WinHook]::Stop()
