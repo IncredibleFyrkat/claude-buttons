@@ -878,6 +878,63 @@ function Get-IconMatchScore([string]$needle, [string]$name) {
     return $null
 }
 
+# Repopulate the picker grid, filtered by the search box. Plain function using $script:
+# state - NOT a closure: GetNewClosure() rebinds $script: to the closure's own module scope,
+# which silently broke $script:iconDlg/$script:iconPick inside the click handler.
+function Fill-IconGrid {
+    $flow = $script:iconFlow
+    if (-not $flow) { return }
+    $q = [string]$script:iconSearch.Text
+    $flow.SuspendLayout()
+    $old = @($flow.Controls)
+    $flow.Controls.Clear()
+    foreach ($o in $old) { $o.Dispose() }
+    # Best match first; "No icon" only on an empty query so it never outranks a real hit.
+    $matches = if ([string]::IsNullOrWhiteSpace($q)) { $script:iconEntries } else {
+        $script:iconEntries | Where-Object { $_.name } |
+            ForEach-Object { $sc = Get-IconMatchScore $q $_.name; if ($null -ne $sc) { [pscustomobject]@{ e = $_; s = $sc } } } |
+            Sort-Object s, @{ e = { $_.e.name } } | ForEach-Object { $_.e }
+    }
+    foreach ($e in @($matches)) {
+        $ib = New-Object System.Windows.Forms.Button
+        $ib.Width = S 46; $ib.Height = S 46
+        $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
+        $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
+        $ib.BackColor = if ($e.name -eq $script:iconCurrent) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
+        $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
+        if ($e.glyph) {
+            # Draw the glyph with the SAME faux-bold the strip uses, so the picker previews the
+            # true stroke weight; the offset scales with this larger font to match proportionally.
+            $ib.Font = $script:iconBig; $ib.Text = ''
+            $ib.add_Paint({
+                param($src, $pe)
+                $gl = Get-IconGlyph ([string]$this.Tag)
+                if (-not $gl) { return }
+                $gr = $pe.Graphics
+                $gr.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+                $sf = New-Object System.Drawing.StringFormat
+                $sf.Alignment = [System.Drawing.StringAlignment]::Center
+                $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+                $br = New-Object System.Drawing.SolidBrush($this.ForeColor)
+                $o = 0.3 * ($this.Font.Size / 9.0)
+                foreach ($d in @(@(-$o, 0.0), @($o, 0.0), @(0.0, -$o), @(0.0, $o), @(0.0, 0.0))) {
+                    $r = New-Object System.Drawing.RectangleF($d[0], $d[1], $this.Width, $this.Height)
+                    $gr.DrawString($gl, $this.Font, $br, $r, $sf)
+                }
+                $br.Dispose(); $sf.Dispose()
+            })
+        }
+        else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
+        $ib.Tag = $e.name
+        # No closure: $this must resolve to the clicked button at event time, and $script: must
+        # reach the real script scope so the dialog refs below are visible.
+        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
+        $script:iconTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
+        [void]$flow.Controls.Add($ib)
+    }
+    $flow.ResumeLayout()
+}
+
 function Show-IconPicker([string]$current) {
     if (-not $script:iconFont) { return $null }
     $dlg = New-Object System.Windows.Forms.Form
@@ -901,68 +958,15 @@ function Show-IconPicker([string]$current) {
     $flow.AutoScroll = $true
     $flow.BackColor = $dlg.BackColor
     $script:iconPick = $null
-    $bigIcon = New-Object System.Drawing.Font($script:iconFontName, 15)
-    $pickTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
+    $script:iconBig = New-Object System.Drawing.Font($script:iconFontName, 15)
+    $script:iconTip = New-Object System.Windows.Forms.ToolTip   # one shared tooltip, not one per icon
+    $script:iconSearch = $search
+    $script:iconFlow = $flow
+    $script:iconCurrent = $current
     # "No icon" first, then all mapped icons
-    $allEntries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
-    $addIconBtn = {
-        param($e)
-        $ib = New-Object System.Windows.Forms.Button
-        $ib.Width = S 46; $ib.Height = S 46
-        $ib.Margin = New-Object System.Windows.Forms.Padding((S 3))
-        $ib.FlatStyle = 'Flat'; $ib.FlatAppearance.BorderSize = 0
-        $ib.BackColor = if ($e.name -eq $current) { [System.Drawing.Color]::FromArgb(120, 88, 44) } else { [System.Drawing.Color]::FromArgb(52, 51, 48) }
-        $ib.ForeColor = [System.Drawing.Color]::FromArgb(224, 220, 212)
-        if ($e.glyph) {
-            # Draw the glyph ourselves with the SAME faux-bold the strip uses, so the picker
-            # previews the true stroke weight instead of a thinner plain-rendered glyph. The
-            # offset scales with the picker's larger font so the weight matches proportionally.
-            $ib.Font = $bigIcon; $ib.Text = ''
-            $ib.add_Paint({
-                param($src, $pe)
-                $gl = Get-IconGlyph ([string]$this.Tag)
-                if (-not $gl) { return }
-                $gr = $pe.Graphics
-                $gr.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
-                $sf = New-Object System.Drawing.StringFormat
-                $sf.Alignment = [System.Drawing.StringAlignment]::Center
-                $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-                $br = New-Object System.Drawing.SolidBrush($this.ForeColor)
-                $o = 0.3 * ($this.Font.Size / 9.0)
-                foreach ($d in @(@(-$o, 0.0), @($o, 0.0), @(0.0, -$o), @(0.0, $o), @(0.0, 0.0))) {
-                    $r = New-Object System.Drawing.RectangleF($d[0], $d[1], $this.Width, $this.Height)
-                    $gr.DrawString($gl, $this.Font, $br, $r, $sf)
-                }
-                $br.Dispose(); $sf.Dispose()
-            })
-        }
-        else { $ib.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $ib.Text = 'abc' }
-        $ib.Tag = $e.name
-        # No GetNewClosure: $this must resolve to the clicked button at event time,
-        # and each button's own name is stored in its Tag.
-        $ib.add_Click({ $script:iconPick = [string]$this.Tag; $script:iconDlg.DialogResult = 'OK'; $script:iconDlg.Close() })
-        $pickTip.SetToolTip($ib, $(if ($e.name) { $e.name } else { 'No icon (text label)' }))
-        [void]$flow.Controls.Add($ib)
-    }.GetNewClosure()
-    # Rebuilt on every keystroke: filter by fuzzy score, best match first. "No icon" only shows
-    # on an empty query so it never outranks a real hit. GetNewClosure so the TextChanged
-    # handler can still see these locals (a plain event scriptblock cannot).
-    $fill = {
-        $q = [string]$search.Text
-        $flow.SuspendLayout()
-        $old = @($flow.Controls)
-        $flow.Controls.Clear()
-        foreach ($o in $old) { $o.Dispose() }
-        $matches = if ([string]::IsNullOrWhiteSpace($q)) { $allEntries } else {
-            $allEntries | Where-Object { $_.name } |
-                ForEach-Object { $sc = Get-IconMatchScore $q $_.name; if ($null -ne $sc) { [pscustomobject]@{ e = $_; s = $sc } } } |
-                Sort-Object s, @{ e = { $_.e.name } } | ForEach-Object { $_.e }
-        }
-        foreach ($m in @($matches)) { & $addIconBtn $m }
-        $flow.ResumeLayout()
-    }.GetNewClosure()
-    & $fill                                                  # initial (unfiltered) grid
-    $search.add_TextChanged({ & $fill }.GetNewClosure())      # live fuzzy filter as you type
+    $script:iconEntries = @(@{ name = ''; glyph = $null }) + (@($script:iconMap.Keys) | Sort-Object | ForEach-Object { @{ name = $_; glyph = (Get-IconGlyph $_) } })
+    Fill-IconGrid                                     # initial (unfiltered) grid
+    $search.add_TextChanged({ Fill-IconGrid })        # live fuzzy filter as you type
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = L 'dlgCancel'; $cancel.DialogResult = 'Cancel'
     $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(62, 60, 56)
@@ -972,12 +976,12 @@ function Show-IconPicker([string]$current) {
     $dlg.CancelButton = $cancel
     # Make sure the dialog appears in front and takes focus (the panel window never activates,
     # so a child dialog can otherwise open behind and block the panel modally out of sight).
-    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($flow.Handle); $this.Activate(); $this.BringToFront() })
+    $dlg.add_Shown({ [CkWin]::DarkTitle($this.Handle); [CkWin]::DarkScroll($script:iconFlow.Handle); $this.Activate(); $this.BringToFront() })
     $res = $dlg.ShowDialog()
     $out = if ($res -eq 'OK') { $script:iconPick } else { $null }
-    $pickTip.Dispose(); $bigIcon.Dispose()
+    $script:iconTip.Dispose(); $script:iconBig.Dispose()
     $dlg.Dispose()
-    $script:iconDlg = $null
+    $script:iconDlg = $null; $script:iconFlow = $null; $script:iconSearch = $null; $script:iconEntries = $null
     return $out
 }
 
