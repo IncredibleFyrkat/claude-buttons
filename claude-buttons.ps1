@@ -340,37 +340,12 @@ if (-not $SmokeTest) {
 # Cross-process lock so panel writes and /pin edits never clobber each other
 $script:cfgLock = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
 
-# buttons.json is user-writable, and a button's `text` is typed - and for a global button
-# auto-submitted - into an agent that executes commands. So treat it as untrusted input
-# (OWASP LLM01): keep only well-formed buttons rather than trusting arbitrary JSON. A button
-# must carry a non-empty string label and text within sane length bounds; malformed entries
-# are dropped (and logged) individually so one bad entry never discards the rest.
-function Get-SafeButtons($raw) {
-    $MAXLABEL = 200
-    $MAXTEXT  = 8000   # well above the tool's long-prompt support, but bounds a pathological blob
-    $out = New-Object System.Collections.ArrayList
-    foreach ($b in @($raw)) {
-        if ($null -eq $b) { continue }
-        $label = [string]$b.label
-        $text  = [string]$b.text
-        if ([string]::IsNullOrEmpty($label) -or [string]::IsNullOrEmpty($text)) {
-            Write-CkLog 'Dropped a buttons.json entry missing label or text'; continue
-        }
-        if ($label.Length -gt $MAXLABEL -or $text.Length -gt $MAXTEXT) {
-            Write-CkLog "Dropped an over-length buttons.json entry (label=$($label.Length), text=$($text.Length))"; continue
-        }
-        [void]$out.Add($b)
-    }
-    ,@($out.ToArray())
-}
-
 function Read-FreshConfig {
     for ($i = 0; $i -lt 3; $i++) {
         try {
             $c = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
             # Normalize: a valid JSON file missing the buttons array must not crash callers
             if ($null -eq $c.buttons) { $c | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
-            $c.buttons = Get-SafeButtons $c.buttons   # untrusted input: keep only well-formed buttons
             return $c
         }
         catch { Start-Sleep -Milliseconds 120 }
