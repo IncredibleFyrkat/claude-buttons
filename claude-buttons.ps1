@@ -416,7 +416,7 @@ $script:reservedW = 380                 # width reserved for the app's own bar e
 if ($script:config.reservedW) { $script:reservedW = [int]$script:config.reservedW }
 $script:relX = 0.0
 if ($null -ne $script:config.relX) { $script:relX = [double]$script:config.relX }
-$script:freeX = $null   # fri placering: strimlens position relativt til vinduets top-venstre
+$script:freeX = $null   # free placement: the strip's position relative to the window's top-left
 $script:freeY = $null
 if ($null -ne $script:config.freeX -and $null -ne $script:config.freeY) {
     $script:freeX = [int]$script:config.freeX
@@ -976,7 +976,7 @@ function Show-TipForm([string]$text, $anchorCtrl) {
         $af = $anchorCtrl.FindForm()
         if (-not $af) { $af = $form }
         $x = $p.X
-        $y = $af.Top - $tipForm.Height - (S 7)   # over den strimmel kontrollen sidder i
+        $y = $af.Top - $tipForm.Height - (S 7)   # above the strip the control sits in
         if ($y -lt 0) { $y = $af.Bottom + (S 7) }
         $tipForm.Location = New-Object System.Drawing.Point($x, $y)
         if (-not $tipForm.Visible) { $tipForm.Show() }
@@ -1053,13 +1053,13 @@ function Add-PinnedButton($entry, [bool]$global) {
             }
         }
         Write-CkLog "Pinning button: label='$($entry.label)' global=$global chatScoped=$([bool]$chatId)"
-        $ny = [ordered]@{ label = [string]$entry.label; text = [string]$entry.text; submit = $true }
-        if ($entry.short) { $ny.short = [string]$entry.short }
-        if ($entry.confirm) { $ny.confirm = $true }
-        if ($chatId) { $ny.chat = $chatId }
-        if (-not $global -and $script:uiaTitle) { $ny.chatTitle = $script:uiaTitle }  # bind to the DISPLAYED chat
-        $nyObj = [pscustomobject]$ny
-        if (Update-Buttons { param($btns) @($btns) + $nyObj }) { Rebuild-Buttons }
+        $new = [ordered]@{ label = [string]$entry.label; text = [string]$entry.text; submit = $true }
+        if ($entry.short) { $new.short = [string]$entry.short }
+        if ($entry.confirm) { $new.confirm = $true }
+        if ($chatId) { $new.chat = $chatId }
+        if (-not $global -and $script:uiaTitle) { $new.chatTitle = $script:uiaTitle }  # bind to the DISPLAYED chat
+        $newObj = [pscustomobject]$new
+        if (Update-Buttons { param($btns) @($btns) + $newObj }) { Rebuild-Buttons }
     } catch { Write-CkLog "Add-PinnedButton error: $($_.Exception.Message)" }
 }
 
@@ -1084,7 +1084,7 @@ $posFree = New-Object System.Windows.Forms.ToolStripMenuItem 'Free placement'
 $posFree.add_Click({
     $script:moveMode = $true
     $script:moveModeAt = Get-Date
-    [void][CkWin]::GetAsyncKeyState(0x01)   # slug klikket der valgte menupunktet
+    [void][CkWin]::GetAsyncKeyState(0x01)   # swallow the click that chose the menu item
 })
 $posAuto = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto (dock)'
 $posAuto.add_Click({ $script:freeX = $null; $script:freeY = $null; Save-PanelState })
@@ -1259,9 +1259,9 @@ $miRename.add_Click({
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
-        $ny = Show-InputDialog (L 'renameTitle') (L 'renameAsk') ([string]$t.label)
-        if ([string]::IsNullOrWhiteSpace($ny)) { return }
-        if (Update-Buttons { param($btns) foreach ($b in $btns) { if (Same-Button $b $t) { $b.label = $ny } }; $btns }) {
+        $new = Show-InputDialog (L 'renameTitle') (L 'renameAsk') ([string]$t.label)
+        if ([string]::IsNullOrWhiteSpace($new)) { return }
+        if (Update-Buttons { param($btns) foreach ($b in $btns) { if (Same-Button $b $t) { $b.label = $new } }; $btns }) {
             Rebuild-Buttons
         }
     } catch { Write-CkLog "Rename error: $($_.Exception.Message)" }
@@ -1271,11 +1271,11 @@ function Move-PinButton([int]$dir) {
     try {
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
-        $hostPanel = $src.Parent   # den strimmel der blev hoejreklikket i (primaer eller spejl)
+        $hostPanel = $src.Parent   # the strip that was right-clicked (primary or mirror)
         $idx = $hostPanel.Controls.IndexOf($src)
-        $nyIdx = $idx + $dir
-        if ($nyIdx -lt 1 -or $nyIdx -ge $hostPanel.Controls.Count) { return }  # index 0 is the grip
-        $neighbor = $hostPanel.Controls[$nyIdx].Tag
+        $newIdx = $idx + $dir
+        if ($newIdx -lt 1 -or $newIdx -ge $hostPanel.Controls.Count) { return }  # index 0 is the grip
+        $neighbor = $hostPanel.Controls[$newIdx].Tag
         $t = $src.Tag
         $ok = Update-Buttons {
             param($btns)
@@ -1288,7 +1288,7 @@ function Move-PinButton([int]$dir) {
             if ($i1 -ge 0 -and $i2 -ge 0) { $tmp = $btns[$i1]; $btns[$i1] = $btns[$i2]; $btns[$i2] = $tmp }
             $btns
         }
-        if ($ok) { Rebuild-Buttons }   # synkroniser raekkefoelgen paa alle strimler
+        if ($ok) { Rebuild-Buttons }   # sync the order across all strips
     } catch { Write-CkLog "Move error: $($_.Exception.Message)" }
 }
 $miLeft.add_Click({ Move-PinButton -1 })
@@ -1616,8 +1616,8 @@ $timer.add_Tick({
         $dirty = $false
         $healing = $script:cfgHealUntil -and ((Get-Date) -lt $script:cfgHealUntil)
         if ($wt -and ($wt -ne $script:cfgTime -or $healing)) {
-            $ny = Read-FreshConfig
-            if ($ny) { $script:config = $ny; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true }
+            $new = Read-FreshConfig
+            if ($new) { $script:config = $new; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true }
         }
         if ($script:cfgHealUntil -and (Get-Date) -ge $script:cfgHealUntil) { $script:cfgHealUntil = $null }  # give up healing
         if (Read-ActiveSession) { $dirty = $true }
@@ -1672,7 +1672,7 @@ $timer.add_Tick({
         if ($newCompact -ne $script:compact) { $script:compact = $newCompact; Rebuild-Buttons }
 
         if ($script:moveMode) {
-            # Fri flytning: strimlen foelger musen; et venstreklik slipper den
+            # Free move: the strip follows the mouse; a left-click drops it
             if ($tipForm.Visible) { $tipForm.Hide() }
             $mp = [System.Windows.Forms.Cursor]::Position
             $script:autoMove = $true
@@ -1687,7 +1687,7 @@ $timer.add_Tick({
             }
         } else {
             if ($null -ne $script:freeX) {
-                # Fri placering: fast punkt relativt til vinduet
+                # Free placement: fixed point relative to the window
                 $x = $r.Left + $script:freeX
                 $y = $r.Top + $script:freeY
             } else {
@@ -1734,8 +1734,8 @@ $timer.add_Tick({
             if (-not $mForm.Visible) { $mForm.Show() }
         }
 
-        # Hover-tooltip + engangs foerstegangs-hint (egen tip-boks - indbygget ToolTip
-        # viser sig ikke paalideligt paa et vindue uden fokus)
+        # Hover tooltip + one-time first-run hint (our own tip box - the built-in ToolTip
+        # does not show reliably on a window without focus)
         if (-not $script:balloonShown -and ($panel.Controls.Count -le 1)) {
             $script:balloonShown = $true
             $script:tipUntil = (Get-Date).AddSeconds(6)
