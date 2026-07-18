@@ -100,6 +100,36 @@ Check 'the modal-hide runs AFTER Update-UiaInfo (so the flag can clear again)' (
 $clearsFlag = @($src | Select-String -Pattern '\$script:composerLost\s*=\s*\$false').Count
 Check 'composerLost is cleared somewhere (else it latches on forever)' ($clearsFlag -ge 1)
 
+# --- Fail-closed send path ---
+$srcText = $src -join "`n"   # defined here too: these checks run before the doc-vs-code block
+# Ctrl+V is asynchronous. If the clipboard is restored before the app reads it, the app pastes
+# the USER'S clipboard: wrong message, and their copied data leaked into an AI conversation.
+# The old code typed the correct text whenever the paste could not be confirmed - and THAT is
+# what turned a detected problem into a sent one, because it appended the right text under the
+# contamination and pressed Enter. These guard the invariant that replaced it: on anything
+# other than a confirmed paste, type nothing, send nothing, change nothing.
+Check 'the send path no longer types a fallback payload' `
+    (-not ($srcText -match 'SendWait\(\(Escape-SendKeys \$textToSend\)\)'))
+Check 'an unconfirmed paste returns instead of pressing Enter' `
+    ($srcText -match '(?s)if \(-not \$pasted\).{0,600}?return')
+Check 'the composer baseline is captured BEFORE the clipboard is touched' `
+    ([regex]::Match($srcText, '(?s)\$baseline = Get-ComposerText.{0,400}?Clipboard\]::GetDataObject').Success)
+Check 'verification compares baseline+payload exactly, not a substring' `
+    (($srcText -match '\$want = Normalize-ComposerText \(\$baseline \+ \$payload\)') -and
+     ($srcText -match '-eq \$want'))
+Check 'an unreadable composer is treated as Unverifiable, never as empty' `
+    ($srcText -match "if \(\`$null -eq \`$baseline\) \{ 'Unverifiable' \}")
+Check 'the three paste outcomes are explicit states, not a nullable boolean' `
+    (($srcText -match "'Confirmed'") -and ($srcText -match "'Mismatch'") -and ($srcText -match "'Unverifiable'"))
+Check 'an abandoned send warns the user rather than only logging' `
+    (($srcText -match 'Show-SendWarning') -and ($srcText -match 'sendMismatch') -and ($srcText -match 'sendUnverified'))
+Check 'no undo/select-all recovery was introduced (it would eat a user draft)' `
+    (-not ($srcText -match "SendWait\('\^z'\)|SendWait\('\^a'\)"))
+foreach ($lang in @('en', 'da')) {
+    Check "the abandoned-send strings exist in $lang" `
+        (($srcText -match "(?s)\b$lang\s*=\s*@\{.*?sendMismatch") -and ($srcText -match "(?s)\b$lang\s*=\s*@\{.*?sendUnverified"))
+}
+
 # --- Version discipline ---
 # v1.7.0 shipped reporting "1.6.0" because a merge resolution silently reverted the bump,
 # and the tag had to be force-moved after release. CB_VERSION is what the panel shows in its

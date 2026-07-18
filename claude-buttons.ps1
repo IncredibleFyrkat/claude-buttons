@@ -682,6 +682,8 @@ $script:strings = @{
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
         tipShift = 'Shift-click: insert without sending'
+        sendMismatch = 'Not sent: the paste did not land as expected. Check the message box before sending - something else may be in it.'
+        sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
@@ -702,6 +704,8 @@ $script:strings = @{
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
         tipShift = 'Shift-klik: indsæt uden at sende'
+        sendMismatch = 'Ikke sendt: indsættelsen landede ikke som forventet. Tjek beskedfeltet før du sender - der kan stå noget andet i det.'
+        sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
@@ -1541,6 +1545,21 @@ function Show-TipForm([string]$text, $anchorCtrl) {
     } catch {}
 }
 
+# A send was abandoned - say so where the user is already looking. Every other failure in this
+# path only ever reached the log file, which means "I clicked and nothing happened" was
+# indistinguishable from success. Reuses the tooltip window so nothing takes focus.
+function Show-SendWarning([string]$text) {
+    try {
+        $anchor = if ($script:lastClickedBtn) { $script:lastClickedBtn } else { $grip }
+        # Reuse $script:tipUntil: the tick checks it BEFORE the hover branch, so the warning
+        # stays put for its full duration instead of being replaced the moment the pointer
+        # moves - and the existing timeout logic hides it, with no second mechanism to keep
+        # in sync.
+        $script:tipUntil = (Get-Date).AddSeconds(8)
+        Show-TipForm $text $anchor
+    } catch {}
+}
+
 # Hover-tekst for en knap: valgfri "desc"-forklaring + kommando + scope + betjening
 function Get-TipText($b) {
     $head = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
@@ -1878,6 +1897,60 @@ function Get-PaneForForm($frm) {
     return $null
 }
 
+# Current text of a composer, read through UIA TextPattern. Chromium exposes contenteditables
+# as a read-only TextPattern, which is enough to see what actually landed. Verified on this
+# app: the pattern resolves directly on the "Prompt" group. Returns $null when nothing is
+# readable - which must be treated as "unknown", never as "empty".
+function Get-ComposerText($el) {
+    if (-not $el) { return $null }
+    try {
+        $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        if ($tp) { return [string]$tp.DocumentRange.GetText(-1) }
+    } catch {}
+    try {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty, $true)
+        $d = $el.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if ($d) {
+            $tp2 = $d.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+            if ($tp2) { return [string]$tp2.DocumentRange.GetText(-1) }
+        }
+    } catch {}
+    return $null
+}
+function Normalize-ComposerText([string]$s) { ($s -replace "`r`n", "`n").Trim() }
+
+# Wait until the composer contains EXACTLY the baseline plus our payload, and nothing else.
+#
+# Ctrl+V is asynchronous: the keystroke is queued and the app reads the clipboard later. If the
+# clipboard is restored before that read, the app pastes the USER'S clipboard instead - the
+# wrong message, and their copied data leaked into an AI conversation. A fixed delay cannot
+# make that safe; only observing the result can.
+#
+# Returns: 'Confirmed'    - the composer is exactly baseline+payload. Safe to restore and submit.
+#          'Mismatch'     - readable, but the content is not what we intended. Something else
+#                           landed (e.g. a stale clipboard). FAIL CLOSED.
+#          'Unverifiable' - the composer exposed no readable text at all. We do not know.
+#
+# Checking for exact equality rather than "contains the payload" matters: a substring probe
+# passes when the draft already happens to start with the same words, or when a previous button
+# left identical boilerplate, and it cannot detect extra content pasted alongside ours.
+function Wait-PasteLanded($el, [string]$baseline, [string]$payload, [int]$timeoutMs = 1200) {
+    $want = Normalize-ComposerText ($baseline + $payload)
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    $sawText = $false
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-ComposerText $el
+        if ($null -ne $now) {
+            $sawText = $true
+            if ((Normalize-ComposerText $now) -eq $want) { return 'Confirmed' }
+        }
+        Start-Sleep -Milliseconds 15
+    }
+    if ($sawText) { return 'Mismatch' }
+    return 'Unverifiable'
+}
+
 function Focus-ChatInput($stripCenterX, $stripTopY) {
     try {
         if ($script:target -eq [IntPtr]::Zero) { return }
@@ -1951,6 +2024,7 @@ function Set-ToggleFace($item, [bool]$on) {
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    $script:lastClickedBtn = $btn     # so an abandoned send can warn next to the button clicked
     # Shift-click = insert the text but do NOT press Enter, so it can be edited or extended
     # first. Read it up front: Shift may be released during the focus + paste round-trip.
     $holdShift = ([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) -ne 0
@@ -2022,6 +2096,10 @@ function Invoke-PillClick($btn) {
             # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
             # it clobbered, and restore it in finally so it survives an exception.
             if (-not (Test-TargetForeground)) { return }
+            # Baseline BEFORE the clipboard is touched, so we can prove afterwards that exactly
+            # our payload was added and nothing else. $null means the composer is unreadable,
+            # which is not the same as empty - see the Unverifiable branch below.
+            $baseline = Get-ComposerText $composerEl
             $backup = $null; $snapOk = $false; $pasted = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
@@ -2048,8 +2126,12 @@ function Invoke-PillClick($btn) {
                 [System.Windows.Forms.Clipboard]::SetDataObject($dobj, $true)
                 $seqAfterSet = [CkWin]::GetClipboardSequenceNumber()
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
-                $pasted = $true
-                Start-Sleep -Milliseconds 90   # let the paste land in the composer
+                # Do not restore the clipboard until the payload is OBSERVED in the composer.
+                # The finally block below runs straight after this, so this wait is the only
+                # thing standing between our paste and the user's clipboard going back.
+                $pasteState = if ($null -eq $baseline) { 'Unverifiable' }
+                              else { Wait-PasteLanded $composerEl $baseline $textToSend }
+                $pasted = ($pasteState -eq 'Confirmed')
             } catch {
                 Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
             } finally {
@@ -2065,9 +2147,28 @@ function Invoke-PillClick($btn) {
                     }
                 }
             }
+            # FAIL CLOSED. Do not type, do not press Enter, do not undo, do not clear.
+            #
+            # The old code typed the correct text whenever the paste could not be confirmed -
+            # and THAT is what turned a detected problem into a sent one. If a stale clipboard
+            # had landed in the box, typing appended the right text underneath it and Enter
+            # shipped both, leaking whatever the user had copied into the conversation.
+            #
+            # Undo is not an option either: if the user typed after the bad paste, Ctrl+Z takes
+            # THEIR text, and no amount of checking afterwards can give it back.
+            #
+            # So we leave the composer exactly as it is. Whatever is in there stays visible and
+            # unsent, and the user decides. That is the only outcome that cannot lose their
+            # data or say something on their behalf.
             if (-not $pasted) {
-                if (-not (Test-TargetForeground)) { return }   # M2: re-check right before send
-                [System.Windows.Forms.SendKeys]::SendWait((Escape-SendKeys $textToSend))
+                if ($pasteState -eq 'Unverifiable') {
+                    Write-CkLog 'Paste could not be verified (composer text unreadable); not sending'
+                    Show-SendWarning (L 'sendUnverified')
+                } else {
+                    Write-CkLog 'Paste did not land as expected; composer left untouched and NOT sent'
+                    Show-SendWarning (L 'sendMismatch')
+                }
+                return
             }
             # F4: flip the toggle only once the text is actually delivered. Flipping before the
             # send left it inverted with nothing sent whenever the paste threw and the typing
