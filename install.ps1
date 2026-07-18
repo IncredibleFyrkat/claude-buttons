@@ -1,4 +1,4 @@
-<#
+﻿<#
   Claude Buttons - installer
   Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
@@ -46,6 +46,47 @@ function Write-Utf8NoBom([string]$path, [string]$text) {
     $enc = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($path, $text, $enc)
 }
+# Atomic, validated write for JSON we must never leave half-written. WriteAllText truncates
+# the target and THEN streams into it, so a crash - or Claude Code writing settings.json at
+# the same moment - could leave the user with an empty or truncated config and no working
+# Claude Code. Write to a temp file, prove it parses back, then swap it in atomically.
+function Write-JsonAtomic([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)   # JSON: never a BOM
+    $tmp  = "$path.tmp.$PID"
+    $swap = "$path.replacing.$PID"   # per-PID: a fixed name collides between concurrent runs,
+                                     # and a stale read-only one wedges every future write
+    try {
+        [IO.File]::WriteAllText($tmp, $text, $enc)
+        # Prove it parses back AND is actually an object. ConvertFrom-Json returns $null for
+        # '', '   ' and 'null' without throwing, and `$null | ConvertTo-Json` is the empty
+        # string - so a null object would otherwise be written as a 0-byte file and certified
+        # valid by its own safety net. That is the exact corruption this function exists to stop.
+        $parsed = $null
+        try { $parsed = [IO.File]::ReadAllText($tmp) | ConvertFrom-Json } catch {
+            throw "Refusing to write $path - the JSON it produced did not parse back. Your file was NOT modified."
+        }
+        if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
+            throw "Refusing to write $path - the JSON it produced was empty or not an object. Your file was NOT modified."
+        }
+        if (Test-Path $path) {
+            Remove-Item $swap -Force -ErrorAction SilentlyContinue
+            # Replace is atomic, but unlike WriteAllText it fails if ANY other process holds
+            # the file open - even a reader. Retry briefly: Defender, a backup agent or an
+            # editor holding a transient handle is common and self-clearing.
+            $done = $false
+            for ($i = 0; $i -lt 5 -and -not $done; $i++) {
+                try { [IO.File]::Replace($tmp, $path, $swap); $done = $true }
+                catch { if ($i -eq 4) { throw }; Start-Sleep -Milliseconds (120 * ($i + 1)) }
+            }
+            Remove-Item $swap -Force -ErrorAction SilentlyContinue
+        } else {
+            Move-Item $tmp $path -Force
+        }
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # never leave .tmp litter behind
+        throw
+    }
+}
 
 function Stop-Panel {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
@@ -60,6 +101,99 @@ function Get-Settings {
     }
     return (New-Object psobject)
 }
+# Pre-flight, run BEFORE anything is written or deleted. settings.json is touched late in
+# both install and uninstall, so a file that is invalid or locked used to abort the run
+# half-way - on uninstall that left the skills and engine deleted but the hooks still in
+# settings.json, pointing at files that no longer exist, with no self-service way back.
+# Failing here costs nothing, because nothing has happened yet.
+function Test-SettingsUsable {
+    if (-not (Test-Path $settingsPath)) { return }
+    $parsed = $null
+    try { $parsed = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { throw "~/.claude/settings.json is not valid JSON. NOTHING has been changed. Fix or remove it, then re-run." }
+    # '' , '   ' and 'null' all parse to $null WITHOUT throwing, so a 0-byte or null-only
+    # settings.json used to walk straight past this gate and then abort the run half-way
+    # through with "Cannot index into a null array" - after files had already been deleted.
+    if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
+        throw "~/.claude/settings.json is empty or is not a JSON object. NOTHING has been changed. Restore it (see $settingsPath.orig.bak) or delete it, then re-run."
+    }
+    # Check nesting HERE, before anything is deleted or written. Doing it at write time meant
+    # the throw landed after the uninstall had already removed the skills and the engine,
+    # stranding the user with hooks pointing at files that no longer exist.
+    Assert-JsonDepthSafe $parsed
+    try { $fs = [IO.File]::Open($settingsPath, 'Open', 'ReadWrite', 'None'); $fs.Close() }
+    catch { throw "~/.claude/settings.json is locked (is Claude Code running?). NOTHING has been changed. Close it and re-run." }
+}
+# Measure the REAL nesting depth of the object graph.
+#
+# PS 5.1's ConvertTo-Json does not error when nesting exceeds -Depth: it stringifies the
+# over-deep node into "@{k=v}" or "System.Object[]" and still emits valid JSON, silently
+# destroying MCP server definitions. The obvious guard - searching the serialized text for
+# those markers - is wrong in BOTH directions: it refuses valid configs whose hook commands
+# or env values legitimately contain "@{", and it misses an over-deep array of strings, which
+# collapses to a space-joined string with no marker at all. So measure the structure instead.
+function Get-JsonDepth($o, [int]$d = 0) {
+    if ($d -gt 120) { return $d }                              # cycle guard
+    if ($null -eq $o -or $o -is [string] -or $o -is [ValueType]) { return $d }
+    $max = $d
+    if ($o -is [System.Collections.IDictionary]) {
+        foreach ($k in @($o.Keys)) {
+            $cd = Get-JsonDepth $o[$k] ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
+    }
+    elseif ($o -is [System.Collections.IList]) {
+        # Index $o directly; do NOT collect the children into a variable first. Measured:
+        # `$kids = if (...) { $o } else { ... }` routes the value through the pipeline, which
+        # UNROLLS a single-element array into its element - so an array-of-arrays loses one
+        # level per recursion and a 10-deep chain measures 6 instead of 11. (@() and foreach
+        # are innocent; both measure 11 on their own. It is specifically the assignment from
+        # an if-expression.) `hooks` is an array of objects containing arrays of objects, so
+        # this is exactly the shape the guard exists to measure.
+        for ($i = 0; $i -lt $o.Count; $i++) {
+            $cd = Get-JsonDepth $o[$i] ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
+    }
+    else {
+        foreach ($p in $o.PSObject.Properties) {
+            $cd = Get-JsonDepth $p.Value ($d + 1); if ($cd -gt $max) { $max = $cd }
+        }
+    }
+    return $max
+}
+function Assert-JsonDepthSafe($obj) {
+    # Threshold calibrated by measurement, not by matching -Depth: with `-Depth 100`,
+    # ConvertTo-Json actually starts stringifying at depth 102, and ConvertFrom-Json refuses
+    # to parse at 102 as well - so the corruption window is unreachable from a settings.json
+    # file at all. Blocking at 100 was over-strict by exactly 2 in the safe direction; 102
+    # matches where the damage really begins.
+    if ((Get-JsonDepth $obj) -ge 102) {
+        throw ("~/.claude/settings.json nests deeper than this installer can safely rewrite. " +
+               "NOTHING has been changed - add the hook manually (see README). " +
+               "Pristine backup: $settingsPath.orig.bak")
+    }
+}
+# A FUNCTION, not an inline loop, so a test can execute it and assert on the rules that are
+# actually granted. The previous test grepped the source for `request-on` near an
+# Ensure-AllowRule line, which a two-line variant defeated:
+#     $rv = 'request' + '-on'
+#     Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $rv)"
+# - the grant line does not contain the literal, and the line that does is not a grant line.
+# Testing the resulting permission set is immune to how the verb is spelled.
+function Grant-ShutdownAllowRules($settings, [string]$scriptFwd) {
+    Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
+    # request-on is deliberately absent - see the SEC-01 note at the call site.
+    foreach ($verb in @('request-off', 'on --this-turn', 'off', 'status')) {
+        Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
+        Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
+    }
+}
+# Also a function, for the same reason: the marker records where this install keeps
+# buttons.json, and /pin and /unpin cannot find the panel without it. It was previously a bare
+# call in the main flow, which the AST test seam cannot reach - so deleting it, or pointing it
+# at the wrong path, left the whole suite green.
+function Write-InstallMarker([string]$claudeDir, [string]$cfgPath) {
+    Write-Utf8NoBom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
+}
 function Save-Settings($obj) {
     if (Test-Path $settingsPath) {
         # Preserve the PRISTINE original once, write-once: a full install calls
@@ -69,7 +203,15 @@ function Save-Settings($obj) {
         if (-not (Test-Path "$settingsPath.orig.bak")) { Copy-Item $settingsPath "$settingsPath.orig.bak" -Force }
         Copy-Item $settingsPath "$settingsPath.bak" -Force
     }
-    Write-Utf8NoBom $settingsPath ($obj | ConvertTo-Json -Depth 20)
+    # PS 5.1's ConvertTo-Json does NOT error when nesting exceeds -Depth: it stringifies the
+    # over-deep node into "@{k=v}" or "System.Object[]", silently destroying MCP server
+    # definitions while still emitting valid JSON. The depth is checked on the OBJECT GRAPH,
+    # not on the serialized text: an earlier version of this guard searched the text for
+    # "@{ and refused perfectly valid configs, because a hook command, an env value or a
+    # statusLine may legitimately contain those characters. String content and structural
+    # damage are indistinguishable once serialized.
+    Assert-JsonDepthSafe $obj
+    Write-JsonAtomic $settingsPath ($obj | ConvertTo-Json -Depth 100)
 }
 function Ensure-HookArray($settings, [string]$event) {
     if (-not $settings.PSObject.Properties['hooks']) { $settings | Add-Member hooks (New-Object psobject) -Force }
@@ -108,6 +250,7 @@ function Remove-AllowRules($settings, [string]$marker) {
 # =================== UNINSTALL ===================
 if ($Uninstall) {
     Write-Host "Uninstalling Claude Buttons..." -ForegroundColor Cyan
+    Test-SettingsUsable   # fail before deleting anything, not after
     Stop-Panel
     if (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
     foreach ($s in @('pin','unpin','close-pc-on-done','cancel-close-pc','shutdown-on-done')) {
@@ -132,6 +275,7 @@ if ($Uninstall) {
 
 # =================== INSTALL / UPDATE ===================
 Write-Host "Installing Claude Buttons to $InstallDir" -ForegroundColor Cyan
+Test-SettingsUsable   # fail before writing anything, not half-way through
 Stop-Panel
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
@@ -146,7 +290,7 @@ if (-not (Test-Path $cfgPath)) {
 } else {
     try {
         $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-Utf8Bom $cfgPath ($cfg | ConvertTo-Json -Depth 6) }
+        if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100) }
     } catch {}
 }
 
@@ -159,7 +303,7 @@ foreach ($s in @('pin','unpin')) {
 }
 
 # 4) Marker so skills find buttons.json without any hardcoded path
-Write-Utf8Bom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
+Write-InstallMarker $claudeDir $cfgPath
 
 # 5) Core hook (UserPromptSubmit) - merged safely
 $settings = Get-Settings
@@ -211,11 +355,16 @@ if ($wantShutdown) {
         }
         # H1: scope the allow-rules to the exact subcommands the skill runs instead of a
         # blanket `toggle *` wildcard (which pre-authorized any future/unexpected subcommand).
-        Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
-        foreach ($verb in @('request-on', 'request-off', 'on --this-turn', 'off', 'status')) {
-            Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
-            Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
-        }
+        #
+        # SEC-01: `request-on` is deliberately NOT allow-listed. The engine refuses to arm
+        # without a standing *.request, but request-on is what CREATES that marker - so
+        # pre-authorizing both made the gate satisfiable by whoever it was meant to stop:
+        # two consecutive unattended Bash calls (`request-on` then `on --this-turn`) walked
+        # injected instructions all the way to a real power-off with no prompt. Leaving
+        # request-on off the list costs the legitimate flow exactly one approval, which the
+        # user is present to give (they just clicked the button), and restores the gate's
+        # two sides to different principals. Disarming stays friction-free on purpose.
+        Grant-ShutdownAllowRules $settings $scriptFwd
         Save-Settings $settings
         # Legacy skills out (superseded by /shutdown-on-done)
         foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
@@ -233,7 +382,7 @@ if ($wantShutdown) {
                     toggle = $true; confirm = $true
                     stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
                     text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
-                Write-Utf8Bom $cfgPath ($cfg | ConvertTo-Json -Depth 6)
+                Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100)
             }
         } catch {}
         Write-Host "  + Shutdown-on-done engine installed (completion-judged; power button added to the panel)." -ForegroundColor DarkGray

@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.7.2 — 2026-07-18
+
+**Safety release for the optional shutdown-on-done feature.** A ten-agent audit found five
+ways the power-off path could fire when it should not, or report success without disarming.
+If you use shutdown-on-done, upgrade. The button panel itself is unaffected by these bugs.
+
+Every fix below ships with a regression test that was verified to **fail** against 1.7.1 —
+17 of the 18 new engine tests do (the eighteenth guards an invariant 1.7.1 already held).
+
+- **A corrupt arm flag no longer shuts the PC down.** `skip: 0` is the fire sentinel, and it
+  was also the default when the flag could not be parsed — so a truncated, empty, or
+  malformed flag powered the machine off. No attacker required: the flag was written
+  non-atomically, and this tool cuts power mid-write by design. The engine now fails closed,
+  consumes the bad flag, disarms, and says so. Flag writes are atomic (temp + rename).
+- **A re-entered Stop hook no longer burns the grace turn.** Any hook returning
+  `decision: "block"` re-runs Stop hooks within the same user-visible turn — including this
+  engine's own MACHINE-ARMED wake. The skip counter decremented twice and fired one response
+  early, which is precisely the mid-work shutdown `toggle on` promises not to do.
+- **`toggle --off` no longer reports success while leaving the machine armed.** Dash-prefixed
+  typos were filtered out as "flags" before the verb check and fell through to the status
+  report: exit 0, no stderr, still armed. Unknown options and stray arguments now exit 1.
+- **`request-off` now drops the arm it authorised.** The panel's power button watches
+  `*.request`, so clearing only that marker made the button go dark while the chat stayed
+  armed — the UI asserting "not armed" about a machine that was.
+- **The arming gate now has two sides.** `toggle on` refuses without a standing `*.request`,
+  but `request-on` creates that marker and both were pre-authorised in `settings.json` — so
+  the gate was satisfiable by exactly the thing it was meant to stop, in two unattended
+  commands with no prompt. `request-on` is no longer allow-listed: arming costs one approval,
+  which the user is present to give. Disarming stays friction-free.
+- **The skill no longer re-grants `toggle *`.** Its frontmatter reinstated the wildcard the
+  installer deliberately removed, so the narrowing was only half-applied.
+- **The test runner no longer reports success when it skipped the engine tests.** With Node
+  absent it printed `ALL TESTS PASSED` having run none of the suite that guards the power-off
+  path. It now fails closed (`CB_ALLOW_NO_NODE=1` to opt out deliberately).
+- **The 1.7.1 modal-latch guard was itself evadable** — it checked the flag's setting side
+  only, and passed against a mutant that deleted the clearing side, fully reintroducing the
+  1.7.0 deadlock. Now guarded too. (Still a source-text proxy; a behavioural test needs the
+  tick decomposed, which is tracked separately.)
+
+### Data safety and the installer
+
+- **`settings.json` is now written atomically and validated first.** It was rewritten with a
+  plain `WriteAllText`, which truncates the target and then streams into it — on a file Claude
+  Code also writes. A crash or a concurrent write could leave the user with no working Claude
+  Code config. Writes now go to a temp file, must parse back, and are swapped in atomically.
+- **A too-deeply-nested `settings.json` is refused rather than silently mangled.** PowerShell's
+  `ConvertTo-Json` does not error past `-Depth`; it stringifies the over-deep node into
+  `"@{k=v}"`, quietly destroying MCP server definitions while still emitting valid JSON. Depth
+  raised to 100 *and* the result is rejected if it shows that stringification.
+- **Install and uninstall pre-flight `settings.json`.** An invalid or locked file used to abort
+  the run half-way — on uninstall that left the skills and engine deleted but the hooks still
+  present and pointing at missing files. It now fails before anything is touched.
+- **`/pin` and `/unpin` no longer edit `buttons.json` by hand.** The panel guards that file with
+  a mutex and merges against a fresh read, but the skills did a plain read-modify-write — so a
+  panel edit landing inside a skill's think-time was silently destroyed. Both now call
+  `claude-buttons.ps1 -AddButton|-RemoveButton <file.json>`, which takes the same lock and the
+  same merge path. Payloads are passed as a file, since a button's text can be a whole prompt.
+- **`buttons.json` is written without a BOM**, as the installer's own comment always said it
+  should be, and at depth 100 for the same reason as above.
+
+### Accessibility and rendering
+
+- **A lit toggle is now readable.** The active fill paired with the standard foreground measured
+  **1.96:1** for an icon glyph — below AA, on the button whose lit state means "this PC is armed
+  to power off". The fill is slightly darker and the label draws in white: **5.1:1** readable,
+  **3.3:1** state cue. Both are now asserted by the test suite, so the README's contrast claim
+  cannot drift away from the code again.
+- **Fixed a GDI handle leak that could kill the panel.** In the layered-window push, the device
+  contexts were acquired *before* the `try` that frees them, so every failed push leaked two
+  handles — and pushes fail precisely when GDI is already under pressure, making it a death
+  spiral toward the 10,000-handle ceiling. Failed pushes now also raise a real Win32 error
+  instead of failing silently.
+
+### Documentation
+
+- **Two documented config knobs were dead code.** `uiaPaneName` and `uiaSidebarName` were
+  parsed and never read again — and the troubleshooting section told users to edit them to
+  recover from a Claude app update. Removed **from the documentation**; the parsing is kept so
+  an existing `buttons.json` containing them still loads. Troubleshooting now leads with
+  `uiaComposerName`, which is the knob that actually matters.
+- **Corrected the contrast and target-size claims.** The stated contrast range did not cover the
+  states it described; the target-size note claimed a WCAG failure the code does not commit
+  (buttons are 27px, meeting SC 2.5.8).
+- **Documented shift-click** (shipped in 1.7.1 with no README coverage) and the `vNudge` /
+  `tipsOff` fields.
+- **New CI-checked invariants** so this class of drift stops recurring: `CB_VERSION` must match
+  the newest CHANGELOG heading, no documented config field may be dead code, and any
+  interaction advertised in a tooltip must appear in both READMEs.
+
 ## 1.7.1 — 2026-07-18
 
 Follow-up fixes from [@RasmusKD](https://github.com/RasmusKD) (PR #3). **Two of these are

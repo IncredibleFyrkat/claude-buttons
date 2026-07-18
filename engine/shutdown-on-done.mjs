@@ -13,7 +13,9 @@
 //     starts a 60s-grace shutdown (abort with `shutdown -a`).
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync, renameSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -52,18 +54,94 @@ const machineArmedFresh = () => {
   return true;
 };
 
+// Backing store for Atomics.wait, used as a CPU-free synchronous sleep in the retry below.
+const SLEEP_LOCK = new Int32Array(new SharedArrayBuffer(4));
+
+// Write via temp + rename so the flag is never observed half-written. A bare writeFileSync
+// truncates first, and this tool cuts power to the machine - so an interrupted write was a
+// realistic way to produce the corrupt flag that (before the fail-closed fix) fired a shutdown.
+const writeFlagAtomic = (p, data) => {
+  // Unique temp name: a shared one lets two interleaved writers rename each other's payload.
+  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, data);
+    for (let i = 0; ; i++) {
+      try { renameSync(tmp, p); return; } catch (e) {
+        // On Windows, rename-over-existing fails with EPERM/EBUSY while ANY process holds the
+        // target open (Defender, a backup agent, an indexer). The plain write it replaced
+        // tolerated that, so an unguarded rename is a reliability REGRESSION. Retry with a
+        // real backoff - a retry loop with no delay completes in microseconds and cannot
+        // outlast the transient hold it exists to survive.
+        if (i >= 4 || (e.code !== 'EPERM' && e.code !== 'EBUSY')) throw e;
+        // Atomics.wait, not a spin loop: this path must stay synchronous (the hook has no
+        // event loop to yield to), but a busy-wait over the full 1.2s schedule measured at
+        // 98.9% of one core. This blocks the thread for the same wall time at ~0% CPU.
+        Atomics.wait(SLEEP_LOCK, 0, 0, 120 * (i + 1));
+      }
+    }
+  } catch (e) {
+    // Never let a flag write crash the hook: an uncaught throw here means the arm silently
+    // fails behind a stack trace, or the counter is not written and the shutdown lands late.
+    try { rmSync(tmp, { force: true }); } catch {}
+    try {
+      writeFileSync(p, data);   // last resort: the old, non-atomic path is better than nothing
+      logLine(`atomic flag write fell back to a direct write: ${e.code ?? e}`);
+    } catch (e2) {
+      // The fallback hits the SAME lock the retry just exhausted on, so it must be guarded
+      // too - an unguarded one crashed every turn-end with a raw stack trace and emitted no
+      // confirmation at all. Failing here defers the shutdown, which is the safe direction.
+      logLine(`flag write FAILED entirely (${e.code ?? e} then ${e2.code ?? e2}); state unchanged`);
+    }
+  }
+};
+
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // Standing-request marker: exists from the moment the user asks until disarm or
 // fire. Carries no logic; external UIs (button panels) read it for toggle state.
 const requestPath = (id) => join(FLAG_DIR, `${id}.request`);
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 
+// Whether the Stop hook is re-entering within the same user-visible turn. ONE normalizer used
+// at BOTH read sites, so they cannot disagree. `=== true` was too strict (a harness sending 1
+// or "true" made a re-entry look like a fresh turn, firing a turn early); bare truthiness was
+// too loose (the string "false" is truthy in JS, so a fresh turn could look like a re-entry and
+// wedge the flag forever). Accept only values that actually mean true.
+const isHookActive = (v) =>
+  v === true || v === 1 || (typeof v === 'string' && /^(1|true|yes)$/i.test(v.trim()));
+
 const [mode, ...rest] = process.argv.slice(2);
 
 if (mode === 'toggle') {
-  const verb = rest.find((a) => !a.startsWith('--'));
-  const action = verb ?? 'status';   // no verb at all = report status (documented default)
+  // Nothing on the disarm path may fail quietly. A user who types a disarm command and
+  // sees a success-shaped message must never still be armed, so EVERY unrecognised token
+  // exits non-zero rather than falling through to the status report.
   const KNOWN = ['on', 'off', 'request-on', 'request-off', 'status'];
+  const KNOWN_FLAGS = ['--this-turn'];
+  const flags = rest.filter((a) => a.startsWith('--'));
+  const words = rest.filter((a) => !a.startsWith('--'));
+  // A dash-prefixed typo (`--off`) used to be filtered out as a "flag" BEFORE the verb
+  // check ran, so it reached the status branch: exit 0, no stderr, machine still armed.
+  const badFlag = flags.find((f) => !KNOWN_FLAGS.includes(f));
+  if (badFlag) {
+    console.error(
+      `Unknown option "${badFlag}". Valid options: ${KNOWN_FLAGS.join(', ')}. ` +
+        `Did you mean \`toggle ${badFlag.replace(/^-+/, '')}\`?`,
+    );
+    process.exit(1);
+  }
+  if (words.length > 1) {
+    console.error(`Unexpected extra argument "${words[1]}". Usage: toggle ${KNOWN.join('|')} [--this-turn]`);
+    process.exit(1);
+  }
+  // A flag with no verb (`toggle --this-turn`) used to fall through to the status report -
+  // which begins "Armed for this chat", i.e. it reads as confirmation of an arm that never
+  // happened. Same silent-success class as the `--off` hole, in the arming direction.
+  if (words.length === 0 && flags.length > 0) {
+    console.error(`"${flags[0]}" needs a verb. Did you mean \`toggle on ${flags[0]}\`?`);
+    process.exit(1);
+  }
+  const verb = words[0];
+  const action = verb ?? 'status';   // no verb at all = report status (documented default)
   if (verb && !KNOWN.includes(verb)) {
     // A mistyped verb must NOT silently fall through to a status report: someone who
     // typed `toggle of` (meaning off) would believe they had disarmed while the chat
@@ -91,7 +169,7 @@ if (mode === 'toggle') {
       process.exit(0);
     }
     mkdirSync(FLAG_DIR, { recursive: true });
-    writeFileSync(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
+    writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
     console.log(
       thisTurn
         ? `Armed: the PC will shut down (${GRACE_SECONDS}s grace) when THIS response finishes. Disarm: toggle off. Abort a started countdown: shutdown -a`
@@ -99,11 +177,20 @@ if (mode === 'toggle') {
     );
   } else if (action === 'request-on') {
     mkdirSync(FLAG_DIR, { recursive: true });
-    writeFileSync(requestPath(id), new Date().toISOString());
+    writeFlagAtomic(requestPath(id), new Date().toISOString());
     console.log('Standing shutdown request recorded for this chat.');
   } else if (action === 'request-off') {
+    // Withdrawing the request must also drop any arm it authorised. The panel's toggle
+    // watches *.request via stateGlob, so clearing only the marker made the power button
+    // go dark while the chat stayed armed and the PC still shut down - the UI actively
+    // asserting "not armed" about a machine that was.
     rmSync(requestPath(id), { force: true });
-    console.log('Standing shutdown request cleared for this chat.');
+    rmSync(flagPath(id), { force: true });
+    // ...and the machine switch, which `toggle off` already clears. Leaving it meant the
+    // wake re-armed the chat at the next turn end, so the user read a withdrawal
+    // confirmation and the PC still powered off.
+    rmSync(MACHINE_FLAG, { force: true });
+    console.log('Standing shutdown request cleared for this chat (and any arm it authorised).');
   } else if (action === 'off') {
     // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
     // must be too - disarming one chat must never silently disarm another the user
@@ -142,7 +229,7 @@ if (!id || !existsSync(flagPath(id))) {
   // Machine-wide switch: no file heuristic can know whether a session is truly
   // finished (background shells, pending wakeups), so wake the model at turn-end
   // and let it judge; it arms the real per-session flag when everything is done.
-  if (machineArmedFresh() && !input.stop_hook_active) {
+  if (machineArmedFresh() && !isHookActive(input.stop_hook_active)) {
     logLine(`MACHINE-ARMED wake sent to session ${id ?? '(none)'}`);
     emit({
       decision: 'block',
@@ -153,15 +240,59 @@ if (!id || !existsSync(flagPath(id))) {
   process.exit(0);
 }
 
-let flag = { skip: 0 };
+// A turn-end that re-enters the Stop hook (any hook returning decision:"block" causes this -
+// including our own MACHINE-ARMED wake below) is still the SAME user-visible turn. A skip may
+// therefore be burned at most ONCE per turn.
+//
+// It must NOT suppress firing outright. Doing that killed the machine-switch feature entirely
+// (its wake IS a decision:"block", so the invocation that would fire always carries
+// stop_hook_active) and - far worse - left the flag armed, so the shutdown the user was
+// promised for THIS turn silently detonated at the end of some unrelated later turn. That
+// moves a power-off from a moment they consented to, to one they did not.
+const sameTurn = isHookActive(input.stop_hook_active);   // normalizer defined at module scope
+
+// Fail CLOSED. `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant
+// every truncated / empty / malformed flag powered the PC off. There is no shape of
+// unreadable data that means "shut down" - it means we do not know what the user wanted.
+let parsed = null;
 try {
-  flag = JSON.parse(readFileSync(flagPath(id), 'utf8'));
+  parsed = JSON.parse(readFileSync(flagPath(id), 'utf8'));
 } catch {
-  // Unreadable flag: treat as armed with no skip.
+  parsed = null;
+}
+const skip =
+  parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+  typeof parsed.skip === 'number' && Number.isInteger(parsed.skip) && parsed.skip >= 0
+    ? parsed.skip
+    : null;
+
+if (skip === null) {
+  // Consume the bad flag so it cannot repeat, and tell the user plainly - silently
+  // disarming would be its own trap ("I armed it and nothing happened"). recursive+try:
+  // a directory-shaped flag made rmSync throw here, killing the hook BEFORE the message
+  // was emitted, so every turn crashed with a raw stack trace and the bad flag survived.
+  try {
+    rmSync(flagPath(id), { force: true, recursive: true });
+    rmSync(requestPath(id), { force: true, recursive: true });
+  } catch {}
+  logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
+  emit({
+    systemMessage:
+      'Shutdown-on-done: the arm flag was unreadable, so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
+  });
+  process.exit(0);
 }
 
-if ((flag.skip ?? 0) > 0) {
-  writeFileSync(flagPath(id), JSON.stringify({ skip: flag.skip - 1 }));
+// This turn has already been accounted for: either it burned the skip, or it decided not to
+// fire. Do nothing more. Crucially this must be checked BEFORE the skip branch AND before the
+// fire path: a counter decremented 1 -> 0 during THIS turn means "due next turn", not "due
+// now", so firing on the re-entry would still be a turn early. An arm created during the
+// re-entry itself (the MACHINE-ARMED wake path) carries no marker, so it correctly falls
+// through and fires - which is what makes the physical switch work at all.
+if (sameTurn && parsed.consumedInTurn === true) process.exit(0);
+
+if (skip > 0) {
+  writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true }));
   emit({
     systemMessage:
       'Shutdown-on-done armed: the PC will shut down when the next response in this chat finishes.',
@@ -171,9 +302,26 @@ if ((flag.skip ?? 0) > 0) {
 
 // One-shot: consume the flags before firing so a misfire can never repeat and
 // the machine switch does not re-trigger after the next boot.
-rmSync(flagPath(id), { force: true });
-rmSync(requestPath(id), { force: true });
-rmSync(MACHINE_FLAG, { force: true });
+//
+// Guarded, for the same reason writeFlagAtomic is: a transient Windows lock (Defender, an
+// indexer, a backup agent) made these throw, which crashed the hook with a raw stack trace,
+// emitted NO systemMessage, and left the flag ARMED - so the power-off silently relocated to
+// an arbitrary later turn. That is the exact harm this file's own comments call out as the
+// worst outcome. If the flags cannot be consumed we must NOT fire: firing without consuming
+// them could repeat after a reboot, which is worse than a shutdown that did not happen.
+try {
+  rmSync(flagPath(id), { force: true });
+  rmSync(requestPath(id), { force: true });
+  rmSync(MACHINE_FLAG, { force: true });
+} catch (e) {
+  logLine(`could not consume flags for session ${id} (${e.code ?? e}); NOT shutting down`);
+  emit({
+    systemMessage:
+      'Shutdown-on-done: the arm flag could not be cleared, so the PC was NOT shut down ' +
+      '(firing without consuming it could repeat after a reboot). Re-arm if you still want it.',
+  });
+  process.exit(0);
+}
 
 if (process.env.SHUTDOWN_ON_DONE_DRYRUN === '1') {
   emit({ systemMessage: '[dry-run] Chat done; would start PC shutdown now.' });

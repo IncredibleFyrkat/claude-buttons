@@ -1,4 +1,13 @@
-﻿param([switch]$SmokeTest, $EscapeProbe = $null)
+﻿# All non-switch parameters are named-only. $EscapeProbe used to be positional, so a stray
+# token from an unquoted path (-AddButton C:\My Temp\p.json) bound to it and the script exited
+# 0 having written nothing - a caller checking only the exit code reports success for a button
+# that was never saved.
+param(
+    [switch]$SmokeTest,
+    [Parameter(DontShow)][string]$EscapeProbe = $null,
+    [string]$AddButton,
+    [string]$RemoveButton
+)
 
 # Encode text into a SendKeys string: newlines become Shift+Enter (a soft line break, not
 # a submit) and SendKeys metacharacters are escaped to their literal form. This decides
@@ -18,10 +27,13 @@ function Escape-SendKeys([string]$s) {
 # -EscapeProbe <path> reads the raw input from a FILE (a file preserves newlines and
 # metacharacters that command-line argument passing would mangle), prints the encoding,
 # and exits before anything else runs.
-if ($null -ne $EscapeProbe) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::ReadAllText([string]$EscapeProbe)))); exit 0 }
+# Test for EMPTINESS, not for $null: a [string]-typed parameter coerces an unbound $null to
+# '', so a $null check is always true and the probe fires on every ordinary launch.
+if (-not [string]::IsNullOrEmpty($EscapeProbe)) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::ReadAllText($EscapeProbe)))); exit 0 }
 # Claude Buttons - a slim button strip that docks onto the Claude desktop app's bottom bar.
 # - Visible only when the Claude window itself is in the foreground
-# - Right-click the dot-grip for the menu (pin / position / language / close)
+# - Click (or right-click) the vertical 3-dot kebab for the menu
+#   (pin new button / language / hover tooltips / close panel)
 # - Global buttons + buttons pinned to the currently displayed chat
 # - buttons.json auto-reloads; all writes merge against a fresh file (atomic + retry, locked)
 # - Buttons with "confirm": true require two clicks (Confirm?)
@@ -30,7 +42,7 @@ if ($null -ne $EscapeProbe) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.7.1'
+$CB_VERSION = '1.7.2'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -95,25 +107,39 @@ public static class Layered {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
-    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT ppt, ref SIZE size, IntPtr src, ref POINT pptSrc, int crKey, ref BLENDFUNCTION blend, int flags);
+    // SetLastError: a failed push is otherwise completely silent - the bool return was
+    // discarded, no exception was raised, so the strip simply stopped updating and the log
+    // stayed clean. For a panel whose failure mode is "it disappeared", that silence is the
+    // difference between a one-line config fix and an undiagnosable bug report.
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT ppt, ref SIZE size, IntPtr src, ref POINT pptSrc, int crKey, ref BLENDFUNCTION blend, int flags);
     // Push a premultiplied-ARGB bitmap to the layered window at screen (x,y). This both
     // positions and shows the window, so it doubles as the reposition path.
     public static void Push(IntPtr hwnd, Bitmap bmp, int x, int y) {
-        IntPtr screen = GetDC(IntPtr.Zero);
-        IntPtr mem = CreateCompatibleDC(screen);
-        IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0));
-        IntPtr old = SelectObject(mem, hbmp);
+        // Every handle is acquired INSIDE the try. GetHbitmap throws exactly when GDI is
+        // under pressure (near the 10,000-handle per-process ceiling, or low memory) - and
+        // acquiring the DCs before the try meant each such throw leaked two more handles.
+        // That turns a transient glitch into a death spiral: the caller logs and the tick
+        // keeps pushing, so the failure accelerates the condition that caused it, until
+        // every GDI allocation in the process fails and the panel is dead until restarted.
+        IntPtr screen = IntPtr.Zero, mem = IntPtr.Zero, hbmp = IntPtr.Zero, old = IntPtr.Zero;
         try {
+            screen = GetDC(IntPtr.Zero);
+            if (screen == IntPtr.Zero) return;
+            mem = CreateCompatibleDC(screen);
+            if (mem == IntPtr.Zero) return;
+            hbmp = bmp.GetHbitmap(Color.FromArgb(0));
+            old = SelectObject(mem, hbmp);
             var size = new SIZE(bmp.Width, bmp.Height);
             var src = new POINT(0, 0);
             var dst = new POINT(x, y);
             var blend = new BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 }; // AC_SRC_ALPHA
-            UpdateLayeredWindow(hwnd, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2); // ULW_ALPHA
+            if (!UpdateLayeredWindow(hwnd, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2)) // ULW_ALPHA
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         } finally {
-            SelectObject(mem, old);
-            DeleteObject(hbmp);
-            DeleteDC(mem);
-            ReleaseDC(IntPtr.Zero, screen);
+            if (mem != IntPtr.Zero && old != IntPtr.Zero) SelectObject(mem, old);
+            if (hbmp != IntPtr.Zero) DeleteObject(hbmp);
+            if (mem != IntPtr.Zero) DeleteDC(mem);
+            if (screen != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screen);
         }
     }
 }
@@ -122,7 +148,14 @@ public class PillButton : Control {
     public Color Fill = Color.FromArgb(48, 47, 44);
     public Color HoverFill = Color.FromArgb(60, 58, 54);
     public Color DownFill = Color.FromArgb(70, 67, 62);
-    public Color ToggleFill = Color.FromArgb(150, 108, 54); // active state for toggle buttons (brighter for state contrast)
+    // Active state for toggle buttons. Two constraints pull against each other: the fill must
+    // separate from the bar (WCAG 1.4.11, 3:1) AND the label/glyph on top of it must stay
+    // readable (1.4.3, 4.5:1). The old pairing satisfied only the first - a grey glyph on the
+    // old fill measured 1.96:1, so the lit state was the LEAST legible state in the product,
+    // and that is the state the shutdown power button uses to mean "this PC is armed to power
+    // off". Darkening the fill alone breaks the state cue, so the foreground brightens too.
+    public Color ToggleFill = Color.FromArgb(144, 102, 36);  // 3.30:1 vs the bar
+    public Color ToggleFore = Color.FromArgb(255, 255, 255); // 5.11:1 on ToggleFill
     public Color Accent = Color.Empty; // border on per-chat buttons
     public bool Bold = false;          // draw the glyph with extra stroke weight (icons)
     bool toggled;
@@ -188,7 +221,8 @@ public class PillButton : Control {
                 g.FillEllipse(b, dx, (Height - dd) / 2, dd, dd);
             textLeft = dx + dd;
         }
-        TextRenderer.DrawText(g, Text, Font, new Rectangle(textLeft, 0, Width - textLeft, Height), ForeColor,
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(textLeft, 0, Width - textLeft, Height),
+            toggled ? ToggleFore : ForeColor,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
     // Composite this button onto a transparent ARGB surface at (ox,oy). The whole
@@ -224,7 +258,7 @@ public class PillButton : Control {
             sf.LineAlignment = StringAlignment.Center;
             sf.FormatFlags = StringFormatFlags.NoWrap;
             var rect = new RectangleF(ox + textLeft, oy, Width - textLeft, Height);
-            using (var b = new SolidBrush(ForeColor)) {
+            using (var b = new SolidBrush(toggled ? ToggleFore : ForeColor)) {
                 if (Bold) {
                     // Faux-bold: redraw the glyph at sub-pixel offsets to thicken strokes
                     // without enlarging the icon (Segoe Fluent Icons has no bold weight).
@@ -522,13 +556,23 @@ $configPath = Join-Path $PSScriptRoot 'buttons.json'
 $activePath = Join-Path $env:USERPROFILE '.claude\active-session.json'
 
 # Marker file so the /pin and /unpin skills know where this install keeps buttons.json,
-# without hardcoding any username or path. NOT written during -SmokeTest, so running a
-# smoke test from a dev/repo folder never repoints a live install's marker.
-if (-not $SmokeTest) {
+# without hardcoding any username or path. Written ONLY by a real panel launch: any invocation
+# that runs from a temp/dev copy must never repoint a live install's marker. That includes
+# -SmokeTest and the -AddButton/-RemoveButton CLI, which the skills themselves call - a CLI
+# run from the wrong folder would rewrite the very file the skills use to find the panel, and
+# the breakage is self-propagating because there is then no correct path left to recover from.
+# No BOM: the skills read this as a PATH, and a leading U+FEFF is a silent "file not found".
+# Deliberately a FUNCTION, called only after the single-instance mutex is won (see the bottom
+# of this file). Writing it here would still repoint a live install's marker when someone
+# double-clicks a repo copy once: that duplicate exits at the single-instance guard ~2000 lines
+# later, but by then it has already rewritten the file the skills use to find the panel.
+function Write-InstallMarker {
+    if ($SmokeTest -or $AddButton -or $RemoveButton) { return }
     try {
         $markerDir = Join-Path $env:USERPROFILE '.claude'
         if (Test-Path $markerDir) {
-            Set-Content -Path (Join-Path $markerDir 'claude-buttons-path.txt') -Value $configPath -Encoding UTF8 -ErrorAction SilentlyContinue
+            [IO.File]::WriteAllText((Join-Path $markerDir 'claude-buttons-path.txt'), $configPath,
+                                    (New-Object System.Text.UTF8Encoding($false)))
         }
     } catch {}
 }
@@ -554,7 +598,12 @@ function Write-ConfigAtomic($cfg) {
     for ($i = 0; $i -lt 3; $i++) {
         try {
             $tmp = "$configPath." + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp'
-            $cfg | ConvertTo-Json -Depth 6 | Set-Content $tmp -Encoding UTF8
+            # Depth 100, not 6: PS 5.1 does not error past -Depth, it stringifies the over-deep
+            # node into "@{k=v}", silently and irreversibly corrupting anything nested that a
+            # newer version or a hand-editing user put there. No BOM: buttons.json is JSON, and
+            # the marker/skill readers are strict (Set-Content -Encoding UTF8 emits a BOM here).
+            $json = $cfg | ConvertTo-Json -Depth 100
+            [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
             Move-Item -Path $tmp -Destination $configPath -Force
             $script:cfgTime = (Get-Item $configPath).LastWriteTimeUtc
             return $true
@@ -628,7 +677,7 @@ $script:strings = @{
         rename = 'Rename...'; moveLeft = 'Move left'; moveRight = 'Move right'; remove = 'Remove this button'
         pinNew = 'Pin new button'; custom = 'Other: type your own...'; onlyChat = 'Only this chat'; globalScope = 'Global (all chats)'
         closePanel = 'Close panel'; language = 'Language'
-        confirm = 'Confirm?'; gripTip = 'Right-click: menu'
+        confirm = 'Confirm?'; gripTip = 'Click: menu'
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
@@ -636,7 +685,7 @@ $script:strings = @{
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
-        firstRun = 'Right-click the dots to add buttons'
+        firstRun = 'Click the menu button to add buttons'
         setIcon = 'Set icon...'; iconTitle = 'Set icon'
         iconAsk = "Icon name (empty = show text label instead).`nAvailable: {0}"
         toggleMode = 'On/off (toggle) mode'
@@ -648,7 +697,7 @@ $script:strings = @{
         rename = 'Omdøb…'; moveLeft = 'Flyt til venstre'; moveRight = 'Flyt til højre'; remove = 'Fjern denne knap'
         pinNew = 'Pin ny knap'; custom = 'Andet: skriv selv…'; onlyChat = 'Kun denne chat'; globalScope = 'Global (alle chats)'
         closePanel = 'Luk panelet'; language = 'Sprog'
-        confirm = 'Bekræft?'; gripTip = 'Højreklik: menu'
+        confirm = 'Bekræft?'; gripTip = 'Klik: menu'
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
@@ -656,7 +705,7 @@ $script:strings = @{
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
-        firstRun = 'Højreklik på prikkerne for at tilføje knapper'
+        firstRun = 'Klik på menuknappen for at tilføje knapper'
         setIcon = 'Vælg ikon…'; iconTitle = 'Vælg ikon'
         iconAsk = "Ikon-navn (tom = vis tekst i stedet).`nMulige: {0}"
         toggleMode = 'On/off-tilstand (toggle)'
@@ -709,7 +758,90 @@ function Update-Buttons([scriptblock]$transform) {
 }
 
 function Same-Button($a, $b) {
-    ($a.label -eq $b.label) -and ($a.text -eq $b.text) -and ([string]$a.chat -eq [string]$b.chat)
+    # -ceq, not -eq: PowerShell's -eq is case-INSENSITIVE, so "Deploy"/"/deploy prod" matched
+    # a genuinely different button "deploy"/"/DEPLOY PROD". Two buttons whose text differs only
+    # by case are two different prompts, and treating them as one deleted the wrong one.
+    ($a.label -ceq $b.label) -and ($a.text -ceq $b.text) -and ([string]$a.chat -ceq [string]$b.chat)
+}
+
+# ---------- Locked CLI entry points for the /pin and /unpin skills ----------
+# The skills used to read buttons.json, think, and write it back by hand. The panel guards
+# every write with the Local\ClaudeButtonsConfig mutex and merges against a fresh read - but
+# a lock only one of three writers honours is not a lock, and a panel edit landing inside the
+# skill's read->write window was silently destroyed. Routing the skills through the SAME
+# merge protocol closes that, and costs them nothing: one call instead of three file steps.
+# Exits before any UI is built, so this is safe to run headless while the panel is running.
+# Bind on PRESENCE, not truthiness: `-AddButton ""` used to be falsy, fall through, and launch
+# the whole panel UI - so a caller whose payload path came out empty got a second panel instance
+# and exit 0, i.e. "success" for a button that was never written.
+if ($PSBoundParameters.ContainsKey('AddButton') -or $PSBoundParameters.ContainsKey('RemoveButton')) {
+    if ($PSBoundParameters.ContainsKey('AddButton') -and $PSBoundParameters.ContainsKey('RemoveButton')) {
+        [Console]::Error.Write('Pass -AddButton or -RemoveButton, not both.'); exit 2
+    }
+    # The value is either a PATH to a UTF-8 JSON file or inline JSON. Prefer the file: a button's
+    # text can be a multi-paragraph prompt containing quotes and newlines, and those do not
+    # survive being passed as a command-line argument through PowerShell. Same reason
+    # -EscapeProbe takes a file.
+    $isAdd = $PSBoundParameters.ContainsKey('AddButton')
+    $raw = if ($isAdd) { $AddButton } else { $RemoveButton }
+    if ([string]::IsNullOrWhiteSpace($raw)) { [Console]::Error.Write('Empty payload argument.'); exit 2 }
+    # A mistyped path must say so. Reporting "Invalid JSON" for a missing file sent callers
+    # off to retry with inline JSON - the one form that mangles multi-line prompts.
+    $looksLikePath = $raw -match '^[A-Za-z]:\\|^\\\\|\.json\s*$'
+    if ($looksLikePath -and -not (Test-Path -LiteralPath $raw -PathType Leaf)) {
+        [Console]::Error.Write("Payload file not found: $raw"); exit 2
+    }
+    $payload = if (Test-Path -LiteralPath $raw -PathType Leaf) { [IO.File]::ReadAllText($raw) } else { $raw }
+    try { $entry = $payload | ConvertFrom-Json } catch {
+        [Console]::Error.Write("Invalid JSON in payload: $($_.Exception.Message)"); exit 2
+    }
+    if ($null -eq $entry) { [Console]::Error.Write('Payload parsed to null.'); exit 2 }
+    # NOTE: Update-Buttons assigns the transform's output to $fresh.buttons UNCONDITIONALLY.
+    # There is no "return nothing = leave it alone" contract, so a transform that declines to
+    # change anything must still return the FULL array it was given. Returning $null writes
+    # a buttons array containing one null entry, i.e. destroys the user's buttons.
+    if ($isAdd) {
+        if (-not $entry.text) { [Console]::Error.Write('A button needs a "text" field.'); exit 2 }
+        if (-not $entry.label) { $entry | Add-Member label ([string]$entry.text) -Force }
+        $script:cbAdded = $false
+        $ok = Update-Buttons {
+            param($btns)
+            # Same duplicate rule the panel's own pin menu uses: same text in the same scope.
+            $dup = @($btns | Where-Object { $_.text -eq $entry.text -and [string]$_.chat -eq [string]$entry.chat })
+            if ($dup.Count -gt 0) { return @($btns) }   # unchanged, NOT null
+            $script:cbAdded = $true
+            @($btns) + $entry
+        }
+        if (-not $ok) { [Console]::Error.Write('Could not write buttons.json (locked or unreadable).'); exit 1 }
+        if (-not $script:cbAdded) { Write-Output 'DUPLICATE: a button with that text already exists in that scope.'; exit 0 }
+        Write-Output "ADDED: $($entry.label)"
+        exit 0
+    }
+    # Refuse an ambiguous delete rather than guessing. Removing "every match" turned one
+    # requested deletion into several, and a button's text may be a prompt the user wrote by
+    # hand - there is no backup and no undo, so the only safe answer to "which one?" is to ask.
+    $script:cbRemoved = 0
+    $script:cbAmbiguous = 0
+    $ok = Update-Buttons {
+        param($btns)
+        $all = @($btns)
+        $hits = @($all | Where-Object { Same-Button $_ $entry })
+        if ($hits.Count -gt 1) { $script:cbAmbiguous = $hits.Count; return $all }   # unchanged
+        if ($hits.Count -eq 0) { return $all }                                      # unchanged
+        $script:cbRemoved = 1
+        $dropped = $false
+        @($all | Where-Object {
+            if (-not $dropped -and (Same-Button $_ $entry)) { $dropped = $true; $false } else { $true }
+        })
+    }
+    if (-not $ok) { [Console]::Error.Write('Could not write buttons.json (locked or unreadable).'); exit 1 }
+    if ($script:cbAmbiguous -gt 1) {
+        [Console]::Error.Write("AMBIGUOUS: $($script:cbAmbiguous) buttons match that label/text/scope exactly - refusing to guess which to delete. Nothing was changed.")
+        exit 3
+    }
+    if ($script:cbRemoved -eq 0) { Write-Output 'NOTFOUND: no button matched.'; exit 0 }
+    Write-Output "REMOVED: 1"
+    exit 0
 }
 
 # ---------- Text helpers ----------
@@ -2401,6 +2533,9 @@ if ($SmokeTest) {
 $created = $false
 $script:mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeButtonsPanel', [ref]$created)
 if (-not $created) { Write-CkLog 'Another instance is already running - exiting' ; exit 0 }
+
+# Only now: this process is THE panel for this session, so its path is the authoritative one.
+Write-InstallMarker
 
 [WinHook]::Start()   # let Windows push window move/resize/foreground/chat-switch events
 $timer.Start()

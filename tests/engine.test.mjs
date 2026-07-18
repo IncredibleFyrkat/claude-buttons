@@ -102,7 +102,7 @@ test('toggle off is per-chat: cancelling one chat leaves other armed chats intac
 test('Stop hook: skip counter decrements without firing', () => {
   writeFileSync(join(flagDir(), 'sSkip.json'), JSON.stringify({ skip: 1 }));
   const { out } = stop({ session_id: 'sSkip' });
-  assert.match(out, /armed/i);
+  assert.match(out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
   assert.doesNotMatch(out, /shutting down|would start/i);
   assert.equal(JSON.parse(readFileSync(join(flagDir(), 'sSkip.json'), 'utf8')).skip, 0);
 });
@@ -151,4 +151,144 @@ test('MACHINE-ARMED with stop_hook_active is suppressed (no re-trigger loop)', (
   writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
   const { out } = stop({ session_id: 'sLoop', stop_hook_active: true });
   assert.equal(out, '');
+});
+
+// ---------------------------------------------------------------------------
+// Band 1 safety fixes. Every case below was verified to FAIL against the code as
+// it shipped in v1.7.1 - a regression test that only passes on the fix proves
+// nothing about the bug it claims to guard.
+// ---------------------------------------------------------------------------
+
+// ENG-01: `skip: 0` is the fire sentinel, so defaulting a corrupt flag to it meant every
+// malformed flag powered the PC off - with no attacker involved, just an interrupted write.
+for (const [name, body] of [
+  ['truncated write', '{"ski'],
+  ['empty file', ''],
+  ['garbage', 'not json at all'],
+  ['no skip key', '{}'],
+  ['negative skip', '{"skip":-1}'],
+  ['string skip', '{"skip":"abc"}'],
+  ['fractional skip', '{"skip":1.5}'],
+  ['JSON null', 'null'],
+  ['JSON array', '[]'],
+  ['object skip', '{"skip":{"a":1}}'],
+]) {
+  test(`corrupt flag (${name}) disarms WITHOUT shutting down`, () => {
+    const id = `sCorrupt-${name.replace(/\W/g, '')}`;
+    writeFileSync(join(flagDir(), `${id}.json`), body);
+    writeFileSync(join(flagDir(), `${id}.request`), 'x');
+    const { out, code } = stop({ session_id: id });
+    assert.doesNotMatch(out, /would start PC shutdown/, 'must NOT fire on unreadable state');
+    assert.match(out, /unreadable/i, 'must tell the user it disarmed rather than fail silently');
+    assert.equal(code, 0);
+    assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'bad flag is consumed so it cannot repeat');
+  });
+}
+
+// ENG-02: any hook returning decision:"block" re-enters the Stop hook within the SAME
+// user-visible turn - including this engine's own MACHINE-ARMED wake. Counting invocations
+// instead of turns decremented twice and fired one response early.
+test('a re-entered Stop hook does not burn the grace turn', () => {
+  const id = 'sReenter';
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 1 }));
+  const first = stop({ session_id: id });
+  assert.match(first.out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
+  const second = stop({ session_id: id, stop_hook_active: true });
+  assert.doesNotMatch(second.out, /would start PC shutdown/, 'must not fire on re-entry');
+  assert.equal(JSON.parse(readFileSync(join(flagDir(), `${id}.json`), 'utf8')).skip, 0,
+    'the counter must not decrement twice for one turn');
+});
+
+// ENG-04: `--off` was filtered out as a "flag" BEFORE the verb check, so it reached the
+// status branch: exit 0, no stderr, machine still armed, user believes they disarmed.
+for (const bad of ['--off', '--status', '--on', '--disable']) {
+  test(`\`toggle ${bad}\` fails loudly and leaves the arm untouched`, () => {
+    const id = `sFlag${bad.replace(/\W/g, '')}`;
+    toggle('toggle request-on', id);
+    toggle('toggle on --this-turn', id);
+    const r = toggle(`toggle ${bad}`, id);
+    assert.equal(r.code, 1, 'must exit non-zero');
+    assert.match(r.err, /Unknown option/);
+    assert.doesNotMatch(r.out, /Armed for this chat|Not armed/, 'must not masquerade as a status report');
+    assert.ok(existsSync(join(flagDir(), `${id}.json`)), 'a rejected command must not half-disarm');
+  });
+}
+
+test('an unexpected extra argument is rejected rather than silently armed', () => {
+  toggle('toggle request-on', 'sExtra');
+  const r = toggle('toggle on --this-turn junk', 'sExtra');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /Unexpected extra argument/);
+  assert.ok(!existsSync(join(flagDir(), 'sExtra.json')), 'nothing armed on a rejected command');
+});
+
+// ENG-06: the panel's power button watches *.request via stateGlob, so clearing only the
+// marker made the button go dark while the chat stayed armed - the UI asserting "not armed"
+// about a machine that was.
+test('request-off also drops the arm it authorised (button state cannot lie)', () => {
+  const id = 'sReqOff';
+  toggle('toggle request-on', id);
+  toggle('toggle on --this-turn', id);
+  toggle('toggle request-off', id);
+  assert.ok(!existsSync(join(flagDir(), `${id}.request`)), 'marker cleared');
+  assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'arm cleared too');
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/, 'a withdrawn request must not still fire');
+});
+
+// The MACHINE-ARMED round trip. Round 1 "fixed" double-counting with a blanket
+// `if (input.stop_hook_active) process.exit(0)`, which killed this feature outright - the wake
+// IS a decision:"block", so the invocation that would fire always carries stop_hook_active -
+// and left the flag armed to detonate at an arbitrary later turn. Every other test passed with
+// the feature dead, so this end-to-end path is what actually guards against its resurrection.
+test('MACHINE-ARMED round trip: wake, arm, and FIRE on the same turn', () => {
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  const wake = stop({ session_id: 'sTrip', stop_hook_active: false });
+  assert.match(wake.out, /"decision":"block"/, 'turn end wakes the model to judge completion');
+  toggle('toggle on --this-turn', 'sTrip');      // the model judges "done" and arms
+  const fired = stop({ session_id: 'sTrip', stop_hook_active: true });   // re-entry caused BY the block
+  assert.match(fired.out, /would start PC shutdown/, 'the promised turn must actually fire');
+  assert.ok(!existsSync(join(flagDir(), 'sTrip.json')), 'flag consumed, not left to detonate later');
+});
+
+test('an armed chat does not detonate in a LATER unrelated turn', () => {
+  const id = 'sLater';
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  stop({ session_id: id, stop_hook_active: false });
+  toggle('toggle on --this-turn', id);
+  stop({ session_id: id, stop_hook_active: true });          // fires here
+  const later = stop({ session_id: id, stop_hook_active: false });
+  assert.doesNotMatch(later.out, /would start PC shutdown/, 'must not fire again in a later turn');
+});
+
+// TEST-02: these behaviours were all correct but unguarded - reverting any of them left the
+// suite fully green.
+test('request-off also clears the machine switch (else the wake re-arms next turn)', () => {
+  const id = 'sReqOffMachine';
+  writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
+  toggle('toggle request-on', id);
+  toggle('toggle on --this-turn', id);
+  toggle('toggle request-off', id);
+  assert.ok(!existsSync(join(flagDir(), 'MACHINE-ARMED')), 'machine switch cleared too');
+  const woke = stop({ session_id: id, stop_hook_active: false });
+  assert.equal(woke.out, '', 'a withdrawn request must not be re-armed by a lingering wake');
+});
+
+test('a flag with no verb is rejected rather than reported as status', () => {
+  const r = toggle('toggle --this-turn', 'sNoVerb');
+  assert.equal(r.code, 1, 'exits non-zero');
+  assert.match(r.err, /needs a verb/);
+  assert.doesNotMatch(r.out, /Armed for this chat|Not armed/, 'must not read as an arm confirmation');
+});
+
+// QA-07: machineArmedFresh() is what makes the 12h expiry real, but only the Stop path was
+// covered - a forgotten week-old switch could still satisfy the anti-injection arm gate.
+test('a STALE machine switch does not satisfy the arm gate', () => {
+  const f = join(flagDir(), 'MACHINE-ARMED');
+  writeFileSync(f, '');
+  const old = Date.now() / 1000 - 13 * 3600;
+  utimesSync(f, old, old);
+  const { out } = toggle('toggle on --this-turn', 'sStaleArm');
+  assert.match(out, /Refused: no standing shutdown request/);
+  assert.ok(!existsSync(join(flagDir(), 'sStaleArm.json')), 'no flag written when refused');
 });

@@ -53,13 +53,14 @@ annullerer. Der tilføjes en `/shutdown-on-done on|off|status`-kommando, en Stop
 - Skift til Claude-appen — strimlen dukker op i bundbjælken.
 - **Klik på ⋮-menuen** (kebab'en yderst til venstre på strimlen) → *Pin new button* → vælg en kommando i undermenuen *Global* eller *Only this chat* (scope vælges i ét klik).
 - **Venstreklik** på en knap for at skrive dens kommando; globale knapper trykker også Enter, chat-knapper lader dig se teksten først.
+- **Shift-klik** indsætter teksten **uden** at sende, så du kan redigere eller udvide prompten før du selv trykker Enter. (Kun relevant på knapper der ellers sender. Toggles skifter ikke tilstand ved shift-klik: kommandoen er parkeret, ikke kørt.)
 - **Højreklik på en knap** → omdøb, redigér tekst, vælg ikon, on/off-tilstand, flyt (*Move left / Move right*) eller fjern.
 - **⋮-menuen** rummer også **Sprog** (English / Dansk), en **Hover tooltips**-kontakt og **Close panel**. Strimlen docker sig selv til composeren — ingen manuel placering.
 
 ## Fejlsøgning
 
-- **Strimlen sidder skævt eller per-chat/split-knapper driller efter en app-opdatering** → appens UI er ændret. Se `%LOCALAPPDATA%\claude-buttons.log` og juster de app-afhængige felter i `buttons.json` (`uiaPaneMatch`, `uiaPaneName`, `uiaSidebarName`, `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `reservedW`). Bed evt. Claude om at "probe appens UIA-træ og opdatere felterne".
-- **App ikke på engelsk?** Accessibility-navne som `Primary pane`/`Sidebar` kan være oversatte — sæt `uiaPaneMatch`/`uiaSidebarName` til de lokaliserede navne.
+- **Strimlen sidder skævt eller forsvinder efter en app-opdatering** → appens UI er ændret. Se `%LOCALAPPDATA%\claude-buttons.log` og juster de app-afhængige felter i `buttons.json`. **Start med `uiaComposerName`** (standard `"Prompt"`): strimlen docker ved at matche composerens accessibility-navn, så en omdøbning dér er den mest sandsynlige årsag og skjuler alle strimler. Derefter `uiaPaneMatch` (split-/grid-paneler) og geometri-værdierne `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `vNudge`, `reservedW`. Bed evt. Claude om at "probe appens UIA-træ og opdatere felterne".
+- **App ikke på engelsk?** Accessibility-navne som `Prompt` og `… pane` kan være oversatte — sæt `uiaComposerName` og `uiaPaneMatch` til de lokaliserede navne.
 - **`/pin` ukendt kommando eller gør ingenting** → genstart Claude-appen; skillen skriver til filen nævnt i `%USERPROFILE%\.claude\claude-buttons-path.txt`.
 - **Intet vises** → strimlen vises kun, når Claude-vinduet er i forgrunden.
 
