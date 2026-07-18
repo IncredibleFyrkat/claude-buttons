@@ -100,6 +100,117 @@ Check 'the modal-hide runs AFTER Update-UiaInfo (so the flag can clear again)' (
 $clearsFlag = @($src | Select-String -Pattern '\$script:composerLost\s*=\s*\$false').Count
 Check 'composerLost is cleared somewhere (else it latches on forever)' ($clearsFlag -ge 1)
 
+# --- Version discipline ---
+# v1.7.0 shipped reporting "1.6.0" because a merge resolution silently reverted the bump,
+# and the tag had to be force-moved after release. CB_VERSION is what the panel shows in its
+# menu and what the installer's smoke test prints, so it is the only way a bug report can
+# identify the running build. Nothing referenced it from tests or CI, so the identical
+# mistake would have recurred unnoticed.
+$verMatch = [regex]::Match(($src -join "`n"), "(?m)^\`$CB_VERSION\s*=\s*'([^']+)'")
+Check 'CB_VERSION is defined' ($verMatch.Success)
+$ver = $verMatch.Groups[1].Value
+$chgTop = [regex]::Match((Get-Content (Join-Path $repo 'CHANGELOG.md') -Raw), '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+)')
+Check 'CHANGELOG has a versioned top heading' ($chgTop.Success)
+Check "CB_VERSION ($ver) matches the newest CHANGELOG heading ($($chgTop.Groups[1].Value))" ($ver -eq $chgTop.Groups[1].Value)
+
+# --- Contrast invariants ---
+# The README states a contrast figure, and a lit toggle used to measure 1.96:1 against it -
+# on the button that means "this PC is armed to power off". Assert the pairs the code
+# actually renders, so the claim cannot drift away from the colours again.
+function Ratio($a, $b) {
+    $lin = { param($v) $v = $v / 255; if ($v -le 0.03928) { $v / 12.92 } else { [Math]::Pow(($v + 0.055) / 1.055, 2.4) } }
+    $la = 0.2126 * (& $lin $a[0]) + 0.7152 * (& $lin $a[1]) + 0.0722 * (& $lin $a[2])
+    $lb = 0.2126 * (& $lin $b[0]) + 0.7152 * (& $lin $b[1]) + 0.0722 * (& $lin $b[2])
+    $hi = [Math]::Max($la, $lb); $lo = [Math]::Min($la, $lb)
+    ($hi + 0.05) / ($lo + 0.05)
+}
+function ArgbFrom([string]$pattern) {
+    $m = [regex]::Match(($src -join "`n"), $pattern)
+    if (-not $m.Success) { return $null }
+    @([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)
+}
+$togFill = ArgbFrom 'ToggleFill\s*=\s*Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$togFore = ArgbFrom 'ToggleFore\s*=\s*Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$bar     = ArgbFrom '\$colBar\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+Check 'toggle colours are parseable from source' ($togFill -and $togFore -and $bar)
+if ($togFill -and $togFore -and $bar) {
+    $fg = Ratio $togFore $togFill
+    $cue = Ratio $togFill $bar
+    Check ("toggle-ON label is readable: {0:N2}:1 >= 4.5 (WCAG 1.4.3)" -f $fg) ($fg -ge 4.5)
+    Check ("toggle-ON state cue holds: {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $cue) ($cue -ge 3.0)
+}
+
+# --- Docs must describe code that exists ---
+# The README documented two config knobs (uiaPaneName, uiaSidebarName) that were parsed and
+# then never read again - and the troubleshooting section told users to edit them to recover
+# from a Claude app update. Inert advice at exactly the moment the tool is broken. A field
+# that is only ever assigned appears once for the default and once for the config override;
+# a field that is genuinely used appears at least three times.
+$srcText = $src -join "`n"
+$readmeText = Get-Content (Join-Path $repo 'README.md') -Raw
+$documented = [regex]::Matches($readmeText, '(?m)^\|\s*`(\w+)`\s*\|') | ForEach-Object { $_.Groups[1].Value }
+$perButton = @('label','short','text','submit','confirm','icon','toggle','textOn','textOff',
+               'stateGlob','chat','chatTitle','chatLabel','desc','schemaVersion','buttons')
+$dead = @()
+foreach ($f in ($documented | Sort-Object -Unique)) {
+    if ($perButton -contains $f) { continue }   # per-button fields are read off the button object
+    $uses = ([regex]::Matches($srcText, [regex]::Escape("script:$f"))).Count
+    if ($uses -gt 0 -and $uses -lt 3) { $dead += "$f ($uses refs)" }
+}
+Check ("no documented config field is dead code" + $(if ($dead) { ": $($dead -join ', ')" } else { '' })) ($dead.Count -eq 0)
+
+# Every interaction the UI advertises in a tooltip must also exist in the README. Shift-click
+# shipped in 1.7.1 with a CHANGELOG entry and a tooltip string and no README coverage at all.
+if ($srcText -match "tipShift\s*=") {
+    Check 'shift-click is documented in README.md' ($readmeText -match '(?i)shift-click')
+    $readmeDa = Get-Content (Join-Path $repo 'README.da.md') -Raw
+    Check 'shift-click is documented in README.da.md' ($readmeDa -match '(?i)shift-klik')
+}
+
+# --- Locked CLI entry point for the skills (DATA-01) ---
+# The /pin and /unpin skills used to read-modify-write buttons.json by hand while the panel
+# wrote the same file under a mutex, so a panel edit landing inside the skill's think-time was
+# silently destroyed. These assert the CLI merges rather than overwrites, and - the part that
+# actually bit - that a DECLINED change (duplicate / not found) leaves the file intact.
+function Invoke-CbCli([string]$json, [string]$switchName, [string]$startCfg) {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("cb-cli-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Copy-Item $panel  (Join-Path $dir 'claude-buttons.ps1') -Force
+    Copy-Item $defCfg (Join-Path $dir 'buttons.default.json') -Force
+    [IO.File]::WriteAllText((Join-Path $dir 'buttons.json'), $startCfg, (New-Object System.Text.UTF8Encoding($false)))
+    # Pass the payload as a FILE, the way the skills are told to - inline JSON does not survive
+    # PowerShell argument parsing once the text contains quotes.
+    $pay = Join-Path $dir 'payload.json'
+    [IO.File]::WriteAllText($pay, $json, (New-Object System.Text.UTF8Encoding($false)))
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') $switchName $pay 2>&1
+    $after = Get-Content (Join-Path $dir 'buttons.json') -Raw
+    Remove-Item $dir -Recurse -Force
+    [pscustomobject]@{ Out = "$out"; Labels = (($after | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ',' }
+}
+$start = '{"schemaVersion":1,"buttons":[{"label":"Kept","text":"/kept"}]}'
+
+$r = Invoke-CbCli '{"label":"New","text":"/new"}' '-AddButton' $start
+Check 'CLI add merges instead of overwriting (existing button survives)' ($r.Labels -eq 'Kept,New')
+Check 'CLI add reports ADDED' ($r.Out -match 'ADDED')
+
+$r = Invoke-CbCli '{"label":"Other","text":"/kept"}' '-AddButton' $start
+Check 'CLI add refuses a duplicate text in the same scope' ($r.Out -match 'DUPLICATE')
+Check 'a DECLINED add leaves the file intact (must not write a null entry)' ($r.Labels -eq 'Kept')
+
+$r = Invoke-CbCli '{"label":"Kept","text":"/kept"}' '-RemoveButton' $start
+Check 'CLI remove deletes the matching button' (($r.Out -match 'REMOVED') -and ($r.Labels -eq ''))
+
+$r = Invoke-CbCli '{"label":"Ghost","text":"/ghost"}' '-RemoveButton' $start
+Check 'CLI remove of a missing button reports NOTFOUND' ($r.Out -match 'NOTFOUND')
+Check 'a DECLINED remove leaves the file intact' ($r.Labels -eq 'Kept')
+
+# The skills must route through the locked entry point, not edit the JSON themselves.
+foreach ($s in @('pin', 'unpin')) {
+    $sk = Get-Content (Join-Path $repo "skills\$s\SKILL.md") -Raw
+    Check "the /$s skill uses the locked CLI entry point" ($sk -match '-(Add|Remove)Button')
+    Check "the /$s skill is told not to write buttons.json itself" ($sk -match '(?i)do NOT (read, edit or )?write buttons\.json')
+}
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

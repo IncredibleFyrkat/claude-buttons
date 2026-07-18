@@ -1,4 +1,4 @@
-<#
+﻿<#
   Claude Buttons - installer
   Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
@@ -46,6 +46,27 @@ function Write-Utf8NoBom([string]$path, [string]$text) {
     $enc = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($path, $text, $enc)
 }
+# Atomic, validated write for JSON we must never leave half-written. WriteAllText truncates
+# the target and THEN streams into it, so a crash - or Claude Code writing settings.json at
+# the same moment - could leave the user with an empty or truncated config and no working
+# Claude Code. Write to a temp file, prove it parses back, then swap it in atomically.
+function Write-JsonAtomic([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)   # JSON: never a BOM
+    $tmp = "$path.tmp.$PID"
+    [IO.File]::WriteAllText($tmp, $text, $enc)
+    try { [void]([IO.File]::ReadAllText($tmp) | ConvertFrom-Json) }
+    catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw "Refusing to write $path - the JSON it produced did not parse back. Your file was NOT modified."
+    }
+    if (Test-Path $path) {
+        $swap = "$path.replacing"
+        [IO.File]::Replace($tmp, $path, $swap)   # single atomic operation on NTFS
+        Remove-Item $swap -Force -ErrorAction SilentlyContinue
+    } else {
+        Move-Item $tmp $path -Force
+    }
+}
 
 function Stop-Panel {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
@@ -60,6 +81,18 @@ function Get-Settings {
     }
     return (New-Object psobject)
 }
+# Pre-flight, run BEFORE anything is written or deleted. settings.json is touched late in
+# both install and uninstall, so a file that is invalid or locked used to abort the run
+# half-way - on uninstall that left the skills and engine deleted but the hooks still in
+# settings.json, pointing at files that no longer exist, with no self-service way back.
+# Failing here costs nothing, because nothing has happened yet.
+function Test-SettingsUsable {
+    if (-not (Test-Path $settingsPath)) { return }
+    try { [void](Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { throw "~/.claude/settings.json is not valid JSON. NOTHING has been changed. Fix or remove it, then re-run." }
+    try { $fs = [IO.File]::Open($settingsPath, 'Open', 'ReadWrite', 'None'); $fs.Close() }
+    catch { throw "~/.claude/settings.json is locked (is Claude Code running?). NOTHING has been changed. Close it and re-run." }
+}
 function Save-Settings($obj) {
     if (Test-Path $settingsPath) {
         # Preserve the PRISTINE original once, write-once: a full install calls
@@ -69,7 +102,17 @@ function Save-Settings($obj) {
         if (-not (Test-Path "$settingsPath.orig.bak")) { Copy-Item $settingsPath "$settingsPath.orig.bak" -Force }
         Copy-Item $settingsPath "$settingsPath.bak" -Force
     }
-    Write-Utf8NoBom $settingsPath ($obj | ConvertTo-Json -Depth 20)
+    # PS 5.1's ConvertTo-Json does NOT error when nesting exceeds -Depth: it stringifies the
+    # over-deep node into "@{k=v}" or "System.Object[]", silently destroying MCP server
+    # definitions and other nested config while still emitting valid JSON. Depth alone is
+    # therefore not a fix - refuse to write anything showing that stringification.
+    $json = $obj | ConvertTo-Json -Depth 100
+    if ($json -match '"@\{' -or $json -match '"System\.(Object\[\]|Collections)') {
+        throw ("settings.json is nested deeper than this installer can safely rewrite. " +
+               "Your file was NOT modified - add the hook manually (see README). " +
+               "Pristine backup: $settingsPath.orig.bak")
+    }
+    Write-JsonAtomic $settingsPath $json
 }
 function Ensure-HookArray($settings, [string]$event) {
     if (-not $settings.PSObject.Properties['hooks']) { $settings | Add-Member hooks (New-Object psobject) -Force }
@@ -108,6 +151,7 @@ function Remove-AllowRules($settings, [string]$marker) {
 # =================== UNINSTALL ===================
 if ($Uninstall) {
     Write-Host "Uninstalling Claude Buttons..." -ForegroundColor Cyan
+    Test-SettingsUsable   # fail before deleting anything, not after
     Stop-Panel
     if (Test-Path $startupLnk) { Remove-Item $startupLnk -Force }
     foreach ($s in @('pin','unpin','close-pc-on-done','cancel-close-pc','shutdown-on-done')) {
@@ -132,6 +176,7 @@ if ($Uninstall) {
 
 # =================== INSTALL / UPDATE ===================
 Write-Host "Installing Claude Buttons to $InstallDir" -ForegroundColor Cyan
+Test-SettingsUsable   # fail before writing anything, not half-way through
 Stop-Panel
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
@@ -146,7 +191,7 @@ if (-not (Test-Path $cfgPath)) {
 } else {
     try {
         $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-Utf8Bom $cfgPath ($cfg | ConvertTo-Json -Depth 6) }
+        if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100) }
     } catch {}
 }
 
@@ -159,7 +204,7 @@ foreach ($s in @('pin','unpin')) {
 }
 
 # 4) Marker so skills find buttons.json without any hardcoded path
-Write-Utf8Bom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
+Write-Utf8NoBom (Join-Path $claudeDir 'claude-buttons-path.txt') $cfgPath
 
 # 5) Core hook (UserPromptSubmit) - merged safely
 $settings = Get-Settings
@@ -242,7 +287,7 @@ if ($wantShutdown) {
                     toggle = $true; confirm = $true
                     stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
                     text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
-                Write-Utf8Bom $cfgPath ($cfg | ConvertTo-Json -Depth 6)
+                Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100)
             }
         } catch {}
         Write-Host "  + Shutdown-on-done engine installed (completion-judged; power button added to the panel)." -ForegroundColor DarkGray

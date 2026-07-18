@@ -74,6 +74,7 @@ confirm to arm, one click to cancel. It is never installed silently.
 - Switch to the Claude app — the strip appears in the bottom bar.
 - **Click the ⋮ menu** (the kebab at the left of the strip) → *Pin new button* → pick a command from the *global* or *this chat* submenu (scope is chosen in one click).
 - **Left-click** a button to type its command; global buttons also press Enter, per-chat buttons let you review first.
+- **Shift-click** to insert the text **without** sending, so you can extend or edit the prompt before pressing Enter yourself. (Only meaningful on buttons that would otherwise send — per-chat buttons never auto-send anyway. Toggles do not flip on a Shift-click: the command is parked, not executed.)
 - **Hover a button** for a themed tooltip showing its command, scope and behavior — add your own explanation with a `"desc"` field in `buttons.json`.
 - **Right-click a button** → rename, edit the text/prompt, set an icon, switch on/off (toggle) mode, reorder (*Move left / Move right*), or remove.
 - The **⋮ menu** also holds **Language** (English / Dansk), a **Hover tooltips** on/off switch, and **Close panel**. The strip docks itself to the composer — there is no manual placement to fiddle with.
@@ -150,14 +151,14 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `targetTitle` | `"Claude"` | Substring the target window's title must contain. |
 | `targetProcess` | `"claude"` | Process name that must own the window. |
 | `uiaPaneMatch` | `" pane$"` | Regex; every Group whose accessibility name matches is treated as a chat pane (matches `Primary pane`, `Secondary pane`…). |
-| `uiaPaneName` | `"Primary pane"` | Legacy exact pane name (fallback). |
-| `uiaComposerName` | `"Prompt"` | Accessibility name of the chat composer the strip docks to. Change it here if a Claude update renames or localizes it. |
-| `uiaSidebarName` | `"Sidebar"` | Sidebar name, used to derive the chat area if no pane matches. |
+| `uiaComposerName` | `"Prompt"` | Accessibility name of the chat composer the strip docks to. **This is the knob to try first if a Claude update breaks the strip** — docking matches this name. |
 | `zoneTop` / `zoneBottom` | `45` / `55` | Logical-px zones where the chat title tab / bottom button row live. |
 | `fallbackRow` | `33` | Strip center above the window bottom when the button row can't be measured. |
 | `stripGap` | `10` | Gap (px) between the app's own buttons and the strip. |
 | `reservedW` | `380` | Width reserved for the app's own bar elements (compact-mode threshold). |
 | `relX` | `0.0` | Horizontal position within the pane (0–1). |
+| `vNudge` | `0` | Vertical nudge in px (+ down, − up). Use this when the strip sits a few px off after an app update. |
+| `tipsOff` | `false` | Hover tooltips off. Set from the ⋮ menu and written back here, so you may see it appear in your file. |
 | `lang` | `"en"` | UI language: `en` or `da`. |
 
 Per-button fields:
@@ -180,8 +181,8 @@ Per-button fields:
 
 ## Troubleshooting
 
-- **Strip sits slightly off, or per-chat/split-view buttons misbehave, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json` (`uiaPaneMatch`, `uiaPaneName`, `uiaSidebarName`, `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `reservedW`). Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
-- **App not in English?** Accessibility names like `Primary pane`/`Sidebar` may be localized — set `uiaPaneMatch` (and `uiaSidebarName`) to the localized names in `buttons.json`.
+- **Strip sits slightly off, or vanishes, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json`. **Start with `uiaComposerName`** (default `"Prompt"`): the strip docks by matching the composer's accessibility name, so a rename there is the most likely breakage and hides every strip. Then `uiaPaneMatch` (split/grid panes), then the geometry values `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `vNudge`, `reservedW`. Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
+- **App not in English?** Accessibility names like `Prompt` and `… pane` may be localized — set `uiaComposerName` and `uiaPaneMatch` to the localized names in `buttons.json`.
 - **`/pin` says unknown command, or does nothing** → restart the Claude app once so the skill loads; the skill writes to the file named in `%USERPROFILE%\.claude\claude-buttons-path.txt`.
 - **Nothing appears** → the strip only shows when the Claude window is the foreground window.
 - **Keyboard / screen-reader users:** the strip is a mouse-driven overlay that never takes focus. Use the `/pin` and `/unpin` skills (and hand-editing `buttons.json`) as the keyboard/AT path.
@@ -195,11 +196,15 @@ keystrokes always go to Claude). That has real limits, stated honestly:
   the ⋮ menu button announces as "Claude Buttons menu".
 - **Non-color cues**: per-chat buttons have a brightened border and toggle-on buttons show a filled
   dot — so scope and on/off aren't conveyed by color alone.
-- **Text contrast** is AAA (~8.9–10.9:1).
+- **Text contrast**: label text is ~8.9:1 on a resting pill and ~11.2:1 on the bare bar (both
+  AAA). A lit toggle draws its label in white on the active fill at ~5.1:1 (AA), and the
+  active fill separates from the bar at ~3.3:1 (1.4.11). These pairs are asserted by
+  `tests\panel.tests.ps1`, so the numbers cannot drift away from the code.
 - **Keyboard-only / AT users**: the strip itself is not keyboard-operable. Use the `/pin` and
   `/unpin` skills (and hand-editing `buttons.json`) as the equivalent path.
-- **Target size**: pills match the app's own ~20px chips rather than the 24px WCAG target, a
-  deliberate trade to look native in the bottom bar.
+- **Target size**: buttons are 27×27 logical px (DPI-scaled), which meets WCAG 2.2 SC 2.5.8
+  (24×24, AA). SC 2.5.5 (44×44, AAA) is not met — the strip deliberately matches the scale of
+  the app's own bottom-bar controls.
 
 ## Development & tests
 
