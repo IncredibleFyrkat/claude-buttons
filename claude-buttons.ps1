@@ -10,7 +10,7 @@
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.6.0'
+$CB_VERSION = '1.6.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -332,6 +332,8 @@ $script:uiaPaneMatch = ' pane$'
 if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config.uiaPaneMatch }
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
+$script:uiaChatName = 'Chat messages'   # accessibility name of the chat column inside a pane
+if ($script:config.uiaChatName) { $script:uiaChatName = [string]$script:config.uiaChatName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
 if ($script:config.zoneTop) { $script:zoneTop = [int]$script:config.zoneTop }
 $script:zoneBottom = 55                 # height of the bottom zone holding the app's own buttons
@@ -716,11 +718,24 @@ $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRect
 
 # Measure one chat pane: geometry, displayed chat title, bottom button row.
 # Must run inside an active $script:uiaCache scope (reads .Cached.*).
-function Measure-Pane($pane, $wr, $btnCond) {
+function Measure-Pane($pane, $wr, $btnCond, $chatCond) {
     $pr = $pane.Cached.BoundingRectangle
     $paneBottom = $pr.Y + $pr.Height
+    # In-chat side panels (background tasks, previews) live INSIDE the pane group and widen
+    # it far past the chat itself. Clamp the effective width to the chat column so the strip
+    # docks under the chat, not centered across chat + panel.
+    $effW = [double]$pr.Width
+    if ($chatCond) {
+        $chat = $pane.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $chatCond)
+        if ($chat) {
+            $cr = $chat.Cached.BoundingRectangle
+            $cRight = $cr.X + $cr.Width
+            # Only clamp when a panel clearly occupies the right side (margin beats rounding noise)
+            if ($cr.Width -gt 0 -and $cRight -lt ($pr.X + $pr.Width - (SW 60))) { $effW = $cRight - $pr.X }
+        }
+    }
     $info = @{
-        OffL = [int]($pr.X - $wr.Left); OffT = [int]($pr.Y - $wr.Top); Width = [int]$pr.Width
+        OffL = [int]($pr.X - $wr.Left); OffT = [int]($pr.Y - $wr.Top); Width = [int]$effW
         BottomOff = [int][Math]::Max(0, $wr.Bottom - $paneBottom)
         Title = $null; RowCenter = $null; LeftOff = $null
     }
@@ -737,7 +752,7 @@ function Measure-Pane($pane, $wr, $btnCond) {
     foreach ($b in $btns) {
         $br = $b.Cached.BoundingRectangle
         $cy = $br.Y + $br.Height / 2
-        if ($cy -gt ($paneBottom - (SW $script:zoneBottom)) -and $cy -lt $paneBottom -and $br.X -ge $pr.X -and $br.X -lt ($pr.X + $pr.Width / 2)) {
+        if ($cy -gt ($paneBottom - (SW $script:zoneBottom)) -and $cy -lt $paneBottom -and $br.X -ge $pr.X -and $br.X -lt ($pr.X + $effW / 2)) {
             $sumY += $cy; $n++
             $re = $br.X + $br.Width
             if ($null -eq $rightEdge -or $re -gt $rightEdge) { $rightEdge = $re }
@@ -766,6 +781,8 @@ function Update-UiaInfo {
         $prevGeoSig = ($script:panes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.RowCenter)" }) -join '|'
 
         $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+        $chatCond = New-Object System.Windows.Automation.AndCondition($grpType,
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaChatName)))
 
         # Activate the property cache for every UIA query below (root, panes, buttons).
         $cacheScope = $script:uiaCache.Activate()
@@ -780,7 +797,7 @@ function Update-UiaInfo {
         }
         $newPanes = @()
         if ($found.Count -gt 0) {
-            foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond) }
+            foreach ($p in $found) { $newPanes += (Measure-Pane $p $wr $btnCond $chatCond) }
             # Reading order: rows top-to-bottom, then left-to-right
             $newPanes = @($newPanes | Sort-Object @{ e = { [int]($_.OffT / 100) } }, @{ e = { $_.OffL } })
         } else {

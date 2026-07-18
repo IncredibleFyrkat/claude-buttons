@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.1 — 2026-07-18
+
+- **Strip no longer drifts when an in-chat panel is open.** Background tasks / preview panels
+  live *inside* the same "… pane" accessibility group as the chat, so the pane's width spanned
+  chat + panel and the strip was placed midway between them. `Measure-Pane` now clamps each
+  pane's effective width to its "Chat messages" column (when one is present and a panel clearly
+  occupies the right side), so the strip docks under the chat itself. The bottom button-row
+  scan uses the clamped width too, keeping the vertical anchor on the chat's own buttons.
+  The accessibility name is configurable via `uiaChatName` in `buttons.json` (default
+  `"Chat messages"`).
+
 ## 1.6.0 — 2026-07-17
 
 Final review band — accessibility + an actual test suite:
