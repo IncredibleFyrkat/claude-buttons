@@ -1724,12 +1724,34 @@ function Update-UiaInfo {
                 # button: walk left-to-right and stop at the first real gap. The genuine controls
                 # sit ~6px apart, so a tight threshold keeps out anything further right (a send/
                 # stop control that appears while typing, or the model label).
-                $rightEdge = $c.X; $sumY = 0.0; $n = 0
+                # Split the row into runs of TIGHTLY spaced controls and take the biggest, rather
+                # than assuming the cluster starts at the leftmost control. With the
+                # bypass-permissions chip on, a lone control sits ~145px left of the real icon
+                # cluster; walking from the left stopped on it immediately, so the strip docked
+                # before the app's own +/mic instead of after them. Measured spacing inside a
+                # real cluster is 6-7px, so 20px still separates runs cleanly.
+                $runs = @(); $cur = @()
+                $prevR = $null
                 foreach ($rb in ($rowBtns | Sort-Object X)) {
-                    if ($n -eq 0 -or $rb.X -le ($rightEdge + (SW 20))) {
+                    if ($null -ne $prevR -and $rb.X -gt ($prevR + (SW 20))) {
+                        if ($cur.Count) { $runs += , $cur }
+                        $cur = @()
+                    }
+                    $cur += $rb
+                    if ($null -eq $prevR -or $rb.R -gt $prevR) { $prevR = $rb.R }
+                }
+                if ($cur.Count) { $runs += , $cur }
+                # Most controls wins, leftmost breaks a tie. Picking the RIGHTMOST run instead
+                # would re-break the original case this walk exists for: a single stray control
+                # sitting past the cluster used to drag the dock with it.
+                $best = $null
+                foreach ($run in $runs) { if ($null -eq $best -or $run.Count -gt $best.Count) { $best = $run } }
+                $rightEdge = $c.X; $sumY = 0.0; $n = 0
+                if ($best) {
+                    foreach ($rb in $best) {
                         if ($rb.R -gt $rightEdge) { $rightEdge = $rb.R }
                         $sumY += $rb.CY; $n++
-                    } else { break }
+                    }
                 }
                 # The row's OUTERMOST controls, for the side bars to sit just beyond. $rowBtns is
                 # capped at the composer's left 60% to find the mic cluster, so it cannot give a
@@ -1755,7 +1777,7 @@ function Update-UiaInfo {
                 # Diagnostic: n is how many controls the cluster walk matched. When it is 0 the
                 # dock falls back to the composer's own left edge and a synthetic Y, which puts
                 # the strip at the far left and at the wrong height.
-                $script:dockDiag += ("{0}:n={1}/{2}" -f $newPanes.Count, $n, $rowBtns.Count)
+                $script:dockDiag += ("{0}:n={1}/{2}:runs={3}" -f $newPanes.Count, $n, $rowBtns.Count, $runs.Count)
                 if ($n -gt 0) {
                     $dockX = [int]$rightEdge
                     $dockY = [int]($sumY / $n)

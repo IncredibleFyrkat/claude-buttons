@@ -752,6 +752,41 @@ Check 'it resolves side strips (else their buttons cannot send)' ($fnSrc -match 
 Check 'it resolves flyout buttons via their owning strip' ($fnSrc -match 'flyForm')
 Check 'the side-strip map truncates rather than rounds' (($fnSrc -split "`n" | Where-Object { $_ -match 'sideStrips' -or $_ -match '\$idx = ' } | Where-Object { $_ -match '\[int\]\(\$i / 2\)' }).Count -eq 0)
 
+# --- The dock cluster is the biggest tight RUN, not the first one ---
+# Measured on a live grid: controls inside a cluster sit 6-7px apart, but with the
+# bypass-permissions chip on, a lone control sits ~145px to the LEFT of the real icon cluster.
+# Walking from the leftmost control stopped on that stray immediately (n=1 of 4), so the strip
+# docked before the app's own +/mic and drew over them - in that one pane, while the pane below
+# it was fine.
+function Pick-Run($items, [int]$gap) {
+    $runs = @(); $cur = @(); $prevR = $null
+    foreach ($rb in ($items | Sort-Object X)) {
+        if ($null -ne $prevR -and $rb.X -gt ($prevR + $gap)) { if ($cur.Count) { $runs += , $cur }; $cur = @() }
+        $cur += $rb
+        if ($null -eq $prevR -or $rb.R -gt $prevR) { $prevR = $rb.R }
+    }
+    if ($cur.Count) { $runs += , $cur }
+    $best = $null
+    foreach ($r in $runs) { if ($null -eq $best -or $r.Count -gt $best.Count) { $best = $r } }
+    $best
+}
+function B($x, $w) { [pscustomobject]@{ X = [double]$x; R = [double]($x + $w) } }
+
+# stray chip at 0..30, real cluster at 175 onward (the measured 145px gap)
+$bypass = @( (B 0 30), (B 175 27), (B 208 27), (B 241 27) )
+$pick = @(Pick-Run $bypass 20)
+Check 'the stray control is skipped for the real cluster' ($pick.Count -eq 3)
+Check 'the dock lands after the cluster, not after the stray' ((($pick | Measure-Object -Property R -Maximum).Maximum) -eq 268)
+
+# the original defect this walk exists for: one control sitting PAST the cluster
+$trailing = @( (B 0 27), (B 33 27), (B 66 27), (B 200 27) )
+$pick2 = @(Pick-Run $trailing 20)
+Check 'a lone control past the cluster is still excluded' ($pick2.Count -eq 3)
+Check 'the trailing stray does not drag the dock right' ((($pick2 | Measure-Object -Property R -Maximum).Maximum) -eq 93)
+
+$normal = @( (B 0 27), (B 33 27), (B 66 27), (B 99 27) )
+Check 'an ordinary row is one run, unchanged' ((@(Pick-Run $normal 20)).Count -eq 4)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
