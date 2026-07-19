@@ -722,6 +722,22 @@ Check 'dissolving keeps them in the group face position' ((($d | ForEach-Object 
 Check 'no member is left claiming the group' ((@($d | Where-Object { $_.group }).Count) -eq 0)
 Check 'they are now separate blocks, not one' ((@(Get-ButtonBlocks $d).Count) -eq 4)
 
+# --- Every strip window must resolve to a pane ---
+# Get-PaneForForm maps a strip's window to the pane whose composer it sends to. A window it
+# does not know returns $null, and the send falls back to picking a composer by geometry - which
+# in a grid is a neighbouring chat. Side strips were missing from it, so their buttons could not
+# send at all. Static check: every strip collection the panel creates must appear in the lookup.
+$fnSrc = ''
+$astP = [System.Management.Automation.Language.Parser]::ParseFile($panel, [ref]$null, [ref]$null)
+$fnNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PaneForForm' }, $true)
+if ($fnNode) { $fnSrc = $fnNode.Extent.Text }
+Check 'Get-PaneForForm was found' ($fnSrc.Length -gt 0)
+Check 'it resolves the primary strip' ($fnSrc -match '\$frm -eq \$form')
+Check 'it resolves mirror strips' ($fnSrc -match 'script:mirrors')
+Check 'it resolves side strips (else their buttons cannot send)' ($fnSrc -match 'script:sideStrips')
+Check 'it resolves flyout buttons via their owning strip' ($fnSrc -match 'flyForm')
+Check 'the side-strip map truncates rather than rounds' (($fnSrc -split "`n" | Where-Object { $_ -match 'sideStrips' -or $_ -match '\$idx = ' } | Where-Object { $_ -match '\[int\]\(\$i / 2\)' }).Count -eq 0)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

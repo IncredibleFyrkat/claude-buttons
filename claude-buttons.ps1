@@ -2897,6 +2897,16 @@ function Get-PaneForForm($frm) {
             return $null
         }
     }
+    # Side strips: two per pane, so strip i belongs to pane i/2. Without this a side-bar button
+    # had NO bound composer, so the send fell back to guessing by geometry and the text landed
+    # in the wrong box - which the paste verification then correctly refused to send.
+    for ($i = 0; $i -lt $script:sideStrips.Count; $i++) {
+        if ($script:sideStrips[$i].Form -eq $frm) {
+            $idx = [int][Math]::Floor($i / 2)   # [int] ROUNDS in PowerShell
+            if ($idx -lt $script:panes.Count) { return $script:panes[$idx] }
+            return $null
+        }
+    }
     return $null
 }
 
