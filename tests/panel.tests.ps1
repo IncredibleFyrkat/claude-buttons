@@ -799,6 +799,37 @@ Check 'the trailing stray does not drag the dock right' ((($pick2 | Measure-Obje
 $normal = @( (B 0 27), (B 33 27), (B 66 27), (B 99 27) )
 Check 'an ordinary row is one run, unchanged' ((@(Pick-Run $normal 20)).Count -eq 4)
 
+# --- The clipboard must not go back while a paste can still be pending ---
+# Ctrl+V is queued; the app reads the clipboard when it gets round to it. Restoring the user's
+# clipboard on an UNCONFIRMED paste hands that pending read their own data, which is how an
+# image from the user's clipboard ended up attached to a chat. Only a CONFIRMED paste proves
+# the read already happened. Asserts on the click path's actual restore calls, not on prose.
+$clickNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-PillClick' }, $true)
+Check 'Invoke-PillClick was found' ($null -ne $clickNode)
+$clickSrc = if ($clickNode) { $clickNode.Extent.Text } else { '' }
+Check 'the click path never restores the clipboard inline (it must route through the helpers)' `
+    ($clickSrc -notmatch 'Clipboard\]::SetDataObject\(\s*\$backup')
+Check 'an unconfirmed paste defers the restore' ($clickSrc -match 'Restore-ClipboardLater')
+Check 'a confirmed paste restores immediately' ($clickSrc -match 'Restore-ClipboardNow')
+# The routing must be ON the confirmed flag: both helpers being called somewhere is not enough,
+# and swapping them would leave every assertion above green.
+$restoreBlock = [regex]::Match($clickSrc, 'if \(\$pasted\)[^\r\n]*\r?\n?[^\r\n]*').Value
+Check 'the immediate restore is the one gated on $pasted' `
+    ($restoreBlock -match 'Restore-ClipboardNow' -and $restoreBlock -notmatch 'Restore-ClipboardLater\s*\}?\s*$')
+
+$laterNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Restore-ClipboardLater' }, $true)
+Check 'Restore-ClipboardLater was found' ($null -ne $laterNode)
+$laterSrc = if ($laterNode) { $laterNode.Extent.Text } else { '' }
+# It must not block the UI thread: the panel's strips all run on it, so sleeping out the grace
+# window would freeze every button for its duration.
+Check 'the deferred restore does not sleep on the UI thread' ($laterSrc -notmatch 'Start-Sleep')
+Check 'the deferred restore uses a timer' ($laterSrc -match 'Forms\.Timer')
+$delay = [regex]::Match($laterSrc, '\[int\]\$delayMs = (\d+)')
+Check 'the grace window is long enough to outlast a slow paste' `
+    ($delay.Success -and ([int]$delay.Groups[1].Value -ge 3000))
+# A second click inside the window must supersede the first, not stack another restore.
+Check 'a pending restore is superseded, not duplicated' ($laterSrc -match '\$script:clipRestoreTimer')
+
 # --- The log dedupe must survive INTERLEAVED messages ---
 # The poll emits two different status lines per pass. A dedupe that remembers only the LAST
 # message written suppresses neither, because each differs from the one immediately before it -

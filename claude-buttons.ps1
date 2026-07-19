@@ -3035,7 +3035,11 @@ function Get-ComposerPlaceholder($el) {
     } catch { return $null }
 }
 
-function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 1200) {
+# 1200ms was too short to be a timeout and long enough to look like one. A busy app (seven
+# panes, a UIA scan every 1.5s) took longer than that to process a queued Ctrl+V, so ordinary
+# sends were reported as failed pastes. The poll returns the instant the text matches, so a
+# longer ceiling costs nothing on the healthy path and only buys patience on the slow one.
+function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 3000) {
     # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
     # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
     # terminator in the MIDDLE of the expected string ("draft\n/cmd") while the paste appends
@@ -3227,6 +3231,52 @@ function Set-ToggleFace($item, [bool]$on) {
     }
 }
 
+# Put the user's clipboard back. Only ever called once the app has demonstrably consumed our
+# paste, or once enough time has passed that a queued Ctrl+V cannot still be pending.
+# Skips the restore if another app copied something meanwhile, rather than clobbering it.
+function Restore-ClipboardNow($backup, $seqAfterSet) {
+    try {
+        $seqNow = [CkWin]::GetClipboardSequenceNumber()
+        if ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet) {
+            [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true)
+        } else {
+            Write-CkLog 'Clipboard changed by another app mid-send; left it alone'
+        }
+    } catch {}
+}
+
+# Deferred restore for every non-confirmed outcome. Our own payload stays on the clipboard for
+# the grace window, so a paste that arrives late inserts the BUTTON'S OWN TEXT - which is
+# already what the user asked for and is never sent without confirmation - instead of whatever
+# they had copied. Non-blocking on purpose: the panel's UI runs on this thread, and sleeping
+# here to wait out the window would freeze every strip for the duration.
+$script:clipRestoreTimer = $null
+$script:clipRestorePayload = $null
+function Restore-ClipboardLater($backup, $seqAfterSet, [int]$delayMs = 6000) {
+    # One pending restore at a time. A second click inside the window supersedes the first:
+    # its snapshot is the more recent view of the user's clipboard, and firing both would
+    # restore a stale one on top of it.
+    if ($script:clipRestoreTimer) {
+        try { $script:clipRestoreTimer.Stop(); $script:clipRestoreTimer.Dispose() } catch {}
+        $script:clipRestoreTimer = $null
+    }
+    $script:clipRestorePayload = @{ Backup = $backup; Seq = $seqAfterSet }
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = $delayMs
+    $t.Add_Tick({
+            param($s, $e)
+            try { $s.Stop() } catch {}
+            $p = $script:clipRestorePayload
+            if ($p) { Restore-ClipboardNow $p.Backup $p.Seq }
+            $script:clipRestorePayload = $null
+            $script:clipRestoreTimer = $null
+            try { $s.Dispose() } catch {}
+        })
+    $script:clipRestoreTimer = $t
+    $t.Start()
+    Write-CkLog "Paste unconfirmed; holding our text on the clipboard for ${delayMs}ms so a late paste cannot deliver the user's clipboard"
+}
+
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
     # A group button has nothing to send: it opens (or pins open) its flyout instead. Checked
@@ -3363,13 +3413,19 @@ function Invoke-PillClick($btn) {
                 # M1: restore the full prior clipboard - but only if nothing else wrote to it
                 # meanwhile, or we would clobber another app's copy with stale content. If the
                 # snapshot itself failed we leave our text rather than guess.
+                #
+                # WHEN the restore happens is a safety property, not a detail. Ctrl+V is queued:
+                # the app reads the clipboard whenever it gets round to it. On a CONFIRMED paste
+                # that read has demonstrably already happened, so restoring now is safe. On any
+                # other outcome it has NOT, and restoring immediately hands the still-pending
+                # paste the user's own clipboard - which is how a slow app turned a harmless
+                # timeout into an image from the user's clipboard appearing in the composer,
+                # attached to a chat they were about to send. Fail-closed on the SEND path is
+                # not enough on its own; the clipboard has to stay ours until the keystroke can
+                # no longer be in flight.
                 if ($snapOk) {
-                    $seqNow = [CkWin]::GetClipboardSequenceNumber()
-                    if ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet) {
-                        try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {}
-                    } else {
-                        Write-CkLog 'Clipboard changed by another app mid-send; left it alone'
-                    }
+                    if ($pasted) { Restore-ClipboardNow $backup $seqAfterSet }
+                    else { Restore-ClipboardLater $backup $seqAfterSet }
                 }
             }
             # FAIL CLOSED. Do not type, do not press Enter, do not undo, do not clear.
