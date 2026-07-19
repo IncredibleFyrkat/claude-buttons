@@ -3020,15 +3020,27 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     if ([string]::IsNullOrWhiteSpace($payload)) { return 'Mismatch' }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     $sawText = $false
+    $last = $null
     while ((Get-Date) -lt $deadline) {
         $now = Get-ComposerText $el
         if ($null -ne $now) {
             $sawText = $true
-            if ((($now -replace "`r`n", "`n").TrimEnd("`n")) -eq $want) { return 'Confirmed' }
+            $last = ($now -replace "`r`n", "`n").TrimEnd("`n")
+            if ($last -eq $want) { return 'Confirmed' }
         }
         Start-Sleep -Milliseconds 15
     }
-    if ($sawText) { return 'Mismatch' }
+    if ($sawText) {
+        # Where the two diverge, by position and character CODE - never the text itself, which
+        # is the user's prompt and has no business in a log file.
+        $k = 0
+        while ($k -lt $want.Length -and $k -lt $last.Length -and $want[$k] -eq $last[$k]) { $k++ }
+        $wc = if ($k -lt $want.Length) { [int][char]$want[$k] } else { -1 }
+        $nc = if ($k -lt $last.Length) { [int][char]$last[$k] } else { -1 }
+        Write-CkLog ("PASTEDIFF wantLen={0} gotLen={1} baseLen={2} firstDiff={3} wantChr={4} gotChr={5}" -f `
+            $want.Length, $last.Length, $base.Length, $k, $wc, $nc)
+        return 'Mismatch'
+    }
     return 'Unverifiable'
 }
 
