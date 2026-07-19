@@ -164,6 +164,9 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `vNudge` | `0` | Vertical nudge in px (+ down, − up). Use this when the strip sits a few px off after an app update. |
 | `tipsOff` | `false` | Hover tooltips off. Set from the ⋮ menu and written back here, so you may see it appear in your file. |
 | `lang` | `"en"` | UI language: `en` or `da`. |
+| `groups` | `{}` | Group definitions, keyed by group name: `{ "ops": { "icon": "settings", "label": "Ops" } }`. A group appears once a button carries its name in `group`, and its definition is dropped automatically when the last member leaves. **Keys are matched case-insensitively** — a group name is a JSON key, and PowerShell's JSON reader refuses a file containing keys that differ only in case, so `Ops` and `ops` are folded into one rather than allowed to become a file the panel cannot read. |
+| `colors` | `{}` | Per-kind button colour, keyed by kind: `prompt`, `command`, `group`, `toggle`. Set from the ⋮ menu. Kind is derived from the button, not stored, so a newly pinned slash command picks up the command colour. |
+| `kebabBar` | `"row"` | Which strip the ⋮ menu handle sits on: `row`, `left` or `right`. |
 
 Per-button fields:
 
@@ -182,6 +185,8 @@ Per-button fields:
 | `chatTitle` | The displayed chat title this button binds to (preferred per-chat match). |
 | `chatLabel` | Human description shown in the tooltip for a per-chat button. |
 | `desc` | Extra explanation shown at the top of the hover tooltip. |
+| `bar` | Which strip the button lives on: `row` (default, the bottom row), `left` or `right` (a vertical strip in the pane margin). |
+| `group` | Name of the group this button belongs to. Grouped buttons collapse into one face on the bar and appear in its hover flyout. Matched case-insensitively — see below. |
 
 ## Troubleshooting
 

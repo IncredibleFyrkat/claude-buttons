@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.10.0 — 2026-07-19
+
+**Side bars, groups, and per-kind colours.** Contributed by
+[@RasmusKD](https://github.com/RasmusKD) in [#5](https://github.com/IncredibleFyrkat/claude-buttons/pull/5),
+with fixes on top before merging.
+
+- **Vertical side bars.** Buttons can move to a strip in the left or right pane margin, so a
+  long row does not have to stay a long row. The kebab can move there too. Buttons reorder
+  within a bar with move up/down.
+- **Groups.** Several buttons collapse into one face on the bar; hovering opens a flyout with
+  the members. A group carries its own icon and label. "Move to group" is a submenu of the
+  groups that exist rather than a box you type a name into — a group shows as a glyph, so its
+  name was not written anywhere on screen and a typo silently created a second group.
+- **Per-kind colours.** Prompts, slash commands, groups and toggles can each take a colour.
+  Kind is derived rather than stored, so a newly pinned slash command picks up the command
+  colour automatically. The toggle ON state is deliberately not colourable: white on its fill
+  is 5.11:1, and every palette entry lands at 1.97–2.44:1, so there is no choice that is not a
+  contrast regression.
+- **Reordering moves blocks, not entries.** Move left/right used to swap two adjacent array
+  entries, which dragged one member out of a group and left the rest behind, or landed a plain
+  button *inside* a group. A group is now one block sitting at its first member.
+- **Icons are optically centred.** `DrawString` centres the font's metrics box — advance width
+  plus full line height — not the ink. The download glyph sat exactly 1px high and the kebab
+  dots a row low. Ink bounds are now measured once per glyph and cached.
+- Group buttons could not be edited at all: the flyout covered the button, and "Set icon" and
+  "Rename" wrote through a path that walks the buttons array, which a synthetic group face is
+  never in. Both reported success and saved nothing.
+
+Fixed before merging, found by review:
+
+- **Buttons on a side bar could send to the wrong chat**, and usually did nothing at all. The
+  pane resolver knew only the row strip and its mirrors, so a side-bar click fell through to a
+  geometric guess whose own comment warns it "can select the neighbouring pane's composer".
+  The guess is now refused from a side strip — the send is abandoned and says so.
+- **`Update-Config` could destroy every pinned button.** Its guard rejected only `$null`, so a
+  transform returning anything else wrote that over `buttons.json` — after which the panel
+  falls back to defaults, so it reads as a spontaneous reset rather than as a failure.
+- **The colour picker showed no colours.** Every swatch rendered grey, so you picked blind.
+- **Hover and the toggle ON state were invisible inside the flyout** (1.04:1 and 2.69:1). Fixed
+  with a state ring rather than a brighter fill — a fill bright enough to clear 3:1 against
+  that surface would have dragged the icon on top of it below 4.5:1.
+- **Dissolving a group** discarded its icon and label permanently, with no confirmation, from a
+  menu item sitting next to "Remove this button". It confirms now.
+- **Group names are case-insensitive, deliberately** — unlike button labels, which are
+  case-sensitive because a label+text *is* the prompt that gets sent. A group name is a JSON
+  key, and PowerShell's JSON reader throws on keys differing only in case, so a case-sensitive
+  group name would let the panel write a config it could never read back.
+
+**Config keys added:** `bar` and `group` on a button, plus `groups`, `colors` and `kebabBar` at
+the top level. A config written by this version still loads and round-trips through 1.7.3
+without losing them.
+
 ## 1.9.1 — 2026-07-19
 
 **1.8.0 and 1.8.1 both shipped a panel that refused to send any formatted button. This is the
@@ -44,14 +96,28 @@ Measured against the real 12,752-character paste: genuine paste confirmed; stale
 instead, before, or after the payload all refused; half the payload refused; eleven stray
 characters refused; ten substituted words refused.
 
-**Known limits, stated plainly.** On a long button, a substitution that swaps up to 2% of the
-words while preserving the total length stays inside the coverage allowance — this is a
-similarity check, not a content signature. An earlier draft of this entry claimed such a
-substitution "is not reachable by a stale clipboard"; that was wrong, and a review demonstrated
-a 156-character clipboard-shaped append that passed. The allowance for short buttons has since
-been cut from half the payload to a quarter, and the separate non-alphanumeric bound closes the
-punctuation case, but the residual on long buttons is real. Verification also still assumes the
-paste is the only change to the box while it is happening.
+**Known limits, stated plainly.** This is a similarity check, not a content signature. A
+substitution that swaps words while preserving the total length can stay inside the coverage
+allowance, and **the allowance is much larger on short buttons than on long ones**. It is
+`min(max(3, 2%·n), floor(n/4))` words out of `n`, which works out as:
+
+| button length | words that may differ undetected |
+|---|---|
+| 2–3 words | 0 |
+| 4–11 words | 1 — i.e. **up to 25%** |
+| 12–149 words | 3 |
+| 150+ words | 2% |
+
+Measured: a four-word button reading back with one word changed is confirmed and sent. Two
+earlier drafts of this paragraph were wrong about this — one claimed such a substitution "is not
+reachable by a stale clipboard" (a review then demonstrated a 156-character clipboard-shaped
+append that passed), and one quoted the 2% figure as if it applied generally, understating the
+real allowance for typical buttons by an order of magnitude.
+
+The separate size bounds are a second lock and a stronger one: anything that changes the total
+length is caught, so exploiting the above requires a length-preserving substitution. The
+non-alphanumeric bound closes the punctuation and emoji case. Verification also still assumes
+the paste is the only change to the box while it is happening.
 
 ## 1.8.1 — 2026-07-19
 
