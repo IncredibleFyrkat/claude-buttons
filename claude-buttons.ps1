@@ -1998,7 +1998,10 @@ function Show-GroupFlyout($btn, [bool]$pin) {
         # is what says which button the flyout belongs to when several sit stacked together.
         $vBar = Get-ButtonBar $tag
         if ($vBar -ne 'row') {
-            $onRight = ($vBar -eq 'left')      # a LEFT bar opens to the right, and vice versa
+            # StemOnRight means the stem leaves the pill's RIGHT edge, i.e. the pill sits to the
+            # LEFT of the button - which is what a RIGHT-hand bar needs so it opens inward over
+            # the chat rather than outward off the edge of the window.
+            $onRight = ($vBar -eq 'right')
             $stemH = $btn.Height + 2 * (S 3)
             $runH = 0
             foreach ($mb in $mbs) { $runH += $mb.Height }
