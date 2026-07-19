@@ -6,6 +6,8 @@
     ... -Uninstall    (remove everything this installer added)
     ... -InstallDir "C:\path"   (override install location)
     ... -Shutdown     (also install the optional shutdown feature without prompting)
+    ... -OneClickArm  (with -Shutdown: arm from the panel in ONE click, no approval prompt.
+                       Read the note on Grant-ShutdownAllowRules before using it.)
     ... -NoAutostart / -Autostart   (skip / force the startup shortcut without prompting)
 
   What it does (core):
@@ -23,6 +25,7 @@ param(
     [switch]$Uninstall,
     [string]$InstallDir,
     [switch]$Shutdown,
+    [switch]$OneClickArm,
     [switch]$Autostart,
     [switch]$NoAutostart
 )
@@ -179,10 +182,26 @@ function Assert-JsonDepthSafe($obj) {
 #     Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $rv)"
 # - the grant line does not contain the literal, and the line that does is not a grant line.
 # Testing the resulting permission set is immune to how the verb is spelled.
-function Grant-ShutdownAllowRules($settings, [string]$scriptFwd) {
+function Grant-ShutdownAllowRules($settings, [string]$scriptFwd, [bool]$oneClickArm = $false) {
     Remove-AllowRules $settings 'shutdown-on-done.mjs'   # drop any old wildcard rule first
     # request-on is deliberately absent - see the SEC-01 note at the call site.
-    foreach ($verb in @('request-off', 'on --this-turn', 'off', 'status')) {
+    $verbs = @('request-off', 'on --this-turn', 'off', 'status')
+    # OPT-IN, OFF BY DEFAULT. Granting request-on removes the ONLY approval step in the arming
+    # chain, so the panel arms in one click - and so does anything else running as this user.
+    #
+    # Be honest about what this trades. It is tempting to keep a gate by having the panel write
+    # a consent file that the engine checks, but that is not a gate: the agent runs shell
+    # commands as the same user, so any file the panel can write, it can write too. The
+    # approval prompt is the only barrier the agent cannot reach around, because the harness
+    # enforces it outside the agent's control. So the choice is binary - keep the prompt, or
+    # accept that arming is agent-reachable - and a file-based "gate" only obscures which one
+    # you picked.
+    #
+    # The blast radius is a 60s countdown that `shutdown -a` aborts, which is why this is
+    # offered at all. For anyone who leaves the machine arming itself unattended, or who lets
+    # agents read untrusted content, the default (prompt on every arm) is the right setting.
+    if ($oneClickArm) { $verbs += 'request-on' }
+    foreach ($verb in $verbs) {
         Ensure-AllowRule $settings "Bash(node `"$scriptFwd`" toggle $verb)"
         Ensure-AllowRule $settings "Bash(node $scriptFwd toggle $verb)"
     }
@@ -364,7 +383,12 @@ if ($wantShutdown) {
         # request-on off the list costs the legitimate flow exactly one approval, which the
         # user is present to give (they just clicked the button), and restores the gate's
         # two sides to different principals. Disarming stays friction-free on purpose.
-        Grant-ShutdownAllowRules $settings $scriptFwd
+        # -OneClickArm waives that approval deliberately; the trade is written out in full at
+        # Grant-ShutdownAllowRules. It stays off unless the flag is passed.
+        Grant-ShutdownAllowRules $settings $scriptFwd ([bool]$OneClickArm)
+        if ($OneClickArm) {
+            Write-Host "  ! One-click arming enabled: no approval prompt. 'shutdown -a' aborts a countdown." -ForegroundColor Yellow
+        }
         Save-Settings $settings
         # Legacy skills out (superseded by /shutdown-on-done)
         foreach ($s in @('close-pc-on-done','cancel-close-pc')) {
@@ -379,7 +403,11 @@ if ($wantShutdown) {
                 $cfg.buttons = @($cfg.buttons) + [pscustomobject]@{
                     label = 'Shutdown on done'; short = 'Shutdown'; icon = 'power'
                     desc = 'Shuts the PC down once this chat is COMPLETELY done with all its work (agent-judged, 60 s grace). Lit while a request is standing; click again to cancel.'
-                    toggle = $true; confirm = $true
+                    # No two-click confirm: this is a REVERSIBLE toggle whose off is one click
+                    # and never gated, and the power-off itself has a 60s countdown that
+                    # `shutdown -a` aborts. A confirm here bought nothing and cost a click on
+                    # the one button people press when they are already leaving the desk.
+                    toggle = $true
                     stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
                     text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
                 Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100)

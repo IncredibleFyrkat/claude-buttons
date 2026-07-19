@@ -228,6 +228,37 @@ Check 'status IS pre-authorised' ([bool]($rules | Where-Object { $_ -match 'togg
 Check 'on --this-turn IS pre-authorised (the arm itself, gated by the request marker)' `
     ([bool]($rules | Where-Object { $_ -match 'toggle\s+on\s+--this-turn' }))
 
+# ---- -OneClickArm: the waiver is OPT-IN and must stay that way ------------------------------
+# The flag removes the last approval in the arming chain on purpose. Two things are pinned:
+# it actually works when asked for, and it is NEVER on unless asked for - a default that
+# silently drifted to granted would hand every existing install a power-off with no prompt.
+Set-Settings '{}'
+$oneClick = Get-Settings
+Grant-ShutdownAllowRules $oneClick 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs' $true
+$ocRules = @($oneClick.permissions.allow)
+Check '-OneClickArm DOES pre-authorise request-on (that is its whole job)' `
+    ([bool]($ocRules | Where-Object { $_ -match 'toggle\s+request-on' }))
+Check '-OneClickArm still grants no wildcard (SEC-02 holds either way)' `
+    (-not ($ocRules | Where-Object { $_ -match 'toggle\s+\*' }))
+
+# Passing nothing must behave exactly like passing $false: a default parameter that flipped
+# would be invisible here otherwise, because every other assertion above passes either way.
+Set-Settings '{}'
+$defaulted = Get-Settings
+Grant-ShutdownAllowRules $defaulted 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs'
+Set-Settings '{}'
+$explicitOff = Get-Settings
+Grant-ShutdownAllowRules $explicitOff 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs' $false
+Check 'omitting the flag grants exactly what passing $false grants' `
+    ((@($defaulted.permissions.allow) -join '|') -eq (@($explicitOff.permissions.allow) -join '|'))
+
+# The default power button must not carry a two-click confirm: disarm is one click and never
+# gated, so a confirm only ever slowed down the arm.
+$btnBlock = (Get-Content (Join-Path $repo 'install.ps1') -Raw)
+$btnDef = [regex]::Match($btnBlock, "label\s*=\s*'Shutdown on done'.*?submit\s*=\s*\`$true", 'Singleline').Value
+Check 'the default shutdown button definition was found' ($btnDef.Length -gt 0)
+Check 'the default shutdown button has no two-click confirm' ($btnDef -notmatch 'confirm\s*=\s*\$true')
+
 # Granting twice must not duplicate: -Update re-runs this on every upgrade.
 $before = @($granted.permissions.allow).Count
 Grant-ShutdownAllowRules $granted 'C:/Users/test/.claude/hooks/shutdown-on-done.mjs'
