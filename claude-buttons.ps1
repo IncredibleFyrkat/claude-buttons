@@ -863,17 +863,40 @@ function Write-InstallMarker {
 $script:cfgLockName = if ($env:CB_CONFIG_LOCK) { $env:CB_CONFIG_LOCK } else { 'Local\ClaudeButtonsConfig' }
 $script:cfgLock = New-Object System.Threading.Mutex($false, $script:cfgLockName)
 
+# The exact text the current in-memory config was PARSED FROM. Write-ConfigAtomic compares the
+# file against this before replacing it, which is how a hand edit made during a panel change
+# stops being silently erased (see the comment there).
+#
+# It is set by the READ and never by a write, and that is the whole point. The obvious version
+# of this check - "has buttons.json changed since the panel last touched it" - is anchored on
+# the wrong event: the panel writes this file on every pin, rename, move and colour change, so
+# such a check either compares against the panel's own output (and never fires) or fires on
+# every single edit the panel makes. Anchoring on the read means the question asked is the one
+# that matters: is the file still what this pending change was computed from?
+$script:cfgReadRaw = $null
+# Set when a write was REFUSED because the file moved underneath it, so the caller can tell the
+# user instead of returning $false into silence. Reset by Notify-ConfigClobber.
+$script:cfgClobber = $false
+
 function Read-FreshConfig {
     $lastErr = ''
     for ($i = 0; $i -lt 3; $i++) {
         try {
-            $c = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            # Keep the raw text, and keep it from the SAME call that was parsed - re-reading the
+            # file to get a token would leave a window in which the two disagree, which is the
+            # very race this exists to close.
+            $raw = Get-Content $configPath -Raw -Encoding UTF8
+            $c = $raw | ConvertFrom-Json
             # Normalize: a valid JSON file missing the buttons array must not crash callers
             if ($null -eq $c.buttons) { $c | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
+            $script:cfgReadRaw = $raw
             return $c
         }
         catch { $lastErr = [string]$_.Exception.Message; Start-Sleep -Milliseconds 120 }
     }
+    # No successful read means no baseline. Leaving a stale one here would let the NEXT write
+    # validate against a file version nobody read.
+    $script:cfgReadRaw = $null
     # Name the one unreadable-config cause a user can create by hand and could never diagnose
     # from a generic message: PS 5.1's ConvertFrom-Json THROWS on an object carrying two keys
     # that differ only in case ("Deploy" and "deploy"). The panel then falls back to defaults,
@@ -890,9 +913,39 @@ function Read-FreshConfig {
     return $null
 }
 
-function Write-ConfigAtomic($cfg) {
+# $expectRaw is the text the caller's change was computed from - $script:cfgReadRaw as captured
+# right after ITS OWN Read-FreshConfig. Pass $null only when there is genuinely no baseline.
+function Write-ConfigAtomic($cfg, $expectRaw) {
     for ($i = 0; $i -lt 3; $i++) {
         try {
+            # LOST-UPDATE GUARD. The config mutex only binds writers that take it. A user editing
+            # buttons.json in Notepad, or any tool that is not this panel, takes nothing - and
+            # this function replaces the WHOLE file, so their save was erased by whatever the
+            # panel happened to be doing. Read-FreshConfig inside the lock narrows the window to
+            # the duration of one transform, but a transform is not instant and nothing detected
+            # the overlap.
+            #
+            # Checked INSIDE the retry loop, not once above it: attempts 2 and 3 happen 150ms
+            # apart after an IO failure, and an external save landing in that gap would sail
+            # straight through a check that only ran before the first attempt.
+            #
+            # -cne, not -ne: -ne is case-insensitive, so a hand edit that only changed a label
+            # from "deploy" to "Deploy" would compare equal and be overwritten. Same reasoning as
+            # Same-Button.
+            #
+            # A file that cannot be read right now ($cur -eq $null) is NOT treated as a conflict:
+            # it is almost always a momentary share violation, and refusing there would turn a
+            # transient lock into a lost user edit - the failure this is meant to prevent.
+            if ($null -ne $expectRaw) {
+                $cur = $null
+                try { $cur = Get-Content $configPath -Raw -Encoding UTF8 } catch { $cur = $null }
+                if ($null -ne $cur -and $cur -cne $expectRaw) {
+                    $script:cfgClobber = $true
+                    Write-CkLog ('buttons.json was changed by something else after the panel read it - ' +
+                                 'refusing to overwrite. The panel-side change was NOT saved; the file on disk is intact.')
+                    return $false
+                }
+            }
             $tmp = "$configPath." + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp'
             # Depth 100, not 6: PS 5.1 does not error past -Depth, it stringifies the over-deep
             # node into "@{k=v}", silently and irreversibly corrupting anything nested that a
@@ -987,6 +1040,8 @@ $script:strings = @{
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
         sendNoPane = 'Not sent: the panel could not tell which chat this button belongs to, so it did not risk sending to the wrong one. Click the chat, then try again.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
+        removeAmbiguous = 'Not removed: two or more buttons have exactly the same name, text and scope, so the panel cannot tell which one you clicked. Rename or retype one of them first. Nothing was changed.'
+        cfgClobber = 'Not saved: buttons.json was changed by something else while this edit was being made, so the panel did not overwrite it. The change you just made was dropped - the file was not. The panel has reloaded; try again.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
         firstRun = 'Click the menu button to add buttons'
@@ -1023,6 +1078,8 @@ $script:strings = @{
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
         sendNoPane = 'Ikke sendt: panelet kunne ikke afgøre hvilken chat denne knap hører til, så det undlod at sende til den forkerte. Klik på chatten, og prøv igen.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
+        removeAmbiguous = 'Ikke fjernet: to eller flere knapper har præcis samme navn, tekst og scope, så panelet kan ikke afgøre hvilken du klikkede på. Omdøb eller ret teksten på den ene først. Intet blev ændret.'
+        cfgClobber = 'Ikke gemt: buttons.json blev ændret af noget andet mens denne redigering blev lavet, så panelet undlod at overskrive den. Den ændring du lige lavede blev kasseret - filen blev ikke. Panelet har genindlæst; prøv igen.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
         firstRun = 'Klik på menuknappen for at tilføje knapper'
@@ -1059,6 +1116,7 @@ function Save-PanelState {
     try {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return }
+        $expect = $script:cfgReadRaw   # snapshot NOW: any later read would move the baseline
         $fresh | Add-Member -NotePropertyName schemaVersion -NotePropertyValue 1 -Force
         $fresh | Add-Member -NotePropertyName targetTitle -NotePropertyValue $targetTitle -Force
         $fresh | Add-Member -NotePropertyName targetProcess -NotePropertyValue $targetProcess -Force
@@ -1067,8 +1125,23 @@ function Save-PanelState {
         $fresh | Add-Member -NotePropertyName tipsOff -NotePropertyValue ([bool]$script:tipsOff) -Force
         # Strip is statically docked; drop any legacy free-placement / offset fields.
         foreach ($legacy in @('freeX', 'freeY', 'x', 'y', 'offsetX', 'offsetY', 'offsetBottom')) { $fresh.PSObject.Properties.Remove($legacy) }
-        [void](Write-ConfigAtomic $fresh)
-    } finally { [void]$script:cfgLock.ReleaseMutex() }
+        [void](Write-ConfigAtomic $fresh $expect)
+    } finally { [void]$script:cfgLock.ReleaseMutex(); Notify-ConfigClobber }
+}
+
+# A refused write must be SEEN. Returning $false into a caller that does nothing with it is the
+# exact failure this project has already shipped twice: the click did nothing, nothing said so,
+# and the edit was gone. Reload as well - after a conflict the bar is showing a version that
+# lost, and letting the user keep editing that stale view just queues up the next conflict.
+#
+# Called from the FINALLY of each writer, i.e. after ReleaseMutex: Rebuild-Buttons walks the
+# whole UI and Show-SendWarning pumps a form, and neither should run holding the config lock.
+function Notify-ConfigClobber {
+    if (-not $script:cfgClobber) { return }
+    $script:cfgClobber = $false
+    try { $again = Read-FreshConfig; if ($again) { $script:config = $again } } catch {}
+    try { Rebuild-Buttons } catch {}
+    try { Show-SendWarning (L 'cfgClobber') } catch {}
 }
 
 # Transform the buttons array against a FRESH file (merge, don't overwrite) and update memory
@@ -1081,6 +1154,7 @@ function Update-Buttons([scriptblock]$transform) {
     try {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return $false }
+        $expect = $script:cfgReadRaw   # snapshot NOW: the transform below may read the file again
         $fresh.buttons = @(& $transform @($fresh.buttons))
         # A group is DEFINED by its members. Once the last one leaves, its saved icon/label is
         # an orphan: it showed up in "Move to group" as a group that renders nowhere. Pruned
@@ -1094,9 +1168,9 @@ function Update-Buttons([scriptblock]$transform) {
                 }
             }
         } catch {}
-        if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
+        if (Write-ConfigAtomic $fresh $expect) { $script:config = $fresh; return $true }
         return $false
-    } finally { [void]$script:cfgLock.ReleaseMutex() }
+    } finally { [void]$script:cfgLock.ReleaseMutex(); Notify-ConfigClobber }
 }
 
 # Same lock + atomic write as Update-Buttons, but the transform sees the WHOLE config.
@@ -1112,6 +1186,7 @@ function Update-Config([scriptblock]$transform) {
     try {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return $false }
+        $expect = $script:cfgReadRaw   # snapshot NOW, before the transform can trigger another read
         $fresh = & $transform $fresh
         # Check the SHAPE, not just truthiness. `-not $fresh` rejects only $null/''/0, so a
         # transform that returned a string wrote "totally not a config" straight over
@@ -1161,9 +1236,9 @@ function Update-Config([scriptblock]$transform) {
             Write-CkLog 'Config transform returned an unusable shape - change not saved'
             return $false
         }
-        if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
+        if (Write-ConfigAtomic $fresh $expect) { $script:config = $fresh; return $true }
         return $false
-    } finally { [void]$script:cfgLock.ReleaseMutex() }
+    } finally { [void]$script:cfgLock.ReleaseMutex(); Notify-ConfigClobber }
 }
 
 # Set one property on a group definition, creating the groups map / entry as needed.
@@ -1249,6 +1324,64 @@ function Same-Button($a, $b) {
     # a genuinely different button "deploy"/"/DEPLOY PROD". Two buttons whose text differs only
     # by case are two different prompts, and treating them as one deleted the wrong one.
     ($a.label -ceq $b.label) -and ($a.text -ceq $b.text) -and ([string]$a.chat -ceq [string]$b.chat)
+}
+
+# ---------- Which ROW did the user click? ----------
+# label+text+chat is a good enough MATCH but it is not an IDENTITY. Rename button B to "A" and
+# retype its text to A's, and the two rows become indistinguishable. "Remove this button" then
+# filtered the array with `-not (Same-Button ...)`, so one requested deletion removed BOTH rows -
+# two hand-written prompts destroyed, no backup, no undo.
+#
+# The CLI removal path was hardened for the neighbouring case long ago (Same-Button is -ceq, and
+# an ambiguous -RemoveButton refuses with exit 3 rather than guessing). The GUI never got the
+# same treatment, and the reason it diverged is worth stating: the CLI is handed a triple and
+# genuinely cannot know which row is meant, whereas the GUI *looks* like it is acting on the
+# button the user clicked - so the ambiguity was never obvious there, even though the code had
+# no more information than the CLI did.
+#
+# It can have more, though, and without touching the schema. PillButton.Tag holds the very
+# object that came out of $script:config.buttons (Build-StripPanel and Build-SideStrip both do
+# $btn.Tag = $b), so REFERENCE equality gives the clicked row a precise identity for the life of
+# the session. Nothing new is written to buttons.json, so a config written by this version still
+# loads on an older one, and an older config still loads here - the two-way path is untouched.
+#
+# A PERSISTED id was the thorough alternative and was rejected deliberately:
+#   - an older panel does not know the field, so on the shared config it would go on deleting
+#     both rows anyway - the fix would not travel with the file it changed;
+#   - every existing config and every hand-pinned button lacks one, so ids would have to be
+#     minted in a migration that REWRITES the user's file at startup, to fix a bug that is not
+#     in the file;
+#   - the ids would then be one more thing a hand edit can duplicate.
+# "Just delete the first match" was rejected too: when the hint is unusable that silently picks
+# a row the user did not point at, which is precisely the guessing the CLI already refuses.
+function Get-TagIndex($t) {
+    # Index of the clicked pill's own row in the CURRENT in-memory array, BY REFERENCE.
+    # -1 for a synthetic tag (a group face is built fresh, it is not a row) or if the array has
+    # been replaced since the strips were built. -1 is not a failure, it is "no hint".
+    try {
+        $all = @($script:config.buttons)
+        for ($i = 0; $i -lt $all.Count; $i++) {
+            if ([Object]::ReferenceEquals($all[$i], $t)) { return $i }
+        }
+    } catch {}
+    return -1
+}
+
+# Resolve the clicked pill against a FRESHLY PARSED array. Update-Buttons re-reads the file
+# inside the lock, so those are different object instances and the reference hint cannot be used
+# directly - and /pin may have changed the file since the strips were built, so the position
+# cannot be trusted blindly either. Hence: use the hint only when the row still standing there
+# matches by value; otherwise fall back to a UNIQUE value match; and if that is ambiguous say so
+# rather than picking one.
+# Returns the index, or -1 = no match, -2 = ambiguous (the caller must refuse and tell the user).
+function Get-TargetIndex($btns, $t, [int]$hint) {
+    $all = @($btns)
+    if ($hint -ge 0 -and $hint -lt $all.Count -and (Same-Button $all[$hint] $t)) { return $hint }
+    $hits = @()
+    for ($i = 0; $i -lt $all.Count; $i++) { if (Same-Button $all[$i] $t) { $hits += $i } }
+    if ($hits.Count -gt 1) { return -2 }
+    if ($hits.Count -eq 1) { return $hits[0] }
+    return -1
 }
 
 # GROUP names go the OTHER way: they are matched case-INSENSITIVELY, on purpose, and the
@@ -3117,9 +3250,33 @@ $miRemove.add_Click({
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
-        if (Update-Buttons { param($btns) $btns | Where-Object { -not (Same-Button $_ $t) } }) {
-            Rebuild-Buttons   # fjerner ogsaa kloner paa spejl-strimlerne
+        # Take the reference hint BEFORE Update-Buttons replaces $script:config with the fresh
+        # parse - afterwards the clicked object is no longer in the array and the hint is gone.
+        $hint = Get-TagIndex $t
+        $script:removeAmbiguous = $false
+        $ok = Update-Buttons {
+            param($btns)
+            $all = @($btns)
+            $idx = Get-TargetIndex $all $t $hint
+            # Unchanged, NOT null: Update-Buttons assigns the transform's output to
+            # $fresh.buttons unconditionally, so a transform that declines must still hand back
+            # the full array it was given.
+            if ($idx -eq -2) { $script:removeAmbiguous = $true; return $all }
+            if ($idx -lt 0) { return $all }
+            # Exactly ONE row leaves, chosen by index. Never a value filter: that is what turned
+            # one deletion into several.
+            $out = @()
+            for ($i = 0; $i -lt $all.Count; $i++) { if ($i -ne $idx) { $out += $all[$i] } }
+            # Returned BARE, not as `, $out`. Update-Buttons does `@(& $transform ...)`, and @()
+            # wraps the transform's PIPELINE OUTPUT - so a comma-wrapped array arrives as one
+            # element that IS an array, and buttons.json is written with the whole array nested
+            # inside itself. (Measured, not assumed: it produced "buttons": [ [ {...} ] ], which
+            # loads as a single unusable button and hides every real one.) Emitting $out bare
+            # enumerates it: N elements stay N, one stays one, and none stays an empty array.
+            $out
         }
+        if ($script:removeAmbiguous) { Show-SendWarning (L 'removeAmbiguous'); return }
+        if ($ok) { Rebuild-Buttons }   # fjerner ogsaa kloner paa spejl-strimlerne
     } catch { Write-CkLog "Remove error: $($_.Exception.Message)" }
 })
 

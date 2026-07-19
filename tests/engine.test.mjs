@@ -5,7 +5,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -310,6 +310,59 @@ test('a flag with no verb is rejected rather than reported as status', () => {
   assert.equal(r.code, 1, 'exits non-zero');
   assert.match(r.err, /needs a verb/);
   assert.doesNotMatch(r.out, /Armed for this chat|Not armed/, 'must not read as an arm confirmation');
+});
+
+// ---------------------------------------------------------------------------
+// ENG-07: a flag write that fails ENTIRELY (both the atomic rename and the direct-write
+// fallback) used to be swallowed - writeFlagAtomic logged and returned, and the caller went on
+// to print "Armed" / "Standing shutdown request recorded". The user then believes the machine
+// will power off when the work finishes, and it will not; or believes state exists that does
+// not. The message must match what is actually on disk.
+//
+// Failure injection: a DIRECTORY at the target path makes rename fail EPERM and the direct
+// write fail EISDIR; a READ-ONLY file makes both fail EPERM while still being readable. Both
+// verified on this platform. No mock is involved - the real fs error paths run.
+// ---------------------------------------------------------------------------
+test('toggle on fails LOUDLY when the arm flag cannot be written (never says Armed)', () => {
+  const id = 'sArmWriteFail';
+  toggle('toggle request-on', id);
+  mkdirSync(join(flagDir(), `${id}.json`), { recursive: true });   // every write to this path now fails
+  const r = toggle('toggle on --this-turn', id);
+  assert.notEqual(r.code, 0, 'must exit non-zero when nothing was written');
+  assert.doesNotMatch(r.out, /^Armed/m, 'must not claim the chat is armed');
+  assert.match(r.err, /NOT armed/, 'must say plainly that nothing was armed');
+  // ...and the disk must agree: a later turn-end must not fire off a half-written arm.
+  const fired = stop({ session_id: id });
+  assert.doesNotMatch(fired.out, /would start PC shutdown/, 'a failed arm must not fire later');
+});
+
+test('toggle request-on fails LOUDLY when the marker cannot be written (never says recorded)', () => {
+  const id = 'sReqWriteFail';
+  mkdirSync(join(flagDir(), `${id}.request`), { recursive: true });
+  const r = toggle('toggle request-on', id);
+  assert.notEqual(r.code, 0, 'must exit non-zero');
+  assert.doesNotMatch(r.out, /recorded/i, 'must not report a standing request that does not exist');
+  assert.match(r.err, /NOT recorded/);
+  // The request marker is the ONLY arm key, so a failed one must not open the gate either.
+  const armed = toggle('toggle on --this-turn', id);
+  assert.doesNotMatch(armed.out, /^Armed/m, 'a request that was never recorded cannot authorise an arm');
+});
+
+test('Stop hook: an unwritable countdown DISARMS rather than promising a shutdown', () => {
+  const id = 'sSkipWriteFail';
+  const f = join(flagDir(), `${id}.json`);
+  writeFileSync(f, JSON.stringify({ skip: 1 }));
+  writeFileSync(join(flagDir(), `${id}.request`), 'x');
+  chmodSync(f, 0o444);          // readable (so skip parses) but unwritable
+  const r = stop({ session_id: id });
+  assert.equal(r.code, 0, 'the hook must not crash the turn');
+  assert.doesNotMatch(r.out, /Shutdown-on-done armed:/,
+    'must not promise a countdown whose decrement never reached the disk');
+  assert.match(r.out, /DISARMED/, 'must tell the user it disarmed instead');
+  // The undecremented flag must never relocate the power-off to some later turn.
+  try { chmodSync(f, 0o666); } catch {}
+  const later = stop({ session_id: id, stop_hook_active: false });
+  assert.doesNotMatch(later.out, /would start PC shutdown/, 'must not detonate in a later turn');
 });
 
 // QA-07: machineArmedFresh() is what makes the 12h expiry real, but only the Stop path was

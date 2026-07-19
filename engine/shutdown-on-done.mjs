@@ -60,13 +60,25 @@ const SLEEP_LOCK = new Int32Array(new SharedArrayBuffer(4));
 // Write via temp + rename so the flag is never observed half-written. A bare writeFileSync
 // truncates first, and this tool cuts power to the machine - so an interrupted write was a
 // realistic way to produce the corrupt flag that (before the fail-closed fix) fired a shutdown.
+//
+// RETURNS true ONLY IF THE DATA IS PROVABLY ON DISK. It used to swallow a total failure and
+// return normally, so when both the rename and the direct write failed (antivirus, permissions,
+// a full disk) the caller carried on and printed "Armed" / "Standing request recorded" about a
+// flag that does not exist. Every caller must now treat false as a hard failure and say so: a
+// user who believes the machine will power off when the work finishes, and it does not, has
+// been lied to by the one tool whose entire job is that promise. The read-back is what ties the
+// message to the disk - a write that "succeeded" but produced different bytes is still a lie.
 const writeFlagAtomic = (p, data) => {
   // Unique temp name: a shared one lets two interleaved writers rename each other's payload.
   const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  // Prove the bytes are readable back as what we asked for. A rename or a write that reports
+  // success while the target holds something else (a stale copy a filter driver restored, a
+  // partially flushed file) must not be reported to the user as state that exists.
+  const verify = () => { try { return readFileSync(p, 'utf8') === data; } catch { return false; } };
   try {
     writeFileSync(tmp, data);
     for (let i = 0; ; i++) {
-      try { renameSync(tmp, p); return; } catch (e) {
+      try { renameSync(tmp, p); return verify(); } catch (e) {
         // On Windows, rename-over-existing fails with EPERM/EBUSY while ANY process holds the
         // target open (Defender, a backup agent, an indexer). The plain write it replaced
         // tolerated that, so an unguarded rename is a reliability REGRESSION. Retry with a
@@ -86,14 +98,22 @@ const writeFlagAtomic = (p, data) => {
     try {
       writeFileSync(p, data);   // last resort: the old, non-atomic path is better than nothing
       logLine(`atomic flag write fell back to a direct write: ${e.code ?? e}`);
+      return verify();
     } catch (e2) {
       // The fallback hits the SAME lock the retry just exhausted on, so it must be guarded
       // too - an unguarded one crashed every turn-end with a raw stack trace and emitted no
-      // confirmation at all. Failing here defers the shutdown, which is the safe direction.
+      // confirmation at all. Failing here defers the shutdown, which is the safe direction -
+      // but it must be REPORTED, not swallowed, which is what returning false makes the
+      // callers do.
       logLine(`flag write FAILED entirely (${e.code ?? e} then ${e2.code ?? e2}); state unchanged`);
+      return false;
     }
   }
 };
+
+// Best-effort removal of a flag whose write we could not complete. Fail-closed means the user
+// must not be left with a half-written arm we then describe as absent.
+const discardFlag = (p) => { try { rmSync(p, { force: true, recursive: true }); } catch {} };
 
 // A session id becomes a FILENAME, and the fire path calls rmSync(force, recursive) on the
 // result - so `../../x` escaped FLAG_DIR and deleted an arbitrary file or directory tree.
@@ -187,16 +207,46 @@ if (mode === 'toggle') {
       logLine(`ARM refused for session ${id}: no standing request`);
       process.exit(0);
     }
-    mkdirSync(FLAG_DIR, { recursive: true });
-    writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
+    // Fail CLOSED and LOUDLY. If the flag cannot be put on disk there is no arm, and saying
+    // "Armed" would leave the user believing the PC will power off when the work finishes.
+    let armed = false;
+    try {
+      mkdirSync(FLAG_DIR, { recursive: true });
+      armed = writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
+    } catch { armed = false; }
+    if (!armed) {
+      discardFlag(flagPath(id));   // never leave a half-written arm behind a "not armed" message
+      logLine(`ARM FAILED for session ${id}: flag could not be written; NOT armed`);
+      console.error(
+        'NOT armed: the arm flag could not be written to disk, so nothing was recorded and the PC will NOT shut down. ' +
+          'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then try again.',
+      );
+      process.exit(1);
+    }
     console.log(
       thisTurn
         ? `Armed: the PC will shut down (${GRACE_SECONDS}s grace) when THIS response finishes. Disarm: toggle off. Abort a started countdown: shutdown -a`
         : `Armed: the PC will shut down (${GRACE_SECONDS}s grace) when the NEXT response in this chat finishes. Disarm: toggle off. Abort a started countdown: shutdown -a`,
     );
   } else if (action === 'request-on') {
-    mkdirSync(FLAG_DIR, { recursive: true });
-    writeFlagAtomic(requestPath(id), new Date().toISOString());
+    // Same fail-closed rule as `on`. The standing request is the ONLY arm key, and the panel's
+    // power button reads *.request for its lit state - so a request that was never written but
+    // was reported as recorded produces both a false confirmation and a UI that contradicts
+    // the disk. Nothing downstream may act as if the key exists.
+    let recorded = false;
+    try {
+      mkdirSync(FLAG_DIR, { recursive: true });
+      recorded = writeFlagAtomic(requestPath(id), new Date().toISOString());
+    } catch { recorded = false; }
+    if (!recorded) {
+      discardFlag(requestPath(id));
+      logLine(`REQUEST FAILED for session ${id}: marker could not be written; nothing recorded`);
+      console.error(
+        'NOT recorded: the standing shutdown request could not be written to disk, so this chat has no shutdown request and cannot be armed. ' +
+          'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then try again.',
+      );
+      process.exit(1);
+    }
     console.log('Standing shutdown request recorded for this chat.');
   } else if (action === 'request-off') {
     // Withdrawing the request must also drop any arm it authorised. The panel's toggle
@@ -316,7 +366,21 @@ if (skip === null) {
 if (sameTurn && parsed.consumedInTurn === true) process.exit(0);
 
 if (skip > 0) {
-  writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true }));
+  // If the decremented counter cannot be written, the flag on disk still says `skip: 1` - so
+  // the message below ("will shut down when the next response finishes") would describe a
+  // state that is not there, and the undecremented counter relocates the power-off to some
+  // arbitrary later turn the user never consented to. Disarm instead and say so: not shutting
+  // down is always the safe direction, and an honest "disarmed" beats a confident wrong promise.
+  if (!writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true }))) {
+    discardFlag(flagPath(id));
+    discardFlag(requestPath(id));
+    logLine(`countdown write FAILED for session ${id}; disarmed WITHOUT shutting down`);
+    emit({
+      systemMessage:
+        'Shutdown-on-done: the countdown could not be written to disk, so this chat has been DISARMED and the PC will NOT shut down. Re-arm if you still want it.',
+    });
+    process.exit(0);
+  }
   emit({
     systemMessage:
       'Shutdown-on-done armed: the PC will shut down when the next response in this chat finishes.',

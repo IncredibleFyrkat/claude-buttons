@@ -905,6 +905,13 @@ function Rebuild-Buttons { $script:rebuilt++ }
 # the others. The two-click DECISION that calls it is not stubbed - it stays in the handler and
 # is what the confirm tests below actually exercise.
 function Set-DissolveLabel([string]$key) { $script:dissolveLabel = $key }
+# The user-visible warning surface. Stubbed as a RECORDER, not as a no-op: a refused write that
+# tells nobody is the failure mode these tests exist to catch, so the tests have to be able to
+# see whether anything was said. The string it is handed comes from the real `L` lookup against
+# the real string table (both loaded below), so an empty or missing table entry shows up here as
+# an empty warning rather than passing silently.
+function Show-SendWarning([string]$text) { $script:warned += , $text }
+$script:warned = @()
 $script:ckLog = @(); $script:rebuilt = 0; $script:flyForm = $null; $script:menuSource = $null
 $script:dissolveLabel = ''; $script:dissolveArmedFor = $null; $script:dissolveArmedAt = Get-Date '2000-01-01'
 # A test-private mutex name. Taking the panel's real production lock here would contend with the
@@ -920,7 +927,12 @@ $panelFns = @('Get-ButtonBlocks', 'Get-ButtonBar', 'Same-Button', 'Get-ColorKind
               'Read-FreshConfig', 'Write-ConfigAtomic', 'Update-Buttons', 'Update-Config',
               'Set-ButtonBar', 'Set-ButtonGroup', 'Set-KindColor', 'Move-GroupMember', 'Move-PinButton',
               'Get-GroupNames', 'Resolve-GroupName', 'Set-GroupProp', 'Get-GroupDef',
-              'Clear-FlyoutForForm')
+              'Clear-FlyoutForForm',
+              # Row identity (the "Remove this button" fix) and the lost-update guard's
+              # user-facing half. NOT `L`: an echo stub for it is defined further down for the
+              # New-ButtonGroup fixture and would shadow the real one anyway, so loading it here
+              # would only look like coverage that is not in force.
+              'Get-TagIndex', 'Get-TargetIndex', 'Notify-ConfigClobber')
 $missingFns = @()
 foreach ($fn in $panelFns) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
@@ -1229,6 +1241,16 @@ $dissolveNode = $ast.Find({ param($n)
 Check 'the dissolve click handler was located in the source' ($null -ne $dissolveNode -and $dissolveNode.Arguments.Count -eq 1)
 $dissolveAction = if ($dissolveNode) { [scriptblock]::Create($dissolveNode.Arguments[0].ScriptBlock.EndBlock.Extent.Text) } else { $null }
 
+# "Remove this button" is a click handler too, so it is extracted the same way. It is extracted
+# rather than re-implemented on purpose: the removal is THE data-loss path in this file (no
+# backup, no undo), and a fixture that reproduces its logic would keep passing while the shipped
+# handler deleted the wrong rows - which is exactly what happened.
+$removeNode = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+    $n.Expression.Extent.Text -eq '$miRemove' -and $n.Member.Extent.Text -eq 'add_Click' }, $true)
+Check 'the remove click handler was located in the source' ($null -ne $removeNode -and $removeNode.Arguments.Count -eq 1)
+$removeAction = if ($removeNode) { [scriptblock]::Create($removeNode.Arguments[0].ScriptBlock.EndBlock.Extent.Text) } else { $null }
+
 # Drive a real transform against a throwaway buttons.json and return the config AS WRITTEN
 # TO DISK. Reading back the file rather than the in-memory return value is deliberate: a
 # transform that corrupts what gets persisted is the damaging failure, and the previous
@@ -1247,9 +1269,14 @@ function Invoke-PanelEdit {
         $script:config = Read-FreshConfig
         $script:menuSource = [pscustomobject]@{ Tag = $Target }
         $script:rebuilt = 0
+        # $Target is evaluated by the CALLER, before $script:config exists, so it can only ever
+        # be a synthetic stand-in. An Action that needs the REAL array element (to exercise the
+        # reference-identity hint) reassigns $script:menuSource itself - it runs after the load.
+        $script:warned = @()
         $ret = & $Action
         $raw = Get-Content $script:configPath -Raw
-        [pscustomobject]@{ Cfg = ($raw | ConvertFrom-Json); Raw = $raw; Ret = $ret; Rebuilt = $script:rebuilt }
+        [pscustomobject]@{ Cfg = ($raw | ConvertFrom-Json); Raw = $raw; Ret = $ret
+                           Rebuilt = $script:rebuilt; Warned = @($script:warned) }
     } finally {
         $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome
         $script:menuSource = $null
@@ -1897,6 +1924,195 @@ Check 'a throwing transform leaves the config file untouched' `
 $r = Invoke-PanelEdit $cfgOnlyJson $null { Set-KindColor 'command' 'blue' }
 Check 'Set-KindColor persists a per-kind colour through Update-Config' ($r.Cfg.colors.command -eq 'blue')
 Check 'saving a colour does not disturb the buttons array' ((Labels $r.Cfg) -eq 'A')
+
+# =====================================================================================
+# DATA-02: "Remove this button" must remove exactly ONE button
+# =====================================================================================
+# The `L` in force from here on is the ECHO STUB defined for the New-ButtonGroup fixture above
+# (`function L([string]$k) { $k }`), which shadows the panel's real lookup. The warning
+# assertions below therefore prove that the handler asked for the right KEY, not what that key
+# renders as - stated because the two are easy to confuse, and because a stub that stopped
+# echoing would turn those assertions into `'' -eq ''` and make them pass vacuously. This guard
+# is what stops that. The rendered text is covered separately, at the bottom of this block,
+# against the shipped string table in BOTH languages.
+Check 'the L stub in force here still echoes its key (the warning checks below depend on it)' `
+    (((L 'removeAmbiguous') -eq 'removeAmbiguous') -and ((L 'cfgClobber') -eq 'cfgClobber'))
+# label+text+chat is a MATCH, not an IDENTITY. Rename B to "A" and retype its text to A's, and
+# the two rows are indistinguishable by that triple - and the handler filtered the array with
+# `-not (Same-Button ...)`, so ONE requested deletion destroyed TWO hand-written prompts. There
+# is no backup and no undo.
+#
+# The duplicates below carry different ICONS. Same-Button ignores `icon`, so they are still
+# ambiguous by the triple, but the icon is what lets these tests say WHICH row went - with two
+# byte-identical rows the assertion could only count, and "removed one" would pass even if it
+# removed the wrong one.
+$dupRemoveJson = '{"schemaVersion":1,"buttons":[
+    {"label":"A","text":"/x","icon":"note"},
+    {"label":"A","text":"/x","icon":"power"},
+    {"label":"Keep","text":"/k"}]}'
+function Icons($cfg) { (@($cfg.buttons) | ForEach-Object { if ($_.icon) { $_.icon } else { '-' } }) -join ',' }
+
+# --- The reported bug. The clicked pill's Tag IS the row object, so the click resolves by
+#     reference and only that row leaves.
+$r = Invoke-PanelEdit $dupRemoveJson $null {
+    $script:menuSource = [pscustomobject]@{ Tag = $script:config.buttons[1] }
+    & $removeAction
+}
+Check 'removing one of two identical-triple buttons leaves the other one alone' `
+    (@($r.Cfg.buttons).Count -eq 2)
+Check '...and it is the row that was CLICKED that went (second: icon=power)' `
+    ((Icons $r.Cfg) -eq 'note,-')
+Check '...and the removal was actually persisted (strips rebuilt)' ($r.Rebuilt -gt 0)
+
+# The other direction. Without this, "always drop the first match" would pass the case above.
+$r = Invoke-PanelEdit $dupRemoveJson $null {
+    $script:menuSource = [pscustomobject]@{ Tag = $script:config.buttons[0] }
+    & $removeAction
+}
+Check 'clicking the FIRST of two identical-triple buttons removes the first, not the second' `
+    ((@($r.Cfg.buttons).Count -eq 2) -and ((Icons $r.Cfg) -eq 'power,-'))
+
+# --- No usable hint (a stale tag: the object is not in the current array) AND the triple is
+#     ambiguous. This is where the GUI has no more information than the CLI, so it gives the
+#     same answer the CLI gives - refuse - instead of guessing.
+$r = Invoke-PanelEdit $dupRemoveJson ([pscustomobject]@{ label = 'A'; text = '/x' }) { & $removeAction }
+Check 'an ambiguous remove with no usable hint deletes NOTHING' `
+    ((@($r.Cfg.buttons).Count -eq 3) -and ((Icons $r.Cfg) -eq 'note,power,-'))
+# ...and it must SAY so. A refusal the user cannot see is indistinguishable from a click that
+# did nothing, which is how they would go on to click it again.
+Check 'a refused ambiguous remove warns the user' `
+    ((@($r.Warned).Count -eq 1) -and ($r.Warned[0] -eq (L 'removeAmbiguous')))
+
+# --- Regressions: the ordinary paths must still work.
+$r = Invoke-PanelEdit $dupRemoveJson ([pscustomobject]@{ label = 'Keep'; text = '/k' }) { & $removeAction }
+Check 'an UNambiguous remove by value still works with no hint at all' `
+    ((@($r.Cfg.buttons).Count -eq 2) -and ((Labels $r.Cfg) -eq 'A,A') -and (@($r.Warned).Count -eq 0))
+$r = Invoke-PanelEdit '{"buttons":[{"label":"Only","text":"/o"}]}' ([pscustomobject]@{ label = 'Only'; text = '/o' }) { & $removeAction }
+# PS 5.1 unrolls an array out of a scriptblock: an empty result must stay an empty ARRAY, not
+# collapse into @($null) - a buttons array holding one null entry is a corrupt config.
+Check 'removing the last button leaves an EMPTY array, not a null entry' `
+    ((@($r.Cfg.buttons).Count -eq 0) -and ($r.Raw -notmatch 'null'))
+$r = Invoke-PanelEdit $dupRemoveJson ([pscustomobject]@{ label = 'Ghost'; text = '/ghost' }) { & $removeAction }
+Check 'removing a button that is not there changes nothing and does not warn' `
+    ((@($r.Cfg.buttons).Count -eq 3) -and (@($r.Warned).Count -eq 0))
+# Case-sensitivity is inherited from Same-Button and must survive the rewrite: a wrong-case
+# target must match nothing rather than the genuinely different button next to it.
+$r = Invoke-PanelEdit '{"buttons":[{"label":"Deploy","text":"/deploy prod"},{"label":"deploy","text":"/DEPLOY PROD"}]}' `
+        ([pscustomobject]@{ label = 'DEPLOY'; text = '/deploy prod' }) { & $removeAction }
+Check 'a wrong-case remove target still matches nothing' (@($r.Cfg.buttons).Count -eq 2)
+
+# --- Get-TargetIndex directly: the -2 (ambiguous) contract the handler branches on.
+$twoSame = @([pscustomobject]@{ label = 'A'; text = '/x' }, [pscustomobject]@{ label = 'A'; text = '/x' })
+Check 'Get-TargetIndex reports ambiguity as -2 rather than picking one' `
+    ((Get-TargetIndex $twoSame $twoSame[0] -1) -eq -2)
+Check 'Get-TargetIndex honours a valid positional hint even when ambiguous' `
+    ((Get-TargetIndex $twoSame $twoSame[0] 1) -eq 1)
+# A hint pointing at a row that no longer matches (the file changed under the panel) must be
+# DISCARDED, not used. Trusting it blindly would delete a button the user never clicked.
+$shifted = @([pscustomobject]@{ label = 'New'; text = '/n' }, [pscustomobject]@{ label = 'A'; text = '/x' })
+Check 'a stale hint is discarded and the unique value match wins' `
+    ((Get-TargetIndex $shifted ([pscustomobject]@{ label = 'A'; text = '/x' }) 0) -eq 1)
+Check 'an out-of-range hint does not throw and falls back to value matching' `
+    ((Get-TargetIndex $shifted ([pscustomobject]@{ label = 'A'; text = '/x' }) 99) -eq 1)
+Check 'Get-TargetIndex reports no match as -1' `
+    ((Get-TargetIndex $shifted ([pscustomobject]@{ label = 'Z'; text = '/z' }) -1) -eq -1)
+
+# =====================================================================================
+# DATA-03: a hand edit must not be silently overwritten
+# =====================================================================================
+# The mutex only binds writers that take it. An editor saving buttons.json takes nothing, and
+# Write-ConfigAtomic replaces the WHOLE file - so a save that landed between the panel's read
+# and its write was erased. Read-FreshConfig inside the lock narrows the window to one
+# transform; it does not close it, because nothing detected the overlap.
+#
+# The transform below IS the external writer, which is the exact scenario: the file is edited
+# WHILE a transform is running.
+$handEditJson = '{"schemaVersion":1,"buttons":[{"label":"A","text":"/a"}],"targetTitle":"Claude"}'
+$r = Invoke-PanelEdit $handEditJson $null {
+    Update-Buttons {
+        param($b)
+        [IO.File]::WriteAllText($script:configPath,
+            '{"schemaVersion":1,"buttons":[{"label":"A","text":"/a"},{"label":"HandEdit","text":"/h"}],"targetTitle":"Claude"}',
+            (New-Object System.Text.UTF8Encoding($false)))
+        @($b) + [pscustomobject]@{ label = 'Panel'; text = '/p' }
+    }
+}
+Check 'a write is REFUSED when the file changed after the panel read it' ($r.Ret -eq $false)
+Check '...and the hand edit survives byte-intact (this is the data loss)' ((Labels $r.Cfg) -eq 'A,HandEdit')
+Check '...and the panel change is genuinely absent, not merged in by accident' ((Labels $r.Cfg) -notmatch 'Panel')
+# Silent discard is the failure mode this project has already shipped twice. A log line is not
+# user-visible; the warning is.
+Check 'a refused write TELLS the user' `
+    ((@($r.Warned).Count -eq 1) -and ($r.Warned[0] -eq (L 'cfgClobber')))
+Check '...and reloads, so the bar stops showing the version that lost' ($r.Rebuilt -gt 0)
+Check '...and it is logged too' ((@($script:ckLog) -join '|') -match 'changed by something else')
+# Update-Config takes the same guard - Set-KindColor and every group edit go through it.
+$r = Invoke-PanelEdit $handEditJson $null {
+    Update-Config {
+        param($c)
+        [IO.File]::WriteAllText($script:configPath,
+            '{"schemaVersion":1,"buttons":[{"label":"A","text":"/a"},{"label":"HandEdit","text":"/h"}]}',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $c | Add-Member -NotePropertyName colors -NotePropertyValue ([pscustomobject]@{ command = 'blue' }) -Force
+        $c
+    }
+}
+Check 'Update-Config refuses the same overwrite' (($r.Ret -eq $false) -and ((Labels $r.Cfg) -eq 'A,HandEdit'))
+
+# THE TRAP, and the reason this needs its own check: the panel writes buttons.json on every
+# single edit. A guard anchored on "has the file changed since the panel last touched it" is
+# true after EVERY panel write, so the second edit in a row would be refused and the feature
+# would be a brick. The guard has to anchor on the READ the pending change was computed from.
+# Deleting the whole guard leaves this green - that is the point of it being separate from the
+# checks above, which deleting the guard turns red.
+$r = Invoke-PanelEdit $handEditJson $null {
+    $a1 = Update-Buttons { param($b) @($b) + [pscustomobject]@{ label = 'One'; text = '/1' } }
+    $a2 = Update-Buttons { param($b) @($b) + [pscustomobject]@{ label = 'Two'; text = '/2' } }
+    $a3 = Update-Config  { param($c) $c | Add-Member -NotePropertyName lang -NotePropertyValue 'da' -Force; $c }
+    , @($a1, $a2, $a3)
+}
+Check 'three back-to-back PANEL writes all succeed (the guard must not fire on our own writes)' `
+    (($r.Ret[0] -eq $true) -and ($r.Ret[1] -eq $true) -and ($r.Ret[2] -eq $true))
+Check '...and every one of them landed' (((Labels $r.Cfg) -eq 'A,One,Two') -and ($r.Cfg.lang -eq 'da'))
+Check '...with no spurious warning' (@($r.Warned).Count -eq 0)
+
+# An external write that happens to produce an IDENTICAL file is not a conflict - refusing there
+# would cost the user an edit for nothing.
+$r = Invoke-PanelEdit $handEditJson $null {
+    Update-Buttons {
+        param($b)
+        [IO.File]::WriteAllText($script:configPath, $script:cfgReadRaw, (New-Object System.Text.UTF8Encoding($false)))
+        @($b) + [pscustomobject]@{ label = 'Panel'; text = '/p' }
+    }
+}
+Check 'a byte-identical rewrite is not treated as a conflict' `
+    (($r.Ret -eq $true) -and ((Labels $r.Cfg) -eq 'A,Panel'))
+
+# ...but a hand edit that changed ONLY the case of a label is a real edit and must be protected.
+# PowerShell's -ne is case-INSENSITIVE, so the obvious comparison reports "unchanged" here and
+# overwrites it. Same trap that made Same-Button -ceq, one layer down.
+$r = Invoke-PanelEdit $handEditJson $null {
+    Update-Buttons {
+        param($b)
+        [IO.File]::WriteAllText($script:configPath,
+            $script:cfgReadRaw.Replace('"label":"A"', '"label":"a"'),
+            (New-Object System.Text.UTF8Encoding($false)))
+        @($b) + [pscustomobject]@{ label = 'Panel'; text = '/p' }
+    }
+}
+Check 'a hand edit that changed only LETTER CASE is still protected' `
+    (($r.Ret -eq $false) -and ((Labels $r.Cfg) -eq 'a'))
+
+# Both new user-visible strings must exist in BOTH tables. A refusal that renders as a blank
+# tooltip in Danish is a silent discard with extra steps.
+$newStrOk = $true
+foreach ($lang in @('en', 'da')) {
+    $block = [regex]::Match($srcText, "(?s)\b$lang\s*=\s*@\{(.*?)\r?\n\s*\}").Groups[1].Value
+    foreach ($k in @('removeAmbiguous', 'cfgClobber')) {
+        if ($block -notmatch "$k\s*=\s*'[^']{40,}'") { $newStrOk = $false }
+    }
+}
+Check 'removeAmbiguous and cfgClobber are defined with real text in EN and DA' $newStrOk
 $r = Invoke-PanelEdit '{"buttons":[{"label":"A","text":"/a"}],"colors":{"command":"blue","text":"red"}}' $null { Set-KindColor 'command' '' }
 Check 'clearing a kind colour removes only that kind' `
     (($null -eq $r.Cfg.colors.PSObject.Properties['command']) -and ($r.Cfg.colors.text -eq 'red'))

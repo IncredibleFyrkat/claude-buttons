@@ -8,6 +8,8 @@ Do the following:
 
 1. Locate buttons.json via the install marker `%USERPROFILE%\.claude\claude-buttons-path.txt` (its content is the full path). Also read `%USERPROFILE%\.claude\active-session.json` (its `session_id` is this chat).
 2. Read buttons.json to FIND the match: the button whose `text` or `label` matches the argument (be flexible — match with or without a leading `/`, case-insensitive). Prefer buttons pinned to this chat (`chat` == session_id), then global ones. Reading is fine; writing is not.
+
+   **Same fail-closed rule as `/pin`.** If `active-session.json` is missing or unreadable, or its `ts` is more than 2 minutes old, you cannot tell which buttons belong to this chat. Do **not** fall back to removing a global button (that one is shared by every conversation, so removing it on a guess is the widest possible action), and do not treat a button as this chat's on an untrusted `session_id`. Instead, list the candidate matches with their scope — per-chat buttons carry `chat`/`chatTitle`, global buttons carry neither — and ask the user which one to remove, or ask them to send a message in this chat first so the session file refreshes. Remove nothing until they choose.
 3. **Do NOT write buttons.json yourself.** The panel writes it too, under a mutex, so a
    hand-written read-modify-write silently destroys whatever the panel saved in between. Run
    the panel's own locked entry point with the matched button's `label`, `text` and `chat`

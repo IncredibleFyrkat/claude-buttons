@@ -255,6 +255,128 @@ Check 'the skill does not pre-authorise request-on either (SEC-01)' ($allowLine 
 Check 'the skill body still instructs the agent to run request-on (it just prompts)' `
     ((($skillLines -join "`n") -match 'toggle request-on'))
 
+# ---- Stop-Panel must kill the PANEL and nothing else (INST-01) ----------------------------
+# The old filter was `CommandLine -like "*claude-buttons.ps1*"`, so ANY powershell process whose
+# command line merely mentions the filename was force-killed - a grep, an AST analysis, a test
+# harness. It killed this project's own tooling. These cases assert on the decision function, so
+# no process is ever started or stopped by the suite.
+$panelName = 'claude-buttons.ps1'   # the function's parameter, named as in the installer
+$pwsh = 'C:\WINDOWS\system32\WindowsPowerShell\v1.0\powershell.exe'
+
+# MUST kill: real launches, including the exact form Launch.vbs uses.
+foreach ($c in @(
+    @{ n = 'Launch.vbs form (quoted path, hidden window)'
+       cl = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\Users\x\AppData\Local\Programs\ClaudeButtons\claude-buttons.ps1`"" },
+    @{ n = 'fully-qualified host, unquoted path'
+       cl = "$pwsh -NoProfile -File C:\Tools\ClaudeButtons\claude-buttons.ps1" },
+    @{ n = 'pwsh 7 host'
+       cl = "pwsh.exe -NoProfile -File `"C:\p\claude-buttons.ps1`"" },
+    @{ n = 'abbreviated -f switch'
+       cl = "powershell.exe -NoProfile -f C:\p\claude-buttons.ps1" },
+    @{ n = 'differently-cased path (Windows paths are case-insensitive)'
+       cl = "powershell.exe -File C:\P\Claude-Buttons.PS1" },
+    @{ n = 'launched with arguments after the script'
+       cl = "powershell.exe -NoProfile -File `"C:\p\claude-buttons.ps1`" -AddButton `"C:\t\b.json`"" }
+)) { Check "Stop-Panel targets a real panel launch: $($c.n)" (Test-PanelCommandLine $c.cl $panelName) }
+
+# MUST NOT kill: every one of these merely MENTIONS the panel. Each is a real thing a
+# maintainer or this repo's own tooling runs.
+foreach ($c in @(
+    @{ n = 'a grep over the source'
+       cl = "powershell.exe -NoProfile -Command `"Select-String claude-buttons.ps1 *.md`"" },
+    @{ n = 'an AST analysis one-liner'
+       cl = "powershell.exe -NoProfile -Command `"[Parser]::ParseFile('claude-buttons.ps1',[ref]`$null,[ref]`$null)`"" },
+    @{ n = 'the test harness running panel.tests.ps1 (which reads claude-buttons.ps1)'
+       cl = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\repo\tests\panel.tests.ps1 -Target claude-buttons.ps1" },
+    @{ n = 'run-all.ps1, whose static check names the panel'
+       cl = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\repo\tests\run-all.ps1" },
+    @{ n = 'an encoded command that happens to decode near the name'
+       cl = "powershell.exe -EncodedCommand ZWNobyBjbGF1ZGUtYnV0dG9ucy5wczE= claude-buttons.ps1" },
+    @{ n = 'a non-PowerShell process whose command line names the panel'
+       cl = "C:\Windows\System32\notepad.exe C:\p\claude-buttons.ps1" },
+    @{ n = 'a -Command payload that PRINTS a launch line (unquoted, so -File is a bare token)'
+       cl = "powershell.exe -NoProfile -Command Write-Output powershell.exe -File C:\p\claude-buttons.ps1" },
+    @{ n = 'an editor with the panel open'
+       cl = "`"C:\Program Files\Editor\edit.exe`" -File C:\p\claude-buttons.ps1" },
+    @{ n = '-File pointing at a DIFFERENT script in the panel folder'
+       cl = "powershell.exe -File C:\p\claude-buttons-helper.ps1" },
+    @{ n = 'the name only in a working directory, not as -File'
+       cl = "powershell.exe -NoProfile -File C:\claude-buttons.ps1.bak" },
+    @{ n = 'an empty command line (protected process)'
+       cl = '' }
+)) { Check "Stop-Panel spares a mere mention: $($c.n)" (-not (Test-PanelCommandLine $c.cl $panelName)) }
+
+# The quote-aware splitter: an install path with spaces is the NORMAL case under
+# %LOCALAPPDATA%\Programs. Splitting on whitespace alone would cut the path in half and the
+# -File argument would never match, silently disabling Stop-Panel for most users.
+$parts = @(Split-CommandLineArgs "powershell.exe -File `"C:\Program Files\Claude Buttons\claude-buttons.ps1`"")
+Check 'Split-CommandLineArgs keeps a quoted path with spaces in one piece' `
+    (($parts.Count -eq 3) -and ($parts[2] -eq 'C:\Program Files\Claude Buttons\claude-buttons.ps1'))
+# PS 5.1 array traps, both of which produced a Stop-Panel that silently stopped nothing:
+# `return ,$arr` adds an outer wrapper that @() collapses to ONE element, and a bare string
+# passed through @() must not be enumerated into characters.
+$one = @(Split-CommandLineArgs 'powershell.exe')
+Check 'Split-CommandLineArgs returns whole arguments, not characters, for a single argument' `
+    (($one.Count -eq 1) -and ($one[0] -eq 'powershell.exe'))
+$three = @(Split-CommandLineArgs 'powershell.exe -File x.ps1')
+Check 'Split-CommandLineArgs does not collapse a multi-argument line to one element' `
+    (($three.Count -eq 3) -and ($three[1] -eq '-File'))
+Check 'a path with spaces is still matched as the panel' `
+    (Test-PanelCommandLine "powershell.exe -File `"C:\Program Files\Claude Buttons\claude-buttons.ps1`"" $panelName)
+
+# Ancestor exclusion: the installer itself runs under powershell.exe, and it may have been
+# started BY the panel (the kebab menu offers an update). Killing an ancestor kills the run
+# half-way through an install.
+$map = @{ 100 = 4; 200 = 100; 300 = 200; 400 = 999 }   # 300 <- 200 <- 100 <- 4(root)
+$anc = @(Get-ProcessAncestry 300 $map)
+Check 'Get-ProcessAncestry walks the whole parent chain' `
+    (($anc -contains 300) -and ($anc -contains 200) -and ($anc -contains 100))
+Check 'Get-ProcessAncestry does not include an unrelated process' (-not ($anc -contains 400))
+# PID reuse can make the chain a cycle; without the visited check this hangs forever.
+$cyc = @{ 10 = 20; 20 = 10 }
+$r = Try-Call { $null = Get-ProcessAncestry 10 $cyc }
+Check 'Get-ProcessAncestry terminates on a cyclic parent chain (PID reuse)' (-not $r.Threw)
+$solo = @(Get-ProcessAncestry 4 @{})
+Check 'Get-ProcessAncestry returns the pid itself for a chain of one' `
+    (($solo.Count -eq 1) -and ($solo[0] -eq 4))
+
+# Stop-Panel must actually USE the narrowing. Testing only the helper is what let earlier
+# rounds ship: the helper can be perfect while Stop-Panel still calls -like on the raw string.
+$stopSrc = [regex]::Match((Get-Content $install -Raw), '(?s)function Stop-Panel\s*\{.*?\n\}').Value
+Check 'Stop-Panel calls the narrowed matcher' ($stopSrc -match 'Test-PanelCommandLine')
+Check 'Stop-Panel no longer wildcard-matches the raw command line' `
+    ($stopSrc -notmatch '-like\s*"\*')
+Check 'Stop-Panel excludes itself and its ancestors' ($stopSrc -match 'Get-ProcessAncestry')
+
+# ---- /pin and /unpin must FAIL CLOSED on a stale session file (PRIV-01) --------------------
+# Reported: the user asks to pin private text "only in this chat", active-session.json is stale,
+# and the instruction permitted "pin globally with a note". The button then appears in every
+# conversation and a later click pastes that text into a different chat. Falling back to global
+# is the opposite of what the user asked for and is the failure direction that leaks their text.
+# -Encoding UTF8 explicitly: these files contain em dashes, and PS 5.1's Get-Content defaults to
+# ANSI, which mangles them - a decoding accident must never be what decides a privacy assertion.
+$pinSrc = Get-Content (Join-Path $repo 'skills\pin\SKILL.md') -Raw -Encoding UTF8
+$staleBlock = [regex]::Match($pinSrc, '(?s)Staleness check.*?(?=\n\d+\. )').Value
+Check 'the /pin skill has a staleness block' ($staleBlock.Length -gt 0)
+Check 'the stale-session instruction REFUSES the pin' ($staleBlock -match 'REFUSE')
+Check 'the stale-session instruction says nothing was pinned' ($staleBlock -match 'nothing was pinned')
+# The defect verbatim. Any instruction that lets a stale file WIDEN the scope is the bug.
+Check 'the stale-session instruction never permits a global fallback (the reported defect)' `
+    ($pinSrc -notmatch '(?i)or pin globally')
+Check '/pin explicitly forbids widening to global on a stale file' `
+    ($staleBlock -match '(?i)never widen|do not pin globally|Never widen')
+# ...and it must not pin with the untrusted id either - the other half of the same fallback.
+Check '/pin also refuses the possibly-wrong session_id' `
+    ($staleBlock -match '(?i)do not pin with the untrusted|possibly-wrong session id')
+
+$unpinSrc = Get-Content (Join-Path $repo 'skills\unpin\SKILL.md') -Raw -Encoding UTF8
+Check '/unpin carries the same fail-closed rule' ($unpinSrc -match '(?i)fail-closed')
+# Removing a GLOBAL button on a guess is the widest action available to /unpin - the same
+# class of fallback, pointed the same way.
+Check '/unpin does not fall back to removing a global button on a stale session' `
+    ($unpinSrc -match '(?i)not.{0,20}fall back to removing a global button')
+Check '/unpin removes nothing until the user chooses' ($unpinSrc -match '(?i)Remove nothing until')
+
 Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""

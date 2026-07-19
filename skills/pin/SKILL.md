@@ -9,7 +9,13 @@ Do the following:
 1. Locate buttons.json: read the install marker at `%USERPROFILE%\.claude\claude-buttons-path.txt` — its content is the full path to buttons.json. If the marker is missing, tell the user Claude Buttons is not installed and stop.
 2. Parse the arguments: the first token (possibly quoted) is the text the button types into the chat (e.g. `/code-review` or plain text). An optional second argument is the button label. Without a label, use the text as the label.
 3. **Scope**: ALWAYS ask one clickable question with the AskUserQuestion tool: "Where should the button appear?" with two options: "Only this chat (Recommended)" (first) and "Global (all chats)". Skip the question ONLY if the user already stated the scope in the command. If the user does not actively choose global, it is this-chat only.
-4. For per-chat scope: read `%USERPROFILE%\.claude\active-session.json` and use its `session_id` as the button's `chat` value (a hook updated this file when the user sent this message). Sanity-check: if the file's `ts` is more than 2 minutes old, do not trust it — ask the user, or pin globally with a note.
+4. For per-chat scope: read `%USERPROFILE%\.claude\active-session.json` and use its `session_id` as the button's `chat` value (a hook updated this file when the user sent this message).
+
+   **Staleness check — this one FAILS CLOSED.** If the file is missing or unreadable, or its `ts` is more than 2 minutes old, **REFUSE the pin and explain why. Never widen the scope to global.**
+
+   A per-chat button is per-chat precisely *because* it carries `chat` (and/or `chatTitle`); a button with neither field is global and shows in every conversation. So "carrying on" past a stale session file means dropping the only thing that keeps the button private — and a click in some other chat would then paste the user's text there. When the user asked for this chat, global is not a degraded answer, it is the wrong one, in the direction that leaks their text. A stale file may also carry a *different* conversation's `session_id`, so pinning with it is equally wrong.
+
+   Say: the chat could not be identified, **nothing was pinned**, and sending any message in this chat refreshes the session file, after which they can retry. Do not pin globally, do not pin with the untrusted `session_id`, and do not offer global as the way out. Pin globally only if the user asks for a global button of their own accord, after being told the pin was refused.
 5. Build the button object:
    - Per-chat: `{ "label": "<label>", "short": "<short>", "text": "<text>", "submit": true, "chat": "<session_id>", "chatTitle": "<the current chat's displayed title, if known>" }`
    - Global: same but without `chat`/`chatTitle`.

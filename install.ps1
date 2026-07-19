@@ -88,10 +88,100 @@ function Write-JsonAtomic([string]$path, [string]$text) {
     }
 }
 
+# ---- Stopping the panel: kill the PANEL, and nothing else -------------------------------
+#
+# This used to be `CommandLine -like "*claude-buttons.ps1*"`, which force-kills ANY powershell
+# process whose command line merely MENTIONS the filename: a maintainer's `Select-String
+# claude-buttons.ps1`, an AST analysis one-liner, this project's own test harness. It has
+# already killed this project's tooling mid-run. Three narrowings, all required:
+#   1. the process image must actually BE a PowerShell host (not a script that names one),
+#   2. the panel must be the argument of -File - present *somewhere* in the string is exactly
+#      the bug, and a -Command/-EncodedCommand payload that mentions the panel is a mention,
+#      not a launch,
+#   3. the current process and its ancestors are never killed - the installer runs under
+#      powershell.exe itself, and suicide mid-install leaves a half-installed machine.
+
+# Split a Win32 command line into arguments, honouring double quotes (install paths under
+# %LOCALAPPDATA%\Programs\... routinely contain spaces, so the quoted form is the normal case).
+function Split-CommandLineArgs([string]$commandLine) {
+    $out = New-Object System.Collections.ArrayList
+    $cur = New-Object System.Text.StringBuilder
+    $inQuote = $false
+    $started = $false      # tracks `""` -> a real, empty argument
+    foreach ($ch in [char[]]$commandLine) {
+        if ($ch -eq '"') { $inQuote = -not $inQuote; $started = $true; continue }
+        if (-not $inQuote -and ($ch -eq ' ' -or $ch -eq "`t")) {
+            if ($started -or $cur.Length -gt 0) { [void]$out.Add($cur.ToString()); [void]$cur.Clear(); $started = $false }
+            continue
+        }
+        [void]$cur.Append($ch)
+    }
+    if ($started -or $cur.Length -gt 0) { [void]$out.Add($cur.ToString()) }
+    # Plain return, and EVERY caller wraps the result in @(). The `return ,$arr` idiom protects
+    # a ONE-element array from unrolling, but for a multi-element one it adds an outer wrapper
+    # that @() then collapses to a single element - `@(Split-CommandLineArgs 'a b c').Count` was
+    # 1, so no -File argument was ever found and Stop-Panel silently stopped stopping anything.
+    return $out.ToArray()
+}
+
+# True only if this command line actually LAUNCHES the panel via -File.
+function Test-PanelCommandLine([string]$commandLine, [string]$panelFile) {
+    if ([string]::IsNullOrWhiteSpace($commandLine) -or [string]::IsNullOrWhiteSpace($panelFile)) { return $false }
+    $parts = @(Split-CommandLineArgs $commandLine)
+    if ($parts.Count -lt 2) { return $false }
+    $exe = $null
+    try { $exe = [IO.Path]::GetFileName($parts[0]) } catch { $exe = $parts[0] }
+    # -match is case-insensitive, which is right for Windows executable names.
+    if ($exe -notmatch '^(powershell|powershell_ise|pwsh)(\.exe)?$') { return $false }
+    for ($i = 1; $i -lt $parts.Count; $i++) {
+        $a = $parts[$i]
+        # -File <path>: PowerShell accepts any unambiguous prefix, and / as the switch char.
+        if ($a -match '^[-/](f|fi|fil|file)$') {
+            if ($i + 1 -ge $parts.Count) { return $false }
+            $leaf = $null
+            try { $leaf = [IO.Path]::GetFileName($parts[$i + 1]) } catch { return $false }
+            # -eq is case-insensitive: correct here, since Windows paths are.
+            return ($leaf -eq $panelFile)
+        }
+        # Everything after -Command / -EncodedCommand is a SCRIPT. A script that mentions the
+        # panel's name is the exact false positive this function exists to stop, so stop looking.
+        if ($a -match '^[-/](c|co|com|comm|comma|comman|command|e|en|ec|encodedcommand|enc)$') { return $false }
+    }
+    return $false
+}
+
+# The PID chain from $StartPid up to the root. $ParentMap (pid -> parent pid) is injectable so
+# this is testable without spawning processes; production reads it from Win32_Process.
+function Get-ProcessAncestry([int]$StartPid, $ParentMap) {
+    if ($null -eq $ParentMap) {
+        $ParentMap = @{}
+        foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+            $ParentMap[[int]$p.ProcessId] = [int]$p.ParentProcessId
+        }
+    }
+    $ids = New-Object System.Collections.ArrayList
+    $cur = $StartPid
+    # PID reuse can make the parent chain a CYCLE; the Contains check terminates on one.
+    while ($cur -and -not $ids.Contains([int]$cur)) {
+        [void]$ids.Add([int]$cur)
+        $cur = $ParentMap[[int]$cur]
+    }
+    return $ids.ToArray()   # callers wrap in @() - see Split-CommandLineArgs for why not `,`
+}
+
 function Stop-Panel {
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*$panelName*" } |
-        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $parentMap = @{}
+    foreach ($p in $all) { $parentMap[[int]$p.ProcessId] = [int]$p.ParentProcessId }
+    $spare = @(Get-ProcessAncestry $PID $parentMap)
+    foreach ($p in $all) {
+        if ($spare -contains [int]$p.ProcessId) { continue }
+        # The real image name, from the OS - the command line's argv[0] is caller-supplied text
+        # and a process can be started with any argv[0] it likes.
+        if ($p.Name -notmatch '^(powershell|powershell_ise|pwsh)\.exe$') { continue }
+        if (-not (Test-PanelCommandLine $p.CommandLine $panelName)) { continue }
+        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
+    }
 }
 
 # ---- settings.json hook helpers (safe merge, never clobber existing config) ----
