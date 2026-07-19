@@ -1859,7 +1859,11 @@ function Update-UiaInfo {
         # Rebuild buttons ONLY when content changes (pane count or a pane's chat title).
         # Geometry drift (dragging, resizing) must NOT rebuild - the tick repositions instead.
         $newContentSig = "$($newPanes.Count)|" + (($newPanes | ForEach-Object { $_.Title }) -join '|')
-        if ($newContentSig -ne $prevContentSig) { $script:uiaDirty = $true }
+        # Sending a message renames the chat, so keying the rebuild on the title meant every
+        # button click reset the bar. A pane COUNT change still rebuilds (strips are created or
+        # destroyed); a title change only matters when a button is scoped to a chat.
+        if ($newPanes.Count -ne $script:panes.Count) { $script:uiaDirty = $true }
+        elseif ($newContentSig -ne $prevContentSig -and (Test-AnyChatScoped)) { $script:uiaDirty = $true }
 
         # Back off polling once geometry is fully stable; any change resumes fast polling
         $newGeoSig = ($newPanes | ForEach-Object { "$($_.OffL),$($_.OffT),$($_.Width),$($_.RowCenter)" }) -join '|'
@@ -3528,6 +3532,15 @@ function Get-GroupDef([string]$name) {
 }
 
 # Which buttons apply to a pane, by scope alone (bar assignment is the caller's business).
+# Does any button's visibility actually depend on WHICH chat is in front? When none does, the
+# signals that track the active chat (its title, the active-session file) cannot change what is
+# on the bar - and rebuilding for them tears down and recreates every strip, which since side
+# bars is up to three per pane and reads as the whole bar resetting.
+function Test-AnyChatScoped {
+    foreach ($b in $script:config.buttons) { if ($b.chat -or $b.chatTitle) { return $true } }
+    return $false
+}
+
 function Get-VisibleButtons([string]$paneTitle, [bool]$isPrimary) {
     $vis = @()
     foreach ($b in $script:config.buttons) {
@@ -3771,9 +3784,7 @@ $timer.add_Tick({
             # configured the rebuild cannot change anything - and it tears down and recreates
             # every strip, which reads as the whole bar resetting each time you type in another
             # chat. Now that a pane can own three strips, that flicker got a lot more visible.
-            $chatScoped = $false
-            foreach ($b in $script:config.buttons) { if ($b.chat -or $b.chatTitle) { $chatScoped = $true; break } }
-            if ($chatScoped) { $dirty = $true }
+            if (Test-AnyChatScoped) { $dirty = $true }
         }
         # Hide chat buttons when the "active chat" signal is older than 10 min
         $exp = $false
