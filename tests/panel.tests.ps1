@@ -286,10 +286,43 @@ Check "a confirmed paste returns without waiting out the timeout (${quickMs}ms)"
 # F6: the user's own flagship button is a 12,752-character, 482-line prompt. Every other probe
 # case is a single short line, so multi-line round-tripping through the UIA read-back was
 # entirely unexercised.
+#
+# These two cases were WRONG until the button was tried for real. They fed back an `observed`
+# equal to the payload, which the composer never produces: reading that 482-line prompt out of
+# the live composer returned 480 lines, because TextPattern joins block elements with a single
+# "\n" and the blank line between a heading and its paragraph is not a character in any block.
+# Exact equality therefore refused to send EVERY time - the log said "Paste did not land as
+# expected" and nothing was submitted. The `observed` values below are the shape the composer
+# actually returns.
+# THE CASE THAT WAS SHIPPED BROKEN TWICE. Measured against the live app: pasting the user's
+# 12,752-char button gave a 12,259-char read-back that diverged at character 62, because the
+# composer RENDERS markdown - a ```text fence loses its backticks AND the word "text". No
+# whitespace normalisation can reconcile that, which is what 1.8.0 and 1.8.1 both tried.
+Check 'a rendered code fence (backticks AND language word gone) still confirms' `
+    ((PasteState '{"baseline":"\n","payload":"## Titel\n\n```text\nDu skal svare.\n```","observed":"## Titel\nDu skal svare.\n"}') -eq 'Confirmed')
+Check 'rendered bold (asterisks eaten) still confirms' `
+    ((PasteState '{"baseline":"\n","payload":"gør det **nu** og grundigt","observed":"gør det nu og grundigt\n"}') -eq 'Confirmed')
+# PowerShell unrolls a single-element array when it is passed as an argument, so a one-word
+# payload reached the coverage walk as a bare string and it indexed CHARACTERS. A perfect paste
+# measured 0% coverage and was refused. Caught by the existing draft test; pinned here too.
+Check 'a ONE-WORD payload confirms (single-element array unrolling)' `
+    ((PasteState '{"baseline":"\n","payload":"continue","observed":"continue\n"}') -eq 'Confirmed')
+Check 'markdown whose blank lines the composer collapsed still confirms' `
+    ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.\n\n- item","observed":"## Heading\nBody text.\n- item\n"}') -eq 'Confirmed')
+# Coverage alone is satisfied by "stale clipboard THEN our payload" - an in-order walk just
+# skips the prefix. The size bound is the half that catches it, so it needs its own test.
+Check 'stale clipboard text pasted ALONGSIDE the payload is a Mismatch (size bound)' `
+    ((PasteState '{"baseline":"\n","payload":"## Titel\n\nDu skal svare.","observed":"kodeord hemmeligt kontonummer 4471 privat besked\n## Titel\nDu skal svare.\n"}') -eq 'Mismatch')
 Check 'a multi-line payload with blank lines confirms' `
-    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\n\nline three\n"}') -eq 'Confirmed')
-Check 'a multi-line payload missing its last line is a Mismatch' `
+    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\nline three\n"}') -eq 'Confirmed')
+Check 'a multi-line payload missing its last line is still a Mismatch' `
     ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\n\n\n"}') -eq 'Mismatch')
+# Collapsing whitespace must not blunt contamination detection: stale clipboard text differs in
+# its characters, not its spacing, so it must still fail however the composer reflowed it.
+Check 'stale clipboard text is a Mismatch even after whitespace collapsing' `
+    ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.","observed":"secret token\n## Heading\nBody text.\n"}') -eq 'Mismatch')
+Check 'a payload of only newlines is refused, not confirmed by collapsing' `
+    ((PasteState '{"baseline":"udkast\n","payload":"\n\n  \n","observed":"udkast\n"}') -eq 'Mismatch')
 # Assert the STRING TABLE, not any mention of the key: the previous version matched the
 # Show-SendWarning call sites, so deleting every string still passed while the user would have
 # got a blank tooltip.

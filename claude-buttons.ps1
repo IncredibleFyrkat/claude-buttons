@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.8.0'
+$CB_VERSION = '1.9.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1908,23 +1908,123 @@ function Get-ComposerText($el) {
     } catch {}
     return $null
 }
-function Normalize-ComposerText([string]$s) { ($s -replace "`r`n", "`n").Trim() }
+# WHY THE COMPARISON IS NOT TEXT EQUALITY.
+#
+# MEASURED against the live app, not assumed. Pasting a 12,752-character markdown button and
+# reading the composer back gave 12,259 characters, and the read-back diverged at character 62:
+#
+#   payload : ...AI-agentpanel ```text Du skal gennemfoere...
+#   composer: ...AI-agentpanel Du skal gennemfoere...
+#
+# The composer RENDERS markdown. A fenced code block loses its backticks AND its language word;
+# bold loses its asterisks. The accessibility layer exposes rendered content, not source. So the
+# payload and the read-back differ in their CHARACTERS, and no amount of whitespace normalising
+# can reconcile them - two earlier attempts at exactly that both shipped a panel that refused to
+# send every formatted button.
+#
+# What IS reliable is the words. Rendering deletes a few of them (fence languages) and reflows
+# the rest, but it does not invent words and it does not reorder them. So:
+#
+#   (a) COVERAGE - the payload's words must appear in the read-back, in order, allowing a small
+#       shortfall for the ones rendering eats.
+#   (b) SIZE     - the read-back must not be materially larger than baseline+payload.
+#
+# Both are required. Coverage alone is satisfied by "stale clipboard text THEN our payload",
+# because an in-order walk simply skips the prefix; the size bound is what catches that. Size
+# alone is satisfied by any text of roughly the right length.
+#
+# Measured on the real capture: genuine paste 99.93% coverage / 1.0000 size. Stale clipboard
+# instead of the payload 0% / 0.002. Stale text prepended 0% / 1.145. Half the payload 47.88% /
+# 0.493. Only the genuine one passes both bounds.
+# The two directions are NOT symmetric, and treating them as one percentage was wrong.
+#
+# TOO SMALL is caused by rendering, which only ever deletes. It is not a safety problem: if our
+# text did not land, coverage collapses and we refuse anyway.
+# TOO BIG means content we did not paste is in the box - a stale clipboard alongside our text.
+# That is the leak this whole function exists to stop, so the ceiling is tight.
+#
+# Both need an ABSOLUTE allowance as well as a proportional one. A percentage alone fails on
+# short payloads: a five-word button containing one code fence loses 20% of its words to
+# rendering and was refused, while the same fence in a 1,416-word button costs 0.07%.
+$script:MaxMissingWords    = 3      # or 2% of the payload's words, whichever is larger,
+$script:MaxMissingFraction = 0.02   # but NEVER more than half the payload (see below)
+# Rendering only ever DELETES characters, so ANY growth beyond baseline+payload is content we
+# did not paste. A proportional allowance is therefore wrong in principle and was wrong in
+# practice: at 1% it let 99 stray characters into a 12k payload undetected - a small clipboard
+# leak, which is the exact thing being defended against. The allowance is a rounding margin, not
+# a tolerance.
+$script:ExtraCharsAllowed  = 2
+$script:ExtraFraction      = 0.0
+$script:MinSizeFraction    = 0.60   # below this, too little landed to be our payload at all
 
-# Wait until the composer contains EXACTLY the baseline plus our payload, and nothing else.
+function Get-CompareWords([string]$s) {
+    @([regex]::Matches($s, '[\p{L}\p{N}]+') | ForEach-Object { $_.Value.ToLowerInvariant() })
+}
+function Get-AlnumLength([string]$s) { ($s -replace '[^\p{L}\p{N}]', '').Length }
+
+# In-order word coverage with a bounded look-ahead on BOTH sides. A strict two-pointer walk
+# deadlocks: the payload word 'text' (a fence language) is absent from the read-back, so the
+# payload pointer never advanced past it and a PERFECT paste measured 0.64% coverage.
+function Get-WordCoverage($payloadWords, $observedWords) {
+    # Re-wrap in @(). PowerShell UNROLLS a single-element array when it is passed as an
+    # argument, so a one-word payload arrives here as a bare string - and indexing a string
+    # yields CHARACTERS. A one-word payload then measured 0% coverage and the panel refused a
+    # perfectly good paste. Same family as the if-expression unrolling fixed in Get-JsonDepth.
+    $pw = @($payloadWords)
+    $ow = @($observedWords)
+    if ($pw.Count -eq 0) { return 0.0 }
+    $W = 6
+    $i = 0; $j = 0; $hit = 0
+    while ($i -lt $pw.Count -and $j -lt $ow.Count) {
+        if ($ow[$j] -ceq $pw[$i]) { $i++; $j++; $hit++; continue }
+        $found = -1
+        for ($k = 1; $k -le $W -and ($j + $k) -lt $ow.Count; $k++) {
+            if ($ow[$j + $k] -ceq $pw[$i]) { $found = $j + $k; break }
+        }
+        if ($found -ge 0) { $j = $found + 1; $i++; $hit++ }   # junk in the read-back
+        else { $i++ }                                          # payload word was rendered away
+    }
+    return ($hit / $pw.Count)
+}
+
+function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed) {
+    $pw = @(Get-CompareWords $payload)
+    if ($pw.Count -eq 0) { return $false }
+    $coverage = Get-WordCoverage $pw (Get-CompareWords $observed)
+    $missing  = $pw.Count - ($coverage * $pw.Count)
+    # Cap the allowance at half the payload. Without this a one-word payload could go entirely
+    # missing and still pass, because the absolute floor of 3 exceeded the whole word count -
+    # "secret token" in the box instead of "/review" was Confirmed.
+    $allowedMissing = [Math]::Min(
+        [Math]::Max($script:MaxMissingWords, $pw.Count * $script:MaxMissingFraction),
+        [Math]::Floor($pw.Count / 2))
+    if ($missing -gt $allowedMissing) { return $false }
+
+    $expected = (Get-AlnumLength $baseline) + (Get-AlnumLength $payload)
+    if ($expected -le 0) { return $false }
+    $actual  = Get-AlnumLength $observed
+    $ceiling = $expected + [Math]::Max($script:ExtraCharsAllowed, $expected * $script:ExtraFraction)
+    if ($actual -gt $ceiling) { return $false }               # something else is in the box
+    if ($actual -lt ($expected * $script:MinSizeFraction)) { return $false }
+    return $true
+}
+
+# Wait until the composer holds the baseline plus our payload, judged by word coverage and
+# size (see Test-PasteLanded above for why text equality cannot work here).
 #
 # Ctrl+V is asynchronous: the keystroke is queued and the app reads the clipboard later. If the
 # clipboard is restored before that read, the app pastes the USER'S clipboard instead - the
 # wrong message, and their copied data leaked into an AI conversation. A fixed delay cannot
 # make that safe; only observing the result can.
 #
-# Returns: 'Confirmed'    - the composer is exactly baseline+payload. Safe to restore and submit.
+# Returns: 'Confirmed'    - the composer holds baseline+payload. Safe to restore and submit.
 #          'Mismatch'     - readable, but the content is not what we intended. Something else
 #                           landed (e.g. a stale clipboard). FAIL CLOSED.
 #          'Unverifiable' - the composer exposed no readable text at all. We do not know.
 #
-# Checking for exact equality rather than "contains the payload" matters: a substring probe
-# passes when the draft already happens to start with the same words, or when a previous button
-# left identical boilerplate, and it cannot detect extra content pasted alongside ours.
+# The size bound is what makes this stricter than "contains the payload". A bare containment
+# probe passes when a stale clipboard is pasted ALONGSIDE our text, which is precisely the leak
+# this function exists to stop.
 function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 1200) {
     # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
     # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
@@ -1936,19 +2036,18 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     # this returns Mismatch - a refusal on a legitimate action. Refusing is the safe direction,
     # but it is a real usability cost and it is not automatically testable here, because
     # positioning a caret requires synthetic input.
-    $base = Normalize-ComposerText ([string]$baseline)
-    $want = Normalize-ComposerText ($base + $payload)
-    # A payload that normalizes away entirely would make want == base, which the poll below
-    # would satisfy on its first read - confirming a paste that never happened and then
-    # submitting whatever the user already had in the box. Refuse instead.
-    if ($want -eq $base) { return 'Mismatch' }
+    $base = [string]$baseline
+    # A payload with no words at all can never be verified: coverage is undefined and the poll
+    # would otherwise confirm a paste that never happened, then submit whatever the user already
+    # had in the box. Refuse instead.
+    if ((Get-CompareWords $payload).Count -eq 0) { return 'Mismatch' }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     $sawText = $false
     while ((Get-Date) -lt $deadline) {
         $now = Get-ComposerText $el
         if ($null -ne $now) {
             $sawText = $true
-            if ((Normalize-ComposerText $now) -eq $want) { return 'Confirmed' }
+            if (Test-PasteLanded $base $payload ([string]$now)) { return 'Confirmed' }
         }
         Start-Sleep -Milliseconds 15
     }

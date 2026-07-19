@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.9.0 — 2026-07-19
+
+**1.8.0 and 1.8.1 both shipped a panel that refused to send any formatted button. This is the
+fix, and it is based on measurement rather than on a third guess about why.**
+
+The composer **renders markdown**, and the accessibility layer exposes the rendered result, not
+the source. Pasting a 12,752-character button and reading the box back gave 12,259 characters
+that diverged at character 62:
+
+```
+payload : ...AI-agentpanel ```text Du skal gennemføre...
+composer: ...AI-agentpanel Du skal gennemføre...
+```
+
+A fenced code block loses its backticks *and* its language word; bold loses its asterisks. So
+the two strings differ in their characters, and no amount of whitespace normalisation can
+reconcile them — which is exactly what 1.8.0 (exact equality) and 1.8.1 (collapsed whitespace)
+each tried. Every button containing markdown was refused, every time.
+
+Verification now compares **words and size** instead of characters:
+
+- **Coverage** — the payload's words must appear in the read-back, in order. Rendering deletes a
+  few (fence languages) but never invents or reorders any, so a small shortfall is allowed:
+  three words, or 2%, whichever is larger, and never more than half the payload.
+- **Size** — the read-back must not be larger than baseline+payload by more than a rounding
+  margin. Rendering only ever *deletes*, so any growth is content nobody pasted.
+
+Both must hold. Coverage alone is satisfied by "stale clipboard, then our text", because an
+in-order walk skips the prefix; the size ceiling is what catches that.
+
+Measured against the real 12,752-character paste: genuine paste confirmed; stale clipboard
+instead, before, or after the payload all refused; half the payload refused; eleven stray
+characters refused; ten substituted words refused.
+
+**Known limits, stated plainly.** A substitution that swaps a handful of words while preserving
+the total length can stay inside the 2% coverage allowance. That is not reachable by a stale
+clipboard, which is the threat this defends against, but it is not a content signature. And
+verification still assumes the paste is the only change to the box while it is happening.
+
+## 1.8.1 — 2026-07-19
+
+**Fixes a defect introduced by 1.8.0: long markdown buttons refused to send.**
+
+1.8.0 required the composer to read back character-for-character identical to what was pasted.
+It does not, and never did. The composer is a tree of block elements, and the accessibility
+layer joins consecutive blocks with a single newline — so a blank line *inside* a paragraph
+survives the round-trip, but a blank line *between* a heading and its paragraph does not.
+Reading a 482-line prompt back out of the live composer returned 480 lines.
+
+The result was that any button containing markdown headings compared unequal, was treated as a
+failed paste, and was never sent. The log line was `Paste did not land as expected; composer
+left untouched and NOT sent`. Nothing was lost or leaked — the refusal is the safe direction —
+but the button was unusable.
+
+Comparison now collapses runs of whitespace on both sides. Stale clipboard content differs in
+its characters rather than its spacing, so contamination is still caught; what is forgiven is
+only the composer's own re-flowing of blank lines. A whitespace-only payload still collapses to
+nothing and is still refused.
+
+This was shipped because every test stubbed the composer reader and fed back an `observed`
+value equal to the payload — a shape the real composer never produces. The tests now use the
+measured shape, and reverting the comparator fails them.
+
 ## 1.8.0 — 2026-07-19
 
 **A button can now refuse to send.** That is a deliberate, user-visible behaviour change, and
