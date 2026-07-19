@@ -3595,9 +3595,13 @@ $timer.add_Tick({
             $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
             $sx = if ($st.Side -eq 'left') { $rowL - $edgeGap - $sForm.Width }
                   else { $rowR + $edgeGap }
-            # Bottom edge level with the control row's buttons, so the lowest side button lines up
-            # with the row instead of floating above it.
-            $sy = [int]($pn.DockY + [int]($pillH / 2) + (SW $script:vNudge) - $sForm.Height)
+            # Line the lowest side BUTTON up with the row, not the form that contains it. The
+            # panel's padding and the button's margin sit between the two, so aligning form
+            # edges left the button a few px high. Measured off the control itself, so it stays
+            # correct if either ever changes.
+            $sBtm = $st.Panel.Controls[0]      # BottomUp: the first control is the bottom one
+            $sCtr = $st.Panel.Top + $sBtm.Top + [int]($sBtm.Height / 2)
+            $sy = [int]($pn.DockY + (SW $script:vNudge) - $sCtr)
             $sx = [Math]::Max($r.Left + 2, [Math]::Min($sx, $r.Right - $sForm.Width - 2))
             $sy = [Math]::Max($r.Top + 2, [Math]::Min($sy, $r.Bottom - $sForm.Height - 2))
             $sVis = [bool]$pn.Anchored
