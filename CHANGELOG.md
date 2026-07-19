@@ -26,7 +26,10 @@ PR made it substantially more likely by cutting a post-paste wait from 300ms to 
   successful send.
 - **The keystroke encoder is gone.** It existed only to feed the typing fallback; with that
   removed it was dead code, so it was deleted rather than left in place untested. The panel now
-  synthesises exactly two keystrokes, `^v` and `{ENTER}`, and a test asserts no third can appear.
+  synthesises exactly two keystrokes, `^v` and `{ENTER}`. A test parses the script and fails if
+  any other input-synthesis call is added, so a typing path cannot come back unnoticed. (The
+  earlier claim that "no third keystroke can appear" was too strong: that test searched for one
+  spelling of one API, and four other ways of sending a keystroke got past it.)
 
 Known limitations, stated rather than buried:
 

@@ -1967,7 +1967,13 @@ function Invoke-PasteProbe([string]$jsonPath) {
     # Shadow the UIA reader for the duration of the probe.
     function script:Get-ComposerText($el) { $script:probeObserved }
     $base = if ($null -eq $c.baseline) { $null } else { [string]$c.baseline }
-    [Console]::Out.Write((Wait-PasteLanded $null $base ([string]$c.payload) 120))
+    # Emit the elapsed time alongside the state, measured INSIDE this process. Timing it from
+    # the caller measured powershell.exe startup (~1.5s, +/-200ms) instead of the poll, which
+    # made the "does it actually wait?" test both vacuous and, once differential, flaky.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $state = Wait-PasteLanded $null $base ([string]$c.payload) 120
+    $sw.Stop()
+    [Console]::Out.Write("$state|$($sw.ElapsedMilliseconds)")
     exit 0
 }
 
@@ -2118,8 +2124,8 @@ function Invoke-PillClick($btn) {
 
             # ALWAYS paste via the clipboard rather than typing: it lands instantly instead of
             # animating key-by-key, and it is ATOMIC - a focus change mid-send can no longer
-            # split one message across two chats. Typing is kept only as a fallback for when the
-            # clipboard is unavailable (another app holding it open).
+            # split one message across two chats. There is no typing fallback: if the clipboard
+            # is unavailable the send is ABANDONED and the user is told (see the top of file).
             # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
             # it clobbered, and restore it in finally so it survives an exception.
             if (-not (Test-TargetForeground)) { return }

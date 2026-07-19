@@ -111,7 +111,7 @@ $srcText = $src -join "`n"   # defined here too: these checks run before the doc
 # nine injected defects survived - including one that reinstated the leak verbatim, and two
 # i18n "tests" whose regex was satisfied by the CALL SITES rather than the string table, so
 # deleting every string still passed.
-function PasteState([string]$json) {
+function PasteState([string]$json, [switch]$Raw) {
     # Run from a throwaway dir with its own config and LOCALAPPDATA. Running the panel out of
     # the repo made every test run append "buttons.json unreadable at startup" to the
     # developer's real %LOCALAPPDATA%\claude-buttons.log.
@@ -127,7 +127,9 @@ function PasteState([string]$json) {
     try {
         $env:LOCALAPPDATA = $dir
         $env:USERPROFILE  = $dir
-        (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') -PasteProbe $f 2>$null) -join ''
+        # The probe emits "state|elapsedms"; -Raw callers want both, everyone else just the state.
+        $out = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') -PasteProbe $f 2>$null) -join ''
+        if ($Raw) { $out } else { ($out -split '\|')[0] }
     } finally {
         $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome
         Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -168,12 +170,52 @@ Check 'nothing is submitted unless the paste was Confirmed' `
 # reinstated type-then-Enter and passed the whole suite.
 #
 # There is no typing path any more, so the script should synthesise exactly two keystrokes.
-# Counting them file-wide cannot be dodged by where the code sits or what it is called.
-$sendSites = [regex]::Matches($srcText, 'SendKeys\]::SendWait\(([^)]*)\)')
-Check "exactly two SendWait sites exist in the whole file (found $($sendSites.Count))" ($sendSites.Count -eq 2)
-$sendArgs = @($sendSites | ForEach-Object { $_.Groups[1].Value.Trim() }) -join ' | '
-Check "the only keystrokes sent are '^v' and '{ENTER}' (found: $sendArgs)" `
-    (($sendArgs -eq "'^v' | '{ENTER}'") -or ($sendArgs -eq "'{ENTER}' | '^v'"))
+#
+# Counting `SendKeys]::SendWait(` with a regex was NOT enough: it pins one spelling of one
+# method on one type, so the count stays at two while a leak is reinstated as
+# `SendKeys::Send($esc)` (a real .NET method with identical delivery), or by aliasing the type
+# to a variable first, or via `New-Object -ComObject WScript.Shell`, or by reflection. All four
+# passed the whole suite. So the guard works on TOKENS and the AST instead of on source text.
+#
+# Token gate (load-bearing): outside comments, the input-synthesis APIs may be NAMED exactly
+# twice in the whole file. Aliasing, reflection and COM all have to name the type somewhere, so
+# they cannot get under this - it does not care how the call is spelled or where it sits.
+$srcTok = $null; $srcErr = $null
+$srcAst = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $panel).Path, [ref]$srcTok, [ref]$srcErr)
+$inputApiTokens = @($srcTok | Where-Object {
+    $_.Kind -ne 'Comment' -and $_.Text -match 'SendKeys|WScript|VisualBasic|keybd_event|mouse_event|SendInput|ValuePattern|InvokePattern'
+})
+$tokNames = @($inputApiTokens | ForEach-Object { "$($_.Extent.StartLineNumber):$($_.Text)" }) -join ' | '
+Check "input-synthesis APIs are named exactly twice outside comments (found: $tokNames)" `
+    ($inputApiTokens.Count -eq 2 -and @($inputApiTokens | Where-Object { $_.Text -eq 'System.Windows.Forms.SendKeys' }).Count -eq 2)
+# COM would let a keystroke API be built from a concatenated string, which no token names.
+Check 'no COM object is created (WScript.Shell would synthesise keystrokes unnamed)' `
+    (-not ($srcText -match '-ComObject'))
+# P/Invoke is the one bypass a maintainer might reach for WITHOUT meaning to obfuscate - the
+# thought is "SendKeys is flaky, I'll post WM_CHAR myself", and none of the tokens above appear.
+# The panel legitimately imports ~30 user32 functions, so this denies the input-synthesis ones
+# by name rather than trying to allowlist the rest.
+$inputImports = @([regex]::Matches($srcText,
+    '\b(SendInput|keybd_event|mouse_event|SendMessage\w*|PostMessage\w*|SetForegroundWindow|AttachThreadInput|BlockInput)\b'
+) | ForEach-Object { $_.Value } | Sort-Object -Unique)
+Check "no input-synthesis function is imported via P/Invoke (found: $($inputImports -join ', '))" `
+    ($inputImports.Count -eq 0)
+# AST gate: both mentions must be direct static SendWait calls, and the only two keystrokes
+# they may send are Ctrl+V and Enter. A literal-looking variable or a concatenation fails here.
+$sendCalls = @($srcAst.FindAll({
+    $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+}, $true) | Where-Object { $_.Expression.Extent.Text -match 'SendKeys' })
+Check "exactly two SendKeys calls exist in the AST (found $($sendCalls.Count))" ($sendCalls.Count -eq 2)
+$badMember = @($sendCalls | Where-Object { $_.Member.Extent.Text -ne 'SendWait' -or -not $_.Static })
+Check "both are static ::SendWait (offenders: $(@($badMember | ForEach-Object { $_.Extent.Text }) -join ', '))" `
+    ($badMember.Count -eq 0)
+$sendArgs = @($sendCalls | ForEach-Object {
+    if ($_.Arguments.Count -ne 1) { '<not-one-arg>' }
+    elseif ($_.Arguments[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { '<not-a-literal>' }
+    else { $_.Arguments[0].Value }
+}) | Sort-Object
+Check "the only keystrokes sent are '^v' and '{ENTER}' (found: $($sendArgs -join ' | '))" `
+    (($sendArgs -join ' | ') -eq '^v | {ENTER}')
 Check 'the SendKeys text encoder is gone (it existed only to feed the typing fallback)' `
     (-not ($srcText -match 'function Escape-SendKeys'))
 $failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
@@ -226,20 +268,20 @@ Check 'Wait-PasteLanded cannot return Unverifiable before it has polled' `
 $toMatch = [regex]::Match($srcText, '\[int\]\$timeoutMs = (\d+)')
 Check 'Wait-PasteLanded has a non-trivial default timeout' `
     ($toMatch.Success -and ([int]$toMatch.Groups[1].Value -ge 300))
-# DIFFERENTIAL, not absolute. PasteState spawns a powershell.exe, so ~1.5s of process startup
-# swamped the poll: the no-wait case measured LONGER than the full-timeout case, and a
-# `>= 100ms` threshold could never fail. Compare the two runs against each other instead, so
-# only the poll's own duration is being measured.
-$swWait = [Diagnostics.Stopwatch]::StartNew()
-$unver = PasteState '{"baseline":"\n","payload":"/review","observed":null}'
-$swWait.Stop()
-$swFast = [Diagnostics.Stopwatch]::StartNew()
-$quick = PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}'
-$swFast.Stop()
-$delta = $swWait.ElapsedMilliseconds - $swFast.ElapsedMilliseconds
+# MEASURED IN-PROCESS. Timing this from here spawned a powershell.exe per case, so ~1.5s of
+# startup swamped the ~120ms poll: as an absolute threshold it could never fail, and made
+# differential it was flaky in BOTH directions - three runs on a clean tree gave +112ms, -60ms
+# and +252ms, so it red-lighted good code and could pass a real defect. The probe now reports
+# its own elapsed time, which contains only the poll.
+$unverRaw = PasteState '{"baseline":"\n","payload":"/review","observed":null}' -Raw
+$quickRaw = PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}' -Raw
+$unver = ($unverRaw -split '\|')[0]; $unverMs = [int]($unverRaw -split '\|')[1]
+$quick = ($quickRaw -split '\|')[0]; $quickMs = [int]($quickRaw -split '\|')[1]
 Check 'an unreadable composer returns Unverifiable' ($unver -eq 'Unverifiable')
-Check "the unreadable case waits measurably longer than an instant confirm (delta ${delta}ms)" `
-    (($quick -eq 'Confirmed') -and ($delta -ge 60))
+Check "an unreadable composer polls until its timeout (${unverMs}ms of a 120ms budget)" `
+    ($unverMs -ge 100)
+Check "a confirmed paste returns without waiting out the timeout (${quickMs}ms)" `
+    (($quick -eq 'Confirmed') -and ($quickMs -lt 60))
 
 # F6: the user's own flagship button is a 12,752-character, 482-line prompt. Every other probe
 # case is a single short line, so multi-line round-tripping through the UIA read-back was
