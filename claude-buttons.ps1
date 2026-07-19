@@ -727,13 +727,36 @@ function SW([double]$v) { [int][Math]::Round($v * $script:winScale) }    # posit
 
 # ---------- Logging ----------
 $script:logPath = Join-Path $env:LOCALAPPDATA 'claude-buttons.log'
-$script:lastLogMsg = ''
-$script:lastLogAt = Get-Date '2000-01-01'
+# Suppress a repeat of ANY message seen in the last minute, not just the last one written.
+# Comparing against a single previous message only collapses a line repeating back-to-back:
+# the poll emits DOCK then BOUNDS every pass, so each one always differed from the message
+# immediately before it and NEITHER was ever suppressed - two lines per pass, forever. That
+# buried the rare lines that matter (a refused paste, a lost focus) under thousands of
+# identical status lines, which is the whole reason the dedupe exists.
+$script:logSeen = @{}
+$script:logWindowSec = 60
 function Write-CkLog([string]$msg) {
     try {
-        if ($script:lastLogMsg -eq $msg -and ((Get-Date) - $script:lastLogAt).TotalSeconds -lt 60) { return }
-        $script:lastLogMsg = $msg; $script:lastLogAt = Get-Date
-        Add-Content -Path $script:logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8
+        $now = Get-Date
+        $at = $script:logSeen[$msg]
+        if ($null -ne $at -and ($now - $at).TotalSeconds -lt $script:logWindowSec) { return }
+        $script:logSeen[$msg] = $now
+        # Bounded: without a prune this map grows one entry per distinct message for the life of
+        # the process, and DOCK/BOUNDS lines are distinct whenever any pane's geometry shifts.
+        # Dropping only EXPIRED entries is not enough - a burst of distinct messages inside one
+        # window has nothing to expire, which is precisely the runaway this cap exists to stop -
+        # so fall back to evicting the oldest. An evicted message may log again before its
+        # window is up; a bounded map that occasionally repeats a line beats an unbounded one.
+        if ($script:logSeen.Count -gt 64) {
+            foreach ($k in @($script:logSeen.Keys)) {
+                if (($now - $script:logSeen[$k]).TotalSeconds -ge $script:logWindowSec) { $script:logSeen.Remove($k) }
+            }
+            if ($script:logSeen.Count -gt 64) {
+                $oldest = @($script:logSeen.GetEnumerator() | Sort-Object Value | Select-Object -First ($script:logSeen.Count - 64))
+                foreach ($e in $oldest) { $script:logSeen.Remove($e.Key) }
+            }
+        }
+        Add-Content -Path $script:logPath -Value "$($now.ToString('yyyy-MM-dd HH:mm:ss')) $msg" -Encoding UTF8
     } catch {}
 }
 
@@ -1542,10 +1565,7 @@ function Set-PaneSideRooms($panes, $wr) {
             }
         }
     }
-    # One line for all panes: Write-CkLog dedupes against the LAST message only, so a single
-    # unchanging summary is free while several alternating lines are not.
-    Write-CkLog ("BOUNDS measured={0}/{1} rects={2} rooms={3}" -f $measured, $panes.Count, $script:paneBounds.Count,
-        (($panes | ForEach-Object { "$($_.LeftRoom)/$($_.RightRoom)" }) -join ' '))
+    # One summary line for all panes rather than one per pane.
     Write-CkLog ("BOUNDS measured={0}/{1} rects={2} rooms={3}" -f $measured, $panes.Count, $script:paneBounds.Count,
         (($panes | ForEach-Object { "$($_.LeftRoom)/$($_.RightRoom)" }) -join ' '))
     if ($measured -eq $panes.Count) { return }
@@ -3066,6 +3086,30 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
         $nc = if ($k -lt $last.Length) { [int][char]$last[$k] } else { -1 }
         Write-CkLog ("PASTEDIFF firstDiff={0} wantLen={1} gotLen={2} baseLen={3} wantChr={4} gotChr={5}" -f `
             $k, $want.Length, $last.Length, $base.Length, $wc, $nc)
+        # DIAGNOSTIC ONLY - never consulted for the verdict.
+        #
+        # $el is captured at UIA-scan time and can be up to a poll interval old. If the app
+        # re-renders the composer (a slash-command palette opening on a payload that starts
+        # with "/" is the suspected trigger), that handle can survive as a DETACHED node that
+        # still answers reads with its last text - so the paste lands in the real box while we
+        # sit here comparing against a ghost. The element holding keyboard FOCUS is by
+        # definition the one Ctrl+V went to, so a disagreement between the two is exactly the
+        # fingerprint of that failure, and agreement means the paste genuinely never landed.
+        # This only records which of the two it was; acting on the focused element's text would
+        # be a second way to reach Confirmed, and a wrong Confirmed SENDS.
+        try {
+            $fe = [System.Windows.Automation.AutomationElement]::FocusedElement
+            if ($fe) {
+                $ft = Get-ComposerText $fe
+                $fLast = if ($null -eq $ft) { $null } else { ($ft -replace "`r`n", "`n").TrimEnd("`n") }
+                $same = try { [System.Windows.Automation.Automation]::Compare($fe, $el) } catch { $null }
+                Write-CkLog ("PASTEFOCUS sameEl={0} focusLen={1} readable={2} matchesWant={3} matchesPayload={4}" -f `
+                    $same, $(if ($null -eq $fLast) { -1 } else { $fLast.Length }), ($null -ne $fLast),
+                    ($fLast -eq $want), ($fLast -eq $payload))
+            } else {
+                Write-CkLog 'PASTEFOCUS no focused element'
+            }
+        } catch { Write-CkLog "PASTEFOCUS unavailable: $($_.Exception.Message)" }
         # The full text pins down a mismatch in one look, but it is the user's prompt - so it is
         # opt-in via "debugPaste": true in buttons.json, not something the tool writes by default.
         if ($script:debugPaste) {

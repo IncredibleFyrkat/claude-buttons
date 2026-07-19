@@ -799,6 +799,45 @@ Check 'the trailing stray does not drag the dock right' ((($pick2 | Measure-Obje
 $normal = @( (B 0 27), (B 33 27), (B 66 27), (B 99 27) )
 Check 'an ordinary row is one run, unchanged' ((@(Pick-Run $normal 20)).Count -eq 4)
 
+# --- The log dedupe must survive INTERLEAVED messages ---
+# The poll emits two different status lines per pass. A dedupe that remembers only the LAST
+# message written suppresses neither, because each differs from the one immediately before it -
+# so the log grew two lines per pass without bound and buried the rare lines that matter.
+# Drives the real function so the state machine is exercised, not a re-implementation of it.
+$logNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Write-CkLog' }, $true)
+Check 'Write-CkLog was found' ($null -ne $logNode)
+$logDir = Join-Path ([IO.Path]::GetTempPath()) ("cb-log-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+try {
+    . ([scriptblock]::Create($logNode.Extent.Text))
+    $script:logPath = Join-Path $logDir 'test.log'
+    $script:logSeen = @{}
+    $script:logWindowSec = 60
+    foreach ($i in 1..40) { Write-CkLog 'DOCK same'; Write-CkLog 'BOUNDS same' }
+    Check 'two alternating repeats collapse to one line each' ((@(Get-Content $script:logPath)).Count -eq 2)
+
+    # A genuinely new message must still get through - suppression is per-message, not global.
+    Write-CkLog 'Paste did not land as expected'
+    Check 'a new message is still logged' ((@(Get-Content $script:logPath)).Count -eq 3)
+
+    # ...and a repeat is admitted again once its own window has passed.
+    $script:logSeen['DOCK same'] = (Get-Date).AddSeconds(-($script:logWindowSec + 1))
+    Write-CkLog 'DOCK same'
+    Check 'a repeat is logged again after its window expires' ((@(Get-Content $script:logPath)).Count -eq 4)
+
+    # The map is bounded even when nothing has EXPIRED: 200 distinct messages inside one window
+    # is the runaway case, and an age-only prune has nothing to drop.
+    $script:logSeen = @{}
+    foreach ($i in 1..200) { Write-CkLog "distinct $i" }
+    Check 'the dedupe map stays bounded under a burst' ($script:logSeen.Count -le 65)
+
+    # Eviction must not cost suppression for the lines that actually repeat: the poll's own
+    # handful of status messages stay inside the cap and keep collapsing.
+    $before = (@(Get-Content $script:logPath)).Count
+    foreach ($i in 1..40) { Write-CkLog 'DOCK poll'; Write-CkLog 'BOUNDS poll' }
+    Check 'the poll pair still collapses after an eviction burst' (((@(Get-Content $script:logPath)).Count - $before) -eq 2)
+} finally { Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
