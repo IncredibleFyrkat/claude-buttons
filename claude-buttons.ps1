@@ -1460,6 +1460,7 @@ function Set-PaneSideRooms($panes, $wr) {
                 $p.PaneR = [int]($pb.X + $pb.W)
                 $p.LeftRoom = [int]($p.Cx - $pb.X)
                 $p.RightRoom = [int](($pb.X + $pb.W) - ($p.Cx + $p.Cw))
+                $p.BoundsReal = $true
                 $measured++
                 break
             }
@@ -3600,8 +3601,17 @@ $timer.add_Tick({
             $edgeGap = S 6
             $rowL = if ($null -ne $pn.RowL) { [int]$pn.RowL } else { [int]$pn.Cx }
             $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
-            $sx = if ($st.Side -eq 'left') { $rowL - $edgeGap - $sForm.Width + (S 2) }
-                  else { $rowR + $edgeGap }
+            # The composer element is only the TEXT AREA - the control row below it is wider, so
+            # the composer's right edge sits left of the row's own outermost controls. The pane
+            # rect is the real outer bound. Used only when it came from a measured UIA pane
+            # group; otherwise fall back to clearing the row, which is never worse than today.
+            $sx = if ($st.Side -eq 'left') {
+                      $rowL - $edgeGap - $sForm.Width + (S 2)
+                  } elseif ($pn.BoundsReal) {
+                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($rowR + $edgeGap))
+                  } else {
+                      [int]($rowR + $edgeGap)
+                  }
             # Line the lowest side BUTTON up with the row, not the form that contains it. The
             # panel's padding and the button's margin sit between the two, so aligning form
             # edges left the button a few px high. Measured off the control itself, so it stays
