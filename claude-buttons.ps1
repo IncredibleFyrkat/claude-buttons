@@ -1035,27 +1035,37 @@ function Get-ButtonBar($b) {
 function Set-ButtonBar($t, [string]$bar) {
     $ok = Update-Buttons {
         param($btns)
+        $btns = @($btns)
+        $moving = @(); $rest = @()
         foreach ($b in $btns) {
-            if ($t.__isGroup) {
-                # Moving a group moves its whole membership, or the group would split across bars.
-                if ([string]$b.group -eq [string]$t.group) {
-                    if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
-                    else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
-                }
-            } elseif (Same-Button $b $t) {
-                # Moving ONE button out of a group takes it out of the group. Keeping the group
-                # field would collapse it straight back behind the group face on the new bar,
-                # so the move would look like it silently did nothing.
-                $b.PSObject.Properties.Remove('group')
+            # Moving a group moves its whole membership, or the group splits across two bars.
+            $isTarget = if ($t.__isGroup) { [string]$b.group -eq [string]$t.group } else { Same-Button $b $t }
+            if ($isTarget) {
                 if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
                 else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
-            }
+                # Moving ONE button out of a group takes it out of the group. Keeping the field
+                # would collapse it straight back behind the group face on the new bar, so the
+                # move would look like it silently did nothing.
+                if (-not $t.__isGroup) { $b.PSObject.Properties.Remove('group') }
+                $moving += $b
+            } else { $rest += $b }
         }
-        $btns
+        if ($moving.Count -eq 0) { return $btns }
+        # Land at the END of the destination bar's run. Setting the field alone left the button
+        # wherever it already sat in the array, so it arrived at the bottom of a side bar and
+        # shoved everything already there upward - the opposite of being added.
+        $insertAt = -1
+        for ($i = 0; $i -lt $rest.Count; $i++) { if ((Get-ButtonBar $rest[$i]) -eq $bar) { $insertAt = $i } }
+        if ($insertAt -lt 0) { return @($rest) + @($moving) }
+        $out = @()
+        for ($i = 0; $i -lt $rest.Count; $i++) {
+            $out += $rest[$i]
+            if ($i -eq $insertAt) { $out += $moving }
+        }
+        $out
     }
     if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }
 }
-
 function Same-Button($a, $b) {
     # -ceq, not -eq: PowerShell's -eq is case-INSENSITIVE, so "Deploy"/"/deploy prod" matched
     # a genuinely different button "deploy"/"/DEPLOY PROD". Two buttons whose text differs only

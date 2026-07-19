@@ -668,6 +668,39 @@ Check 'the orphan does not become a button' ((Buttons $r.Out) -eq 1)
 $r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","group":"g"} ], "groups": { "g": { "icon": "note" } } }'
 Check 'a group WITH a member collapses its member behind one face' ((Buttons $r.Out) -eq 1)
 
+# --- Moving to a bar lands at the END of that bar's run ---
+# Setting the bar field alone left the button wherever it already sat in the array. Bars render
+# in array order, so a button moved to a side bar arrived at the BOTTOM and shoved everything
+# already there upward, reading as an insert rather than an addition.
+function Move-ToBar($btns, $t, [string]$bar) {
+    $btns = @($btns); $moving = @(); $rest = @()
+    foreach ($b in $btns) {
+        if (Same-Button $b $t) {
+            if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
+            else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
+            $moving += $b
+        } else { $rest += $b }
+    }
+    $insertAt = -1
+    for ($i = 0; $i -lt $rest.Count; $i++) { if ((Get-ButtonBar $rest[$i]) -eq $bar) { $insertAt = $i } }
+    if ($insertAt -lt 0) { return @($rest) + @($moving) }
+    $out = @()
+    for ($i = 0; $i -lt $rest.Count; $i++) { $out += $rest[$i]; if ($i -eq $insertAt) { $out += $moving } }
+    $out
+}
+$cfg2 = @(
+    [pscustomobject]@{ label = 'X'; text = '/x' },
+    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
+    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' },
+    [pscustomobject]@{ label = 'Y'; text = '/y' }
+)
+$moved = @(Move-ToBar $cfg2 $cfg2[0] 'left')
+$onLeft = @($moved | Where-Object { $_.bar -eq 'left' } | ForEach-Object { $_.label })
+Check 'a button moved to a side bar lands last, not first' (($onLeft -join ',') -eq 'L1,L2,X')
+Check 'nothing is lost in the move' ($moved.Count -eq 4)
+$first = @(Move-ToBar $cfg2 $cfg2[3] 'right')
+Check 'the first button on an empty bar still lands there' ((@($first | Where-Object { $_.bar -eq 'right' }).Count) -eq 1)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
