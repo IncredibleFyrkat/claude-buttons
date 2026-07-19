@@ -1668,11 +1668,13 @@ function Update-UiaInfo {
                         $rowEdges += [double]($bb.X + $bb.Width)
                     }
                 }
-                # Anchor to the SECOND-outermost control on the right. The outermost is the
-                # status spinner, which only exists while a turn is running - anchoring to it
-                # would walk the bar sideways every time generation starts and stops.
-                $rowEdges = @($rowEdges | Sort-Object -Descending)
-                $rowR = if ($rowEdges.Count -ge 2) { $rowEdges[1] } elseif ($rowEdges.Count -eq 1) { $rowEdges[0] } else { $null }
+                # The COMPOSER's right edge, not any control on the row. Counting controls from
+                # the outside in is unstable by construction: the row gains and loses a status
+                # spinner as turns run, some of its items are text rather than buttons so they
+                # never appear here at all, and every "outermost minus N" rule picked a
+                # different element than the one it looked like on screen. The composer bounds
+                # every one of them and does not move.
+                $rowR = $c.X + $c.W
                 $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
                 $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
                 $newPanes += @{
