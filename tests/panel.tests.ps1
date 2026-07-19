@@ -612,6 +612,179 @@ foreach ($s in @('pin', 'unpin')) {
     Check "the /$s skill uses the locked CLI entry point" ($sk -match '-(Add|Remove)Button')
     Check "the /$s skill is told not to write buttons.json itself" ($sk -match '(?i)do NOT (read, edit or )?write buttons\.json')
 }
+# --- Ordering: groups move as ONE block ---
+# Left/right used to swap two adjacent array entries. Once a group could span several entries
+# that was wrong twice over: moving a group dragged a single member out of it, and moving a
+# plain button past a group landed it in the group's middle. Both silently lose a button from
+# the bar, so the block algebra is checked directly.
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($panel, [ref]$null, [ref]$null)
+foreach ($fn in @('Get-ButtonBlocks')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text }
+}
+function Same-Button($a, $b) { ($a.label -eq $b.label) -and ($a.text -eq $b.text) -and ([string]$a.chat -eq [string]$b.chat) }
+
+function Swap-Blocks($btns, $key, [int]$dir) {
+    $blocks = @(Get-ButtonBlocks $btns)
+    $bi = -1
+    for ($i = 0; $i -lt $blocks.Count; $i++) {
+        if ($blocks[$i].key -eq $key) { $bi = $i; break }
+        if (-not $key -and -not $blocks[$i].key) { }
+    }
+    $nb = $bi + $dir
+    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
+    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
+    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
+    $out
+}
+
+$cfg = @(
+    [pscustomobject]@{ label = 'A'; text = '/a' },
+    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' },
+    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'grp' },
+    [pscustomobject]@{ label = 'B'; text = '/b' }
+)
+$blocks = @(Get-ButtonBlocks $cfg)
+Check 'a group collapses to one block (A, grp, B)' ($blocks.Count -eq 3 -and $blocks[1].key -eq 'g:grp' -and $blocks[1].items.Count -eq 2)
+
+$moved = @(Swap-Blocks $cfg 'g:grp' -1)
+Check 'moving a group left keeps its members together' ((($moved | ForEach-Object { $_.label }) -join ',') -eq 'G1,G2,A,B')
+Check 'moving a group never loses a button' ($moved.Count -eq $cfg.Count)
+
+$moved2 = @(Swap-Blocks $cfg 'g:grp' 1)
+Check 'moving a group right jumps the whole block past B' ((($moved2 | ForEach-Object { $_.label }) -join ',') -eq 'A,B,G1,G2')
+
+$edge = @(Swap-Blocks $cfg 'g:grp' -99)
+Check 'an out-of-range move is a no-op, not a truncation' ($edge.Count -eq $cfg.Count)
+
+# --- Bars: a button assigned to a side must LEAVE the control row ---
+# The row strip and the side strips share one visibility filter. If the row stopped filtering on
+# bar, a side button would render twice - once in the row and once in the margin.
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"}, {"label":"B","text":"/b","bar":"left"} ] }'
+Check 'a left-bar button is not drawn in the control row' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","bar":"left"}, {"label":"B","text":"/b","bar":"right"} ] }'
+Check 'both sides empty the row entirely' ((Buttons $r.Out) -eq 0 -and $r.Code -eq 0)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","bar":"nonsense"} ] }'
+Check 'an unknown bar value falls back to the row, not nowhere' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"}, {"label":"B","text":"/b"} ] }'
+Check 'no bar field = every button stays in the row (back-compat)' ((Buttons $r.Out) -eq 2)
+
+# --- Strip index -> pane index must TRUNCATE, not round ---
+# Two side strips per pane, so strip i belongs to pane i/2. PowerShell's [int] rounds half away
+# to even, so [int](3/2) is 2, not 1 - strip 3 was paired with the wrong pane, leaving one pane
+# with no right bar while its neighbour drew two in the same place. Pure integer logic, and the
+# symptom (a bar missing in SOME chats) looks nothing like an arithmetic bug, so pin it.
+$mapOk = $true
+$roundBroke = $false
+for ($i = 0; $i -lt 12; $i++) {
+    if ([int][Math]::Floor($i / 2) -ne [Math]::Truncate($i / 2)) { $mapOk = $false }
+    if ([int]($i / 2) -ne [Math]::Truncate($i / 2)) { $roundBroke = $true }
+}
+Check 'floor maps every strip index to its own pane' $mapOk
+Check '[int] does NOT (guards the fix from being reverted to it)' $roundBroke
+Check 'the source uses Floor for the strip->pane map' (((Get-Content $panel -Raw) -split "`n" | Where-Object { $_ -match '\$pIdx = ' } | Where-Object { $_ -notmatch 'Floor' }).Count -eq 0)
+
+# --- Reordering is per-bar ---
+# The bars share one array. Ordering across the whole of it would let a move on the row
+# reshuffle the side bars, or land a row button in the middle of a side bar's run.
+function Get-ButtonBar($b) { $v = [string]$b.bar; if (@('row','left','right') -contains $v) { $v } else { 'row' } }
+function Reorder-InBar($btns, $t, [int]$dir) {
+    $btns = @($btns)
+    $bar = Get-ButtonBar $t
+    $idxs = @()
+    for ($i = 0; $i -lt $btns.Count; $i++) { if ((Get-ButtonBar $btns[$i]) -eq $bar) { $idxs += $i } }
+    $blocks = @(Get-ButtonBlocks @($idxs | ForEach-Object { $btns[$_] }))
+    $bi = -1
+    for ($i = 0; $i -lt $blocks.Count; $i++) { if (Same-Button $blocks[$i].items[0] $t) { $bi = $i; break } }
+    $nb = $bi + $dir
+    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
+    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
+    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
+    for ($k = 0; $k -lt $idxs.Count; $k++) { $btns[$idxs[$k]] = $out[$k] }
+    $btns
+}
+$mix = @(
+    [pscustomobject]@{ label = 'R1'; text = '/r1' },
+    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
+    [pscustomobject]@{ label = 'R2'; text = '/r2' },
+    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' }
+)
+$m = @(Reorder-InBar $mix $mix[1] 1)
+Check 'moving a left-bar button reorders only the left bar' ((($m | ForEach-Object { $_.label }) -join ',') -eq 'R1,L2,R2,L1')
+Check 'the row buttons keep their own positions' ((($m | Where-Object { -not $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'R1,R2')
+$m2 = @(Reorder-InBar $mix $mix[0] 1)
+Check 'moving a row button does not disturb the side bar' ((($m2 | Where-Object { $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'L1,L2')
+$m3 = @(Reorder-InBar $mix $mix[1] -1)
+Check 'the first button on a bar cannot move further down' ((($m3 | ForEach-Object { $_.label }) -join ',') -eq 'R1,L1,R2,L2')
+
+# --- An empty group definition must not survive ---
+# Groups live in config.groups, keyed by name, but a group exists only through its members.
+# When the last member left, the orphaned icon/label stayed and kept appearing in
+# "Move to group" as a group that renders nowhere. A config carrying such an orphan must still
+# load, and the group must not be treated as real.
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"} ], "groups": { "ghost": { "icon": "note", "label": "Ghost" } } }'
+Check 'a config with an orphaned group def still loads' (($r.Out -match 'SMOKE-OK') -and $r.Code -eq 0)
+Check 'the orphan does not become a button' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","group":"g"} ], "groups": { "g": { "icon": "note" } } }'
+Check 'a group WITH a member collapses its member behind one face' ((Buttons $r.Out) -eq 1)
+
+# --- Moving to a bar lands at the END of that bar's run ---
+# Setting the bar field alone left the button wherever it already sat in the array. Bars render
+# in array order, so a button moved to a side bar arrived at the BOTTOM and shoved everything
+# already there upward, reading as an insert rather than an addition.
+function Move-ToBar($btns, $t, [string]$bar) {
+    $btns = @($btns); $moving = @(); $rest = @()
+    foreach ($b in $btns) {
+        if (Same-Button $b $t) {
+            if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
+            else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
+            $moving += $b
+        } else { $rest += $b }
+    }
+    $insertAt = -1
+    for ($i = 0; $i -lt $rest.Count; $i++) { if ((Get-ButtonBar $rest[$i]) -eq $bar) { $insertAt = $i } }
+    if ($insertAt -lt 0) { return @($rest) + @($moving) }
+    $out = @()
+    for ($i = 0; $i -lt $rest.Count; $i++) { $out += $rest[$i]; if ($i -eq $insertAt) { $out += $moving } }
+    $out
+}
+$cfg2 = @(
+    [pscustomobject]@{ label = 'X'; text = '/x' },
+    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
+    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' },
+    [pscustomobject]@{ label = 'Y'; text = '/y' }
+)
+$moved = @(Move-ToBar $cfg2 $cfg2[0] 'left')
+$onLeft = @($moved | Where-Object { $_.bar -eq 'left' } | ForEach-Object { $_.label })
+Check 'a button moved to a side bar lands last, not first' (($onLeft -join ',') -eq 'L1,L2,X')
+Check 'nothing is lost in the move' ($moved.Count -eq 4)
+$first = @(Move-ToBar $cfg2 $cfg2[3] 'right')
+Check 'the first button on an empty bar still lands there' ((@($first | Where-Object { $_.bar -eq 'right' }).Count) -eq 1)
+
+# --- Dissolving a group leaves its members where they were ---
+# Members already carry the group's bar and already occupy the group face's slot in the array,
+# so dropping the group field must be enough. If it were not, dissolving would scatter the
+# buttons back to the control row.
+function Dissolve($btns, [string]$g) {
+    $btns = @($btns)
+    foreach ($b in $btns) { if ([string]$b.group -eq $g) { $b.PSObject.Properties.Remove('group') } }
+    $btns
+}
+$grp = @(
+    [pscustomobject]@{ label = 'A'; text = '/a' },
+    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'g'; bar = 'right' },
+    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'g'; bar = 'right' },
+    [pscustomobject]@{ label = 'B'; text = '/b' }
+)
+$d = @(Dissolve $grp 'g')
+Check 'dissolving keeps the members on their bar' ((@($d | Where-Object { $_.bar -eq 'right' }).Count) -eq 2)
+Check 'dissolving keeps them in the group face position' ((($d | ForEach-Object { $_.label }) -join ',') -eq 'A,G1,G2,B')
+Check 'no member is left claiming the group' ((@($d | Where-Object { $_.group }).Count) -eq 0)
+Check 'they are now separate blocks, not one' ((@(Get-ButtonBlocks $d).Count) -eq 4)
 
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }

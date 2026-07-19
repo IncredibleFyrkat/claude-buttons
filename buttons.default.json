@@ -8,7 +8,7 @@
     "zoneTop": 45,
     "zoneBottom": 55,
     "fallbackRow": 33,
-    "stripGap": 10,
+    "stripGap": 1,
     "reservedW": 380,
     "vNudge": 0,
     "lang": "en",
