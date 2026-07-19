@@ -2959,19 +2959,24 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     # this returns Mismatch - a refusal on a legitimate action. Refusing is the safe direction,
     # but it is a real usability cost and it is not automatically testable here, because
     # positioning a caret requires synthetic input.
-    $base = Normalize-ComposerText ([string]$baseline)
-    $want = Normalize-ComposerText ($base + $payload)
-    # A payload that normalizes away entirely would make want == base, which the poll below
-    # would satisfy on its first read - confirming a paste that never happened and then
-    # submitting whatever the user already had in the box. Refuse instead.
-    if ($want -eq $base) { return 'Mismatch' }
+    # Strip ONLY the composer's own trailing newline terminator, never the user's whitespace.
+    # Trim()ing the baseline before concatenating discarded a trailing space in the draft, but
+    # the paste lands AFTER that space and it is still there - so "draft " + "/cmd" expected
+    # "draft/cmd" while the box actually read "draft /cmd", and every click on a draft ending
+    # in a space was refused as a failed paste.
+    $base = (([string]$baseline) -replace "`r`n", "`n").TrimEnd("`n")
+    $want = $base + $payload
+    # A payload that is only whitespace would make the comparison satisfiable by the draft
+    # alone on the first read - confirming a paste that never happened and then submitting
+    # whatever the user already had in the box. Refuse instead.
+    if ([string]::IsNullOrWhiteSpace($payload)) { return 'Mismatch' }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     $sawText = $false
     while ((Get-Date) -lt $deadline) {
         $now = Get-ComposerText $el
         if ($null -ne $now) {
             $sawText = $true
-            if ((Normalize-ComposerText $now) -eq $want) { return 'Confirmed' }
+            if ((($now -replace "`r`n", "`n").TrimEnd("`n")) -eq $want) { return 'Confirmed' }
         }
         Start-Sleep -Milliseconds 15
     }

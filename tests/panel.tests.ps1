@@ -142,6 +142,20 @@ Check 'a clean paste into an EMPTY composer is Confirmed' `
 # terminator mid-string and every click with a draft in the box refused to send.
 Check 'a clean paste on top of a USER DRAFT is Confirmed (not refused)' `
     ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast/review\n"}') -eq 'Confirmed')
+# Trimming the baseline before concatenating discarded the user's own trailing whitespace, but
+# the paste lands AFTER it and it is still in the box - so "draft " + "/cmd" expected
+# "draft/cmd" while the composer read "draft /cmd". Every click on a draft ending in a space
+# was refused as a failed paste. Only the composer's own terminator may be stripped.
+Check 'a draft ending in a SPACE is Confirmed, not refused' `
+    ((PasteState '{"baseline":"hi there \n","payload":"/review","observed":"hi there /review\n"}') -eq 'Confirmed')
+Check 'leading whitespace in the draft is preserved too' `
+    ((PasteState '{"baseline":"  indented\n","payload":"/review","observed":"  indented/review\n"}') -eq 'Confirmed')
+# The other side of that coin: whitespace must not become a way to satisfy the check without a
+# paste, or the panel would submit the user's draft on its own.
+Check 'a whitespace-only payload is refused' `
+    ((PasteState '{"baseline":"hi\n","payload":"   ","observed":"hi   \n"}') -eq 'Mismatch')
+Check 'a paste that never landed is still a Mismatch' `
+    ((PasteState '{"baseline":"hi\n","payload":"/review","observed":"hi\n"}') -eq 'Mismatch')
 Check 'a stale clipboard landing instead of the payload is a Mismatch' `
     ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token\n"}') -eq 'Mismatch')
 # The exact shape reported in PR #4: stale text prepended, our payload also present. A
