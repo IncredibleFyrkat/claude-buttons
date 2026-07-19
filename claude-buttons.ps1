@@ -1658,16 +1658,21 @@ function Update-UiaInfo {
                 # capped at the composer's left 60% to find the mic cluster, so it cannot give a
                 # right extent. Bounded to this composer's own span: in a grid the neighbouring
                 # panes' rows sit at the same Y and would otherwise be swept up.
-                $rowL = $null; $rowR = $null
+                $rowL = $null; $rowEdges = @()
                 foreach ($b in $allBtns) {
                     $bb = $b.Cached.BoundingRectangle
                     $bcy = $bb.Y + $bb.Height / 2
                     if ($bcy -gt $cBottom -and $bcy -lt ($cBottom + (SW 64)) -and
                         $bb.X -ge ($c.X - (SW 40)) -and ($bb.X + $bb.Width) -le ($c.X + $c.W + (SW 40))) {
                         if ($null -eq $rowL -or $bb.X -lt $rowL) { $rowL = $bb.X }
-                        if ($null -eq $rowR -or ($bb.X + $bb.Width) -gt $rowR) { $rowR = $bb.X + $bb.Width }
+                        $rowEdges += [double]($bb.X + $bb.Width)
                     }
                 }
+                # Anchor to the SECOND-outermost control on the right. The outermost is the
+                # status spinner, which only exists while a turn is running - anchoring to it
+                # would walk the bar sideways every time generation starts and stops.
+                $rowEdges = @($rowEdges | Sort-Object -Descending)
+                $rowR = if ($rowEdges.Count -ge 2) { $rowEdges[1] } elseif ($rowEdges.Count -eq 1) { $rowEdges[0] } else { $null }
                 $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
                 $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
                 $newPanes += @{
@@ -3593,7 +3598,7 @@ $timer.add_Tick({
             $edgeGap = S 6
             $rowL = if ($null -ne $pn.RowL) { [int]$pn.RowL } else { [int]$pn.Cx }
             $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
-            $sx = if ($st.Side -eq 'left') { $rowL - $edgeGap - $sForm.Width }
+            $sx = if ($st.Side -eq 'left') { $rowL - $edgeGap - $sForm.Width + (S 2) }
                   else { $rowR + $edgeGap }
             # Line the lowest side BUTTON up with the row, not the form that contains it. The
             # panel's padding and the button's margin sit between the two, so aligning form
