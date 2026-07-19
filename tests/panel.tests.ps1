@@ -1460,7 +1460,7 @@ Check 'the toggle ON state is never recoloured (every palette pick regresses its
 # composer, so this pane's composer is rejected; in a vertically-staggered layout a
 # NEIGHBOURING pane's composer can pass instead and take the prompt. The everyday symptom was
 # that side-bar buttons silently did nothing; sending to the wrong chat was the tail case.
-foreach ($fn in @('Resolve-StripForm', 'Get-PaneForForm', 'Get-StripWidth', 'Get-PillWidth',
+foreach ($fn in @('Resolve-StripForm', 'Get-PaneForForm', 'Test-CanGuessFrom', 'Get-StripWidth', 'Get-PillWidth',
                   'Get-ShortLabel', 'Get-GroupDef', 'Get-IconGlyph', 'Test-ChatButtonVisible', 'S')) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
     if ($node) { Invoke-Expression $node.Extent.Text } else { $missingFns += $fn }
@@ -1492,6 +1492,45 @@ Check 'a mirror window resolves to its own pane, offset past the primary' `
 Check 'an unknown window resolves to no pane' ($null -eq (Get-PaneForForm ([pscustomobject]@{ Name = 'stranger' })))
 Check 'a null form resolves to no pane' ($null -eq (Get-PaneForForm $null))
 
+# --- Test-CanGuessFrom: WHICH hosts may fall back to guessing at a composer ---
+# This is the wrong-chat invariant, asserted by VALUE. The predicate was extracted from
+# Invoke-PillClick precisely so it could be tested this way: the previous guard was pinned only
+# by an AST check that a guard variable's assignment text mentioned $form or $script:mirrors,
+# and this mutant satisfied it while reinstating the whole hazard -
+#
+#     $canGuess = ($sf -eq $form) -or ($null -ne $script:mirrors)
+#
+# because the surviving `$sf -eq $form` half still matched the regex. The check asserted that a
+# row-derived assignment EXISTS, never that side strips are EXCLUDED. Two reviewers found that
+# independently, one by mutation and one by reading the test.
+#
+# The geometric fallback scores candidate composers on the assumption that the strip is a
+# HORIZONTAL row docked BELOW its composer. A side strip is anchored above it, so the fallback's
+# model does not describe it: at best every candidate is rejected and the click silently does
+# nothing; at worst, in a vertically-staggered layout, a NEIGHBOURING pane's composer scores
+# best and the prompt goes into a conversation the user was not looking at.
+Check 'the primary strip MAY use the geometric fallback' (Test-CanGuessFrom $form)
+Check 'a mirror strip MAY use the geometric fallback' (Test-CanGuessFrom $script:mirrors[0].Form)
+Check 'a SIDE strip may NOT use the geometric fallback' (-not (Test-CanGuessFrom $script:sideStrips[0].Form))
+Check 'no side strip at all may use it (checked every one)' `
+    (-not (@(0..7 | Where-Object { Test-CanGuessFrom $script:sideStrips[$_].Form }).Count))
+Check 'an unrelated window may NOT use the geometric fallback' `
+    (-not (Test-CanGuessFrom ([pscustomobject]@{ Name = 'stranger' })))
+Check 'a null form may NOT use the geometric fallback' (-not (Test-CanGuessFrom $null))
+# ...and specifically when the primary form does not exist yet either. Deleting the explicit
+# null check SURVIVED every other case here, because with a real $form the comparison just
+# returns false anyway. But during startup $form is $null too, and `$null -eq $null` is TRUE -
+# so the guard would hand a nonexistent window permission to guess at a composer. Found by
+# mutation; no amount of reading the function would have shown it.
+$formSaved = $form
+$form = $null
+Check 'a null form is refused even before the primary window exists' (-not (Test-CanGuessFrom $null))
+$form = $formSaved
+# The mirror record itself is not a Form. `$script:mirrors -contains $sf` would compare against
+# the records rather than their .Form and quietly answer the wrong question.
+Check 'a mirror RECORD is not mistaken for its window' `
+    (-not (Test-CanGuessFrom $script:mirrors[0]))
+
 # --- Resolve-StripForm: a flyout stands in for the strip that opened it ---
 # A button inside the group flyout belongs to the pane of the strip that opened it. The flyout
 # is its own window and maps to no pane, so without this it fell straight through to the
@@ -1512,6 +1551,31 @@ Check 'a plain strip form is returned unchanged' `
     ((Resolve-StripForm ([pscustomobject]@{ Name = 'plain' })).Name -eq 'plain')
 Check 'Resolve-StripForm passes null through' ($null -eq (Resolve-StripForm $null))
 $script:flyForm = $null
+
+# --- A rebuild must dismiss the flyout, on EVERY path into it ---
+# Rebuild-Buttons disposes the strip's PillButtons, but the flyout's members hold .Tag
+# references into the config objects the rebuild replaces. The menu handlers each wrote
+# `Hide-GroupFlyout; Rebuild-Buttons`, so the hazard only showed on the paths that DON'T:
+# the tick rebuilding on a dirty buttons.json (/pin, an agent) and the compact-mode flip.
+# A click-PINNED flyout is skipped by the tick's own dismissal check, so it survived both -
+# left on screen offering buttons that had just been deleted from disk, owned by a control
+# that no longer exists. The dismissal belongs inside the rebuild, where no caller can
+# forget it, which is why this is asserted against the function body and not the call sites.
+# MUTATION: delete the Hide-GroupFlyout line from Rebuild-Buttons and this goes red.
+$rbNode = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Rebuild-Buttons' }, $true)
+Check 'Rebuild-Buttons was located in the panel source' ($null -ne $rbNode)
+if ($rbNode) {
+    $rbStmts = @($rbNode.Body.EndBlock.Statements)
+    Check 'Rebuild-Buttons dismisses the group flyout before it disposes the buttons' `
+        ($rbStmts.Count -gt 0 -and $rbStmts[0].Extent.Text.Trim() -eq 'Hide-GroupFlyout')
+}
+# ...and Hide-GroupFlyout must clear the PIN, or the tick's dismissal check keeps skipping a
+# flyout that is hidden but still believes it is pinned open.
+$hideFn = [regex]::Match($srcText, '(?s)function Hide-GroupFlyout \{.*?\n\}').Value
+Check 'Hide-GroupFlyout was located' ($hideFn.Length -gt 40)
+Check 'Hide-GroupFlyout clears the pinned flag as well as hiding the window' `
+    ($hideFn -match '\$script:flyPinned\s*=\s*\$false' -and $hideFn -match '\$script:flyForm\.Hide\(\)')
 
 # --- The geometric fallback must stay GUARDED (the actual wrong-chat invariant) ---
 # Invoke-PillClick runs a live UIA/window pipeline, so it cannot be called from here. What CAN
@@ -1545,19 +1609,27 @@ foreach ($fc in $focusCalls) {
     if (-not $guarded) { $unguarded += $fc.Extent.Text }
 }
 Check 'the geometric fallback is not reachable unconditionally from Invoke-PillClick' ($unguarded.Count -eq 0)
-# ...and the guard must be computed from the row-strip identity, not hardcoded. Every guard
-# variable is traced back to its assignment inside Invoke-PillClick; at least one must be
-# derived from $form or $script:mirrors, which is what "this is a row strip" means here.
+# ...and the guard must come from the named predicate, which the behavioural tests above pin by
+# VALUE. This check used to accept any guard whose assignment text merely mentioned $form or
+# $script:mirrors - and a mutant that repointed the membership scan to $script:sideStrips passed
+# it, because the surviving `$canGuess = ($sf -eq $form)` half still matched the regex. It
+# asserted that a row-derived assignment EXISTS, not that side strips are EXCLUDED, so it could
+# not tell a correct guard from a broken one. Two reviewers found that independently.
+#
+# Keep BOTH checks. This one catches "the guard was inlined or replaced by something the
+# behavioural tests do not see"; the behavioural tests catch "the predicate itself is wrong";
+# and the reachability check above catches "the guard was deleted along with its call site".
+# None of the three subsumes another.
 $guardVars = @($guardVars | Sort-Object -Unique)
 $rowDerived = $false
 foreach ($gv in $guardVars) {
     $asns = @($pillFn.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $gv }, $true))
     foreach ($a in $asns) {
-        if ($a.Right.Extent.Text -match '\$script:mirrors|\$form\b') { $rowDerived = $true }
+        if ($a.Right.Extent.Text -match 'Test-CanGuessFrom') { $rowDerived = $true }
     }
 }
-Check "the fallback guard is derived from the row-strip identity (vars: $($guardVars -join ', '))" $rowDerived
+Check "the fallback guard calls the tested predicate (vars: $($guardVars -join ', '))" $rowDerived
 # And the refusal must be VISIBLE. A silent return is indistinguishable from a successful
 # send - which is how this whole class of bug stayed invisible: "I clicked and nothing
 # happened" reads as a flaky panel, not as a refusal that protected the user.

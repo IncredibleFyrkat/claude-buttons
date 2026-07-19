@@ -3191,6 +3191,32 @@ function Get-PaneForForm($frm) {
     return $null
 }
 
+# May the geometric composer guess be used for this strip form? THE WRONG-CHAT INVARIANT.
+#
+# The guess models ONE shape: a horizontal ROW strip docked just below its own composer, so it
+# scores composers sitting ABOVE the strip. Only the primary row strip ($form) and the mirror
+# row strips have that shape. A vertical SIDE strip is anchored well above its own composer, so
+# that filter rejects this pane's composer and can instead match a NEIGHBOURING pane's - i.e.
+# the prompt is typed into a different conversation. So: row strips may guess, nothing else may.
+#
+# This is a separate, pure function on purpose. Inline in Invoke-PillClick it could only ever be
+# tested by reading the source, and a source-shape test cannot tell a correct predicate from a
+# broken one - `($sf -eq $form) -or ($null -ne $script:mirrors)` reinstates the whole hazard
+# while still "mentioning $form and $script:mirrors". As a function its VALUE is asserted
+# directly for a primary form, a mirror, a side strip, $null and an unrelated form.
+#
+# Fails CLOSED: anything not positively identified as a row strip returns $false, and the
+# caller then abandons the send and tells the user rather than guessing.
+function Test-CanGuessFrom($sf) {
+    if (-not $sf) { return $false }
+    if ($sf -eq $form) { return $true }
+    # -eq on the ELEMENT, never on the array: `$script:mirrors -contains $sf` compares against
+    # the mirror records, not their .Form, and `$null -ne $script:mirrors` is not a test of
+    # anything at all. Each mirror's own Form must match.
+    foreach ($m in $script:mirrors) { if ($m.Form -eq $sf) { return $true } }
+    return $false
+}
+
 # Current text of a composer, read through UIA TextPattern. Chromium exposes contenteditables
 # as a read-only TextPattern, which is enough to see what actually landed. Verified on this
 # app: the pattern resolves directly on the "Prompt" group. Returns $null when nothing is
@@ -3565,13 +3591,9 @@ function Invoke-PillClick($btn) {
                 # rejects this pane's own composer and can instead match a NEIGHBOURING pane's
                 # - i.e. the prompt would go to the wrong chat. Never guess from a side strip:
                 # if its bound composer is gone, abandon the send and say so.
-                $canGuess = $false
-                if ($sf) {
-                    $canGuess = ($sf -eq $form)
-                    if (-not $canGuess) {
-                        foreach ($m in $script:mirrors) { if ($m.Form -eq $sf) { $canGuess = $true; break } }
-                    }
-                }
+                # Kept as a CALL, not inlined: see Test-CanGuessFrom. The test suite pins both
+                # that this call site delegates to it and what it returns for each strip kind.
+                $canGuess = Test-CanGuessFrom $sf
                 if ($canGuess) {
                     Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
                     $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
@@ -3941,6 +3963,13 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
 }
 
 function Rebuild-Buttons {
+    # The flyout's member buttons carry .Tag references into the config objects we are about to
+    # replace, so it cannot outlive a rebuild. The menu paths all hide it themselves, but the
+    # TICK does not: an external write to buttons.json (/pin, an agent) or a compact-mode flip
+    # rebuilds with no dismissal, and a CLICK-PINNED flyout is skipped by the tick's own
+    # dismissal check ($flyPinned) - so it stayed on screen listing buttons that no longer
+    # exist, owned by a disposed control. Hide it here and every caller is covered at once.
+    Hide-GroupFlyout
     $script:armedBtn = $null
     $script:menuSource = $null
     $script:hoverCtrl = $null
