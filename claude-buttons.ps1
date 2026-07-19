@@ -968,6 +968,18 @@ function Update-Buttons([scriptblock]$transform) {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return $false }
         $fresh.buttons = @(& $transform @($fresh.buttons))
+        # A group is DEFINED by its members. Once the last one leaves, its saved icon/label is
+        # an orphan: it showed up in "Move to group" as a group that renders nowhere. Pruned
+        # here so every path that edits buttons is covered, rather than at each callsite.
+        try {
+            if ($fresh.PSObject.Properties['groups'] -and $fresh.groups) {
+                $live = @{}
+                foreach ($b in $fresh.buttons) { $g = [string]$b.group; if ($g) { $live[$g] = $true } }
+                foreach ($prop in @($fresh.groups.PSObject.Properties)) {
+                    if (-not $live.ContainsKey($prop.Name)) { $fresh.groups.PSObject.Properties.Remove($prop.Name) }
+                }
+            }
+        } catch {}
         if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
         return $false
     } finally { [void]$script:cfgLock.ReleaseMutex() }

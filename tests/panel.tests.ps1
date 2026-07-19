@@ -656,6 +656,18 @@ Check 'moving a row button does not disturb the side bar' ((($m2 | Where-Object 
 $m3 = @(Reorder-InBar $mix $mix[1] -1)
 Check 'the first button on a bar cannot move further down' ((($m3 | ForEach-Object { $_.label }) -join ',') -eq 'R1,L1,R2,L2')
 
+# --- An empty group definition must not survive ---
+# Groups live in config.groups, keyed by name, but a group exists only through its members.
+# When the last member left, the orphaned icon/label stayed and kept appearing in
+# "Move to group" as a group that renders nowhere. A config carrying such an orphan must still
+# load, and the group must not be treated as real.
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"} ], "groups": { "ghost": { "icon": "note", "label": "Ghost" } } }'
+Check 'a config with an orphaned group def still loads' (($r.Out -match 'SMOKE-OK') -and $r.Code -eq 0)
+Check 'the orphan does not become a button' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","group":"g"} ], "groups": { "g": { "icon": "note" } } }'
+Check 'a group WITH a member collapses its member behind one face' ((Buttons $r.Out) -eq 1)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
