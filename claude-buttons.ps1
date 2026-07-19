@@ -3493,10 +3493,17 @@ function Rebuild-Buttons {
         $size = [Math]::Min($pillH, $room - (S 6))
         $st.BtnSize = $size
         if ($size -lt (S $script:sideMinBtn)) { $st.Form.Hide(); continue }
+        # The stack is bottom-anchored but the FORM grows from its Top, so adding a button made
+        # the whole bar drop until the next tick recomputed the position and snapped it back up.
+        # Pin the bottom edge here and the growth goes upward straight away; the tick's exact
+        # placement then lands on the same pixel instead of correcting a visible jump.
+        $wasVisible = $st.Form.Visible
+        $keepBottom = $st.Form.Bottom
         $st.Form.SuspendLayout()
         $n = Build-SideStrip $st $pn.Title ($pIdx -eq 0) $size
         $st.Form.ResumeLayout()
         if ($n -eq 0) { $st.Form.Hide(); continue }
+        if ($wasVisible) { $st.Form.Top = $keepBottom - $st.Form.Height }
         Update-LayeredStrip $st.Form $st.Panel
     }
 }
