@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.10.1 — 2026-07-19
+
+Follow-up fixes to 1.10.0, from a review of the review.
+
+- **A button edit could be silently discarded.** `Update-Config` waits 2s for the config lock
+  and, on timeout, dropped the change with only a log line — no dialog, nothing on screen. The
+  project's own test suite took that same lock and held it for over a second per run, so
+  running the tests while the panel was up could make a pinned button, a colour change or a
+  dissolved group simply not happen. The lock name is now configurable, with the shipped default
+  unchanged, and the tests use their own.
+- **A malformed config write could destroy every pinned button.** The guard checked only that a
+  `buttons` key existed, so a value of `null`, a number or a string passed and was written over
+  `buttons.json`. The panel then falls back to defaults, so it looks like a spontaneous reset
+  rather than a failure. The value is now checked, not just the key.
+- **Hovering a per-chat button in a group flyout hid the very thing that marks it per-chat.**
+  The state ring and the accent were drawn on the same rectangle at the same width. The ring is
+  now inset.
+
+Also: two code comments described behaviour the code does not have, and one stated a cause that
+turned out to be wrong when measured — adding a differently-cased group name does not produce an
+unreadable file, it silently renames the existing group and discards its icon and label.
+
 ## 1.10.0 — 2026-07-19
 
 **Side bars, groups, and per-kind colours.** Contributed by
