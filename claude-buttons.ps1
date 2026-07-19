@@ -1426,6 +1426,7 @@ $script:paneRect = $null      # first chat pane relative to the window
 $script:rowCenterOff = $null  # bottom buttons' vertical center, measured from the pane bottom
 $script:leftEdgeOff = $null   # right edge of the pane's left button cluster, from window left
 $script:paneBottomOff = 0     # first pane's bottom edge, measured up from the window bottom
+$script:paneBounds = @()      # measured pane rects, for side-bar margins
 $script:panes = @()           # ALL chat panes (side-by-side / grid view) - one strip per pane
 $script:uiaDirty = $false
 $script:uiaLast = Get-Date '2000-01-01'
@@ -1448,6 +1449,30 @@ $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRect
 # through to the window edges, which is the same answer.
 function Set-PaneSideRooms($panes, $wr) {
     if (-not $panes -or $panes.Count -eq 0) { return }
+    # A composer sits inside exactly one pane rect: use that pane's real edges when we have them.
+    $measured = 0
+    foreach ($p in $panes) {
+        if (-not $p.Cx) { continue }
+        $ccx = $p.Cx + $p.Cw / 2; $ccy = $p.Cy + $p.Ch / 2
+        foreach ($pb in $script:paneBounds) {
+            if ($ccx -ge $pb.X -and $ccx -le ($pb.X + $pb.W) -and $ccy -ge $pb.Y -and $ccy -le ($pb.Y + $pb.H)) {
+                $p.PaneL = [int]$pb.X
+                $p.PaneR = [int]($pb.X + $pb.W)
+                $p.LeftRoom = [int]($p.Cx - $pb.X)
+                $p.RightRoom = [int](($pb.X + $pb.W) - ($p.Cx + $p.Cw))
+                $measured++
+                break
+            }
+        }
+    }
+    # One line for all panes: Write-CkLog dedupes against the LAST message only, so a single
+    # unchanging summary is free while several alternating lines are not.
+    Write-CkLog ("BOUNDS measured={0}/{1} rects={2} rooms={3}" -f $measured, $panes.Count, $script:paneBounds.Count,
+        (($panes | ForEach-Object { "$($_.LeftRoom)/$($_.RightRoom)" }) -join ' '))
+    Write-CkLog ("BOUNDS measured={0}/{1} rects={2} rooms={3}" -f $measured, $panes.Count, $script:paneBounds.Count,
+        (($panes | ForEach-Object { "$($_.LeftRoom)/$($_.RightRoom)" }) -join ' '))
+    if ($measured -eq $panes.Count) { return }
+
     # Group by COLUMN, across every row. Grouping by row band handed a pane that happened to be
     # alone in its row the entire window as its margin, so its bars flew out to the window edge
     # while the pane directly below it - same column - got sane bounds. Columns are stable
@@ -1585,6 +1610,17 @@ function Update-UiaInfo {
         if ($composers.Count -gt 0) { $script:composerSeen = $true; $script:composerLost = $false }
         elseif ($script:composerSeen) { $script:composerLost = $true }
         if ($composers.Count -gt 0) {
+            # The panes' OWN rects, so a margin can be measured from the chat's real edge rather
+            # than inferred. Composer elements stop well short of their pane, and midpoints
+            # between neighbouring composers are not an edge at all.
+            $script:paneBounds = @()
+            foreach ($gp in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $grpType)) {
+                $gn = $gp.Cached.Name
+                if ($gn -and ($gn -match $script:uiaPaneMatch)) {
+                    $gr = $gp.Cached.BoundingRectangle
+                    if ($gr.Width -gt (SW 250)) { $script:paneBounds += , @{ X = $gr.X; W = $gr.Width; Y = $gr.Y; H = $gr.Height } }
+                }
+            }
             # All buttons once (cached); per composer, find its control row (the Auto/+/mic bar
             # just below the input) so we dock the strip AFTER that left cluster, on that row -
             # exactly where it sat before, but per pane.
@@ -1618,12 +1654,29 @@ function Update-UiaInfo {
                         $sumY += $rb.CY; $n++
                     } else { break }
                 }
+                # The row's OUTERMOST controls, for the side bars to sit just beyond. $rowBtns is
+                # capped at the composer's left 60% to find the mic cluster, so it cannot give a
+                # right extent. Bounded to this composer's own span: in a grid the neighbouring
+                # panes' rows sit at the same Y and would otherwise be swept up.
+                $rowL = $null; $rowR = $null
+                foreach ($b in $allBtns) {
+                    $bb = $b.Cached.BoundingRectangle
+                    $bcy = $bb.Y + $bb.Height / 2
+                    if ($bcy -gt $cBottom -and $bcy -lt ($cBottom + (SW 64)) -and
+                        $bb.X -ge ($c.X - (SW 40)) -and ($bb.X + $bb.Width) -le ($c.X + $c.W + (SW 40))) {
+                        if ($null -eq $rowL -or $bb.X -lt $rowL) { $rowL = $bb.X }
+                        if ($null -eq $rowR -or ($bb.X + $bb.Width) -gt $rowR) { $rowR = $bb.X + $bb.Width }
+                    }
+                }
                 $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
                 $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
                 $newPanes += @{
                     OffL = $c.X - $wr.Left; OffT = $c.Y - $wr.Top; Width = $c.W
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
                     Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
+                    # Measured row extents; fall back to the composer's own edges.
+                    RowL = if ($null -ne $rowL) { [int]$rowL } else { [int]$c.X }
+                    RowR = if ($null -ne $rowR) { [int]$rowR } else { [int]($c.X + $c.W) }
                     DockX = $dockX; DockY = $dockY
                     # Dock point stored RELATIVE to the composer, so the per-tick geometry
                     # refresh can recompute it live without redoing the expensive tree walk.
@@ -3534,16 +3587,14 @@ $timer.add_Tick({
             # answer: a pane edge is not measured, it is the midpoint between neighbouring
             # composers, so the leftmost pane threw its bar out to the window edge and the
             # middle panes dropped theirs in the gap between two chats.
-            # Sit OUT in the margin, against the column boundary, not tucked beside the chat.
-            # The composer element ends well before the column does (~100px on a wide pane), so
-            # anchoring to the chat edge left most of the margin empty. Clamped to stay off the
-            # chat when the margin is only just wide enough for the bar.
+            # Anchor to the CONTROL ROW's outermost controls - the same kind of measured anchor
+            # the row bar itself docks against. Every inferred edge tried before this (window,
+            # midpoint between composers, column cluster) gave a different answer per pane.
             $edgeGap = S 6
-            $sx = if ($st.Side -eq 'left') {
-                      [Math]::Min([int]($pn.PaneL + $edgeGap), [int]($pn.Cx - $sForm.Width - (S 4)))
-                  } else {
-                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($pn.Cx + $pn.Cw + (S 4)))
-                  }
+            $rowL = if ($null -ne $pn.RowL) { [int]$pn.RowL } else { [int]$pn.Cx }
+            $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
+            $sx = if ($st.Side -eq 'left') { $rowL - $edgeGap - $sForm.Width }
+                  else { $rowR + $edgeGap }
             # Bottom edge level with the control row's buttons, so the lowest side button lines up
             # with the row instead of floating above it.
             $sy = [int]($pn.DockY + [int]($pillH / 2) + (SW $script:vNudge) - $sForm.Height)
