@@ -3766,7 +3766,15 @@ $timer.add_Tick({
             if ($new) { $script:config = $new; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true }
         }
         if ($script:cfgHealUntil -and (Get-Date) -ge $script:cfgHealUntil) { $script:cfgHealUntil = $null }  # give up healing
-        if (Read-ActiveSession) { $dirty = $true }
+        if (Read-ActiveSession) {
+            # The active session only decides visibility for buttons scoped to a CHAT. With none
+            # configured the rebuild cannot change anything - and it tears down and recreates
+            # every strip, which reads as the whole bar resetting each time you type in another
+            # chat. Now that a pane can own three strips, that flicker got a lot more visible.
+            $chatScoped = $false
+            foreach ($b in $script:config.buttons) { if ($b.chat -or $b.chatTitle) { $chatScoped = $true; break } }
+            if ($chatScoped) { $dirty = $true }
+        }
         # Hide chat buttons when the "active chat" signal is older than 10 min
         $exp = $false
         if ($script:activeSession -and $script:activeTs) {
