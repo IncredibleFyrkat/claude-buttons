@@ -855,6 +855,7 @@ $script:vNudge = [int]$script:config.vNudge   # vertical nudge in px (+ = down, 
 $script:tipCtrl = $null    # control the hover tip is currently showing for
 $script:tipsOff = [bool]$script:config.tipsOff   # hover-tooltip off switch (grip menu; persisted)
 $script:kebabBar = 'row'                         # which bar the kebab itself lives on
+$script:debugPaste = [bool]$script:config.debugPaste   # dump WANT/GOT text on a paste mismatch
 if ($script:config.kebabBar) { $script:kebabBar = [string]$script:config.kebabBar }
 
 # ---------- Language (default: English; switch in the grip menu) ----------
@@ -2996,6 +2997,20 @@ function Normalize-ComposerText([string]$s) { ($s -replace "`r`n", "`n").Trim() 
 # Checking for exact equality rather than "contains the payload" matters: a substring probe
 # passes when the draft already happens to start with the same words, or when a previous button
 # left identical boilerplate, and it cannot detect extra content pasted alongside ours.
+# An empty Chromium composer does not report "" - it reports its PLACEHOLDER ("Type / for
+# commands"), because the TextPattern range covers the placeholder node. Treating that as real
+# content made the expected string placeholder+payload while the box correctly held the payload
+# alone, so every click into an empty composer was refused as a failed paste. UIA exposes the
+# placeholder as HelpText; when it does not, the caller's payload-only branch still covers it.
+function Get-ComposerPlaceholder($el) {
+    if (-not $el) { return $null }
+    try {
+        $h = [string]$el.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::HelpTextProperty)
+        if ([string]::IsNullOrWhiteSpace($h)) { return $null }
+        return ($h -replace "`r`n", "`n").Trim()
+    } catch { return $null }
+}
+
 function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 1200) {
     # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
     # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
@@ -3013,6 +3028,9 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     # "draft/cmd" while the box actually read "draft /cmd", and every click on a draft ending
     # in a space was refused as a failed paste.
     $base = (([string]$baseline) -replace "`r`n", "`n").TrimEnd("`n")
+    # The placeholder is not content: an empty box that shows it must count as empty.
+    $ph = Get-ComposerPlaceholder $el
+    if ($ph -and $base.Trim() -eq $ph) { $base = '' }
     $want = $base + $payload
     # A payload that is only whitespace would make the comparison satisfiable by the draft
     # alone on the first read - confirming a paste that never happened and then submitting
@@ -3027,6 +3045,11 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
             $sawText = $true
             $last = ($now -replace "`r`n", "`n").TrimEnd("`n")
             if ($last -eq $want) { return 'Confirmed' }
+            # The box holding EXACTLY our payload is also a success: whatever the baseline read
+            # was (a placeholder on a build that exposes no HelpText, or a selection the paste
+            # replaced), nothing but our own text is in there. This cannot mask the leak the
+            # check exists for - a stale clipboard landing would make $last something else.
+            if ($last -eq $payload) { return 'Confirmed' }
         }
         Start-Sleep -Milliseconds 15
     }
@@ -3035,16 +3058,21 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
         # is the user's prompt and has no business in a log file.
         $k = 0
         while ($k -lt $want.Length -and $k -lt $last.Length -and $want[$k] -eq $last[$k]) { $k++ }
-        # Owner asked for the raw text. Control characters are escaped and each side capped at
-        # 160 chars so one failure cannot write a novel into the log.
-        $esc = {
-            param($t)
-            $t = [string]$t
-            if ($t.Length -gt 160) { $t = $t.Substring(0, 160) + '...' }
-            ($t -replace "`r", '\\r' -replace "`n", '\\n' -replace "`t", '\\t')
+        $wc = if ($k -lt $want.Length) { [int][char]$want[$k] } else { -1 }
+        $nc = if ($k -lt $last.Length) { [int][char]$last[$k] } else { -1 }
+        Write-CkLog ("PASTEDIFF firstDiff={0} wantLen={1} gotLen={2} baseLen={3} wantChr={4} gotChr={5}" -f `
+            $k, $want.Length, $last.Length, $base.Length, $wc, $nc)
+        # The full text pins down a mismatch in one look, but it is the user's prompt - so it is
+        # opt-in via "debugPaste": true in buttons.json, not something the tool writes by default.
+        if ($script:debugPaste) {
+            $esc = {
+                param($t)
+                $t = [string]$t
+                if ($t.Length -gt 160) { $t = $t.Substring(0, 160) + '...' }
+                ($t -replace "`r", '\\r' -replace "`n", '\\n' -replace "`t", '\\t')
+            }
+            Write-CkLog ("PASTEDIFF`n  WANT=[{0}]`n  GOT =[{1}]" -f (& $esc $want), (& $esc $last))
         }
-        Write-CkLog ("PASTEDIFF firstDiff={0} wantLen={1} gotLen={2}`n  WANT=[{3}]`n  GOT =[{4}]" -f `
-            $k, $want.Length, $last.Length, (& $esc $want), (& $esc $last))
         return 'Mismatch'
     }
     return 'Unverifiable'

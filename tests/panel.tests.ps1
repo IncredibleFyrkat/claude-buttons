@@ -156,6 +156,18 @@ Check 'a whitespace-only payload is refused' `
     ((PasteState '{"baseline":"hi\n","payload":"   ","observed":"hi   \n"}') -eq 'Mismatch')
 Check 'a paste that never landed is still a Mismatch' `
     ((PasteState '{"baseline":"hi\n","payload":"/review","observed":"hi\n"}') -eq 'Mismatch')
+# An 'empty' composer does not report empty - it reports its PLACEHOLDER, because the
+# TextPattern range covers the placeholder node. Treating that as content made the expected
+# string placeholder+payload while the box correctly held the payload alone, so EVERY click
+# into an empty composer was refused as a failed paste.
+Check 'a placeholder baseline does not block the send' `
+    ((PasteState '{"baseline":"Type / for commands","payload":"/review","observed":"/review"}') -eq 'Confirmed')
+# That leniency must not extend to a stale clipboard: the box holding something OTHER than our
+# payload is still a refusal, whatever the baseline was.
+Check 'a placeholder baseline still refuses foreign text' `
+    ((PasteState '{"baseline":"Type / for commands","payload":"/review","observed":"secret token"}') -eq 'Mismatch')
+Check 'a placeholder baseline still refuses stale PLUS payload' `
+    ((PasteState '{"baseline":"Type / for commands","payload":"/review","observed":"secret token/review"}') -eq 'Mismatch')
 Check 'a stale clipboard landing instead of the payload is a Mismatch' `
     ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token\n"}') -eq 'Mismatch')
 # The exact shape reported in PR #4: stale text prepended, our payload also present. A
