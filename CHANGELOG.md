@@ -1,5 +1,84 @@
 # Changelog
 
+## 1.10.2 — unreleased
+
+**The panel could confirm a paste that never happened and submit your own draft.** Blocking
+send-path fix. Found by an external review, then reproduced through the real verification code
+before anything was changed.
+
+Paste verification used to compare **aggregates** over the whole composer read-back: how many of
+the button's words appeared anywhere in it, plus ceilings on its total length. An aggregate
+cannot show that the new text in the box *came from the button*, and three cases proved it —
+all three were confirmed and would have been sent:
+
+| baseline (composer before) | button text | read-back after | old verdict |
+|---|---|---|---|
+| *(empty)* | `/review` | `xx/review` | confirmed — two foreign characters rode in under the rounding margin |
+| *(empty)* | `send alpha beta gamma` | `send omega beta gamma` | confirmed — one substituted word of four sat inside the allowance |
+| `review review` | `/review` | `review review` | confirmed — **nothing landed at all** |
+
+The third is the serious one. The draft already contained the button's words, so coverage was
+satisfied, and the draft's own length cleared the size floor. Nothing had been pasted, the check
+passed anyway, and the panel then pressed Enter — submitting **the user's own unfinished text**.
+No threshold fixes that, because the measurement never looked at what *changed*.
+
+**Verification now judges the delta, not the total.** The read-back must begin with the composer's
+prior contents; that prefix is subtracted, and only what the paste actually *added* is examined:
+
+- every word in the delta must occur in the button's text, **in order** — rendering deletes
+  words, it never invents or substitutes them, so an ordered subset is exactly what a genuine
+  paste produces (this refuses cases 1 and 2);
+- enough of the button's text must be present in the delta, with the same small allowance as
+  before for what rendering eats;
+- the same ordered-subset rule over punctuation, symbols and emoji;
+- the delta may not be *larger* than the button's text in either character class.
+
+An unchanged composer yields an empty delta, and an empty delta has zero coverage against an
+allowance capped below 100%, so case 3 is now refused **by construction** rather than by a
+threshold that could be tuned wrong again.
+
+Formatted buttons still send: the two ordered-subset rules permit deletion freely, which is all
+markdown rendering does. The 12,752-character flagship button whose read-back is 12,259
+characters is now a test fixture rather than a story, together with fenced blocks, bold, markdown
+links whose URLs render away, collapsed blank lines, and one-word buttons.
+
+**Known limits, stated plainly** (these replace the allowance table further down this file):
+
+- **The paste must append.** Verification assumes the text lands at the end of the composer. If
+  the caret is parked in the middle of a draft, or text is selected so the paste replaces it, the
+  read-back does not begin with the prior contents and **the send is refused**. Nothing is sent
+  and nothing is lost, but a legitimate click does nothing except show a warning. This is a real
+  usability cost, deliberately taken: refusing is the safe direction, and it cannot be tested
+  automatically because positioning a caret requires synthesising input.
+- **An incomplete paste can still be sent.** The remaining tolerance is one-sided: content may be
+  *missing* from the delta, never *added* to it. Up to `min(max(3, 2%·n), floor(n/4))` of the
+  button's `n` words may be absent and the send still goes through — 0 words for a 2–3 word
+  button, 1 for 4–11, 3 for 12–149, 2% above that — provided the delta still carries 60% of the
+  button's alphanumeric characters. So a truncated paste of a long button can be submitted;
+  a *substituted* or *injected* one can no longer be, which is the change that matters.
+- **Content smuggled onto a ```` ``` ```` line in the read-back** is invisible to both ordered-subset
+  rules, because fence info-strings are stripped before comparison. The length bounds are what
+  catch it, and they are exact rather than proportional for exactly that reason.
+- Verification still assumes the paste is the only change to the box while it is happening.
+
+**Two guards were correct but nothing proved they stayed correct.** Both fixed in the same pass,
+both verified by running the mutation first rather than reasoning about it:
+
+- **Enter was not structurally dominated by a confirmed paste.** The test asserted that the line
+  `$pasted = ($pasteState -eq 'Confirmed')` existed somewhere in the file. Moving the whole
+  submit block above the fail-closed guard left that line untouched and passed all 332 tests
+  while a mismatched paste pressed Enter anyway — the exact leak the guard exists to prevent.
+  The submit now lives *inside* `if ($pasteState -ceq 'Confirmed')` and nowhere else, and the
+  test locates the keystroke in the syntax tree and requires that enclosing condition verbatim,
+  so it cannot be widened with `-or`, weakened to the case-insensitive `-eq`, or hopped over.
+- **The wrong-chat guard could be widened.** The call-site check accepted any enclosing `if` as
+  long as *some* variable in its condition had been assigned from the tested predicate, so
+  `if ($canGuess -or $somethingElse)` passed while the predicate gated nothing. The condition
+  must now *be* the predicate's result, alone.
+
+All three are the same underlying mistake: asserting that a correct-looking line exists, instead
+of asserting that the dangerous path cannot be reached.
+
 ## 1.10.1 — 2026-07-19
 
 Follow-up fixes to 1.10.0, from a review of the review.
@@ -118,28 +197,9 @@ Measured against the real 12,752-character paste: genuine paste confirmed; stale
 instead, before, or after the payload all refused; half the payload refused; eleven stray
 characters refused; ten substituted words refused.
 
-**Known limits, stated plainly.** This is a similarity check, not a content signature. A
-substitution that swaps words while preserving the total length can stay inside the coverage
-allowance, and **the allowance is much larger on short buttons than on long ones**. It is
-`min(max(3, 2%·n), floor(n/4))` words out of `n`, which works out as:
-
-| button length | words that may differ undetected |
-|---|---|
-| 2–3 words | 0 |
-| 4–11 words | 1 — i.e. **up to 25%** |
-| 12–149 words | 3 |
-| 150+ words | 2% |
-
-Measured: a four-word button reading back with one word changed is confirmed and sent. Two
-earlier drafts of this paragraph were wrong about this — one claimed such a substitution "is not
-reachable by a stale clipboard" (a review then demonstrated a 156-character clipboard-shaped
-append that passed), and one quoted the 2% figure as if it applied generally, understating the
-real allowance for typical buttons by an order of magnitude.
-
-The separate size bounds are a second lock and a stronger one: anything that changes the total
-length is caught, so exploiting the above requires a length-preserving substitution. The
-non-alphanumeric bound closes the punctuation and emoji case. Verification also still assumes
-the paste is the only change to the box while it is happening.
+> **Superseded in 1.10.2.** The allowances described above were measured over the *whole*
+> read-back. That turned out to be unfixable by tuning — see the 1.10.2 entry at the top of this
+> file for what replaced them and for the current known limits.
 
 ## 1.8.1 — 2026-07-19
 

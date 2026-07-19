@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.10.1'
+$CB_VERSION = '1.10.2'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -3350,38 +3350,63 @@ function Get-ComposerText($el) {
 # send every formatted button.
 #
 # What IS reliable is the words. Rendering deletes a few of them (fence languages) and reflows
-# the rest, but it does not invent words and it does not reorder them. So:
+# the rest, but it does not invent words and it does not reorder them.
 #
-#   (a) COVERAGE - the payload's words must appear in the read-back, in order, allowing a small
-#       shortfall for the ones rendering eats.
-#   (b) SIZE     - the read-back must not be materially larger than baseline+payload.
+# VERIFY THE DELTA, NOT THE TOTAL. Every earlier version of this compared AGGREGATES over the
+# whole read-back - word coverage between the payload and all of `observed`, plus size ceilings
+# on the total. Aggregates cannot prove that the new content in the box CAME FROM the payload,
+# and three counterexamples all returned Confirmed against the real -PasteProbe seam:
 #
-# Both are required. Coverage alone is satisfied by "stale clipboard text THEN our payload",
-# because an in-order walk simply skips the prefix; the size bound is what catches that. Size
-# alone is satisfied by any text of roughly the right length.
+#   1. baseline "\n" / payload "/review" / observed "xx/review\n"
+#      Two foreign characters rode in under the absolute size allowance.
+#   2. baseline "\n" / payload "send alpha beta gamma" / observed "send omega beta gamma\n"
+#      One substituted word out of four sat inside the floor(n/4) missing-word cap.
+#   3. baseline "review review\n" / payload "/review" / observed "review review\n"
+#      NOTHING LANDED. The user's own draft already contained the payload's words, so coverage
+#      was satisfied, and the baseline alone cleared the 60% size floor. The panel then pressed
+#      Enter and submitted the user's draft. This is the one that makes aggregates unfixable by
+#      tuning: no threshold distinguishes "the payload arrived" from "the draft already looked
+#      like the payload", because the measurement never looked at what CHANGED.
 #
-# Measured on the real capture: genuine paste 99.93% coverage / 1.0000 size. Stale clipboard
-# instead of the payload 0% / 0.002. Stale text prepended 0% / 1.145. Half the payload 47.88% /
-# 0.493. Only the genuine one passes both bounds.
-# The two directions are NOT symmetric, and treating them as one percentage was wrong.
+# So: require `observed` to begin with the rendered `baseline`, subtract it, and judge only the
+# DELTA - the text the paste actually added. An unchanged composer yields an empty delta, whose
+# word coverage is 0, and 0 coverage can never clear the allowance (the allowance is capped at
+# floor(n/4), which is strictly less than n for every n). Case 3 therefore cannot confirm by
+# construction rather than by threshold.
 #
-# TOO SMALL is caused by rendering, which only ever deletes. It is not a safety problem: if our
-# text did not land, coverage collapses and we refuse anyway.
-# TOO BIG means content we did not paste is in the box - a stale clipboard alongside our text.
-# That is the leak this whole function exists to stop, so the ceiling is tight.
+# The delta is then checked in BOTH directions, which is what the aggregates conflated:
 #
-# Both need an ABSOLUTE allowance as well as a proportional one. A percentage alone fails on
-# short payloads: a five-word button containing one code fence loses 20% of its words to
-# rendering and was refused, while the same fence in a 1,416-word button costs 0.07%.
+#   (a) DERIVATION - every word in the delta must occur in the payload, IN ORDER. Rendering only
+#       ever deletes, so a genuine delta is an ordered subset of the payload. This forbids
+#       invented or substituted words outright and is what refuses cases 1 and 2.
+#   (b) COVERAGE   - enough of the payload's words must appear in the delta, in order, allowing
+#       the same small shortfall as before for the ones rendering eats. This is what refuses
+#       case 3, and a half-landed paste.
+#   (c) SYMBOLS    - the same ordered-subset rule over non-alphanumeric characters. Without it a
+#       clipboard of pure punctuation or emoji is invisible to (a) and (b).
+#   (d) SIZE       - the delta may not be LARGER than the payload in either character class.
+#       Rendering only deletes, so any growth is content we did not paste.
+#
+# (a) and (c) are subset checks, so they are inherently permissive to deletion - which is exactly
+# what markdown rendering does, and why a fenced or bold button still confirms.
+#
+# KNOWN LIMITATION (deliberate, and it is the same one the old baseline concatenation had): this
+# assumes the paste APPENDS at the end of the composer. If the caret sits mid-draft, or text is
+# selected so the paste replaces it, `observed` does not begin with `baseline`, the prefix check
+# fails and the send is REFUSED. That is a usability cost on a legitimate action, and it is the
+# safe direction: nothing is sent and nothing is lost. It is not automatically testable here,
+# because positioning a caret requires synthetic input.
+#
+# Rendering deletes a few payload words (fence languages), so the coverage side needs an
+# ABSOLUTE allowance as well as a proportional one. A percentage alone fails on short payloads:
+# a five-word button containing one code fence loses 20% of its words to rendering and was
+# refused, while the same fence in a 1,416-word button costs 0.07%.
 $script:MaxMissingWords    = 3      # or 2% of the payload's words, whichever is larger,
-$script:MaxMissingFraction = 0.02   # but NEVER more than half the payload (see below)
-# Rendering only ever DELETES characters, so ANY growth beyond baseline+payload is content we
-# did not paste. A proportional allowance is therefore wrong in principle and was wrong in
-# practice: at 1% it let 99 stray characters into a 12k payload undetected - a small clipboard
-# leak, which is the exact thing being defended against. The allowance is a rounding margin, not
-# a tolerance.
-$script:ExtraCharsAllowed  = 2
-$script:ExtraFraction      = 0.0
+$script:MaxMissingFraction = 0.02   # but NEVER more than a quarter of the payload (see below)
+# The delta may not exceed the payload AT ALL. This used to be a ceiling over the TOTAL with a
+# rounding margin of 2 characters, and that margin is precisely how case 1 above got in: two
+# foreign characters are a rounding error against a total, but they are 100% foreign against a
+# delta. Measured against a delta the bound is exact, so there is no margin to spend.
 $script:MinSizeFraction    = 0.60   # below this, too little landed to be our payload at all
 
 # Drop the info-string of a fenced code block: the whole ```lang line, markers and language.
@@ -3395,6 +3420,38 @@ function Remove-FenceInfoStrings([string]$s) {
 }
 function Get-CompareWords([string]$s) {
     @([regex]::Matches((Remove-FenceInfoStrings $s), '[\p{L}\p{N}]+') | ForEach-Object { $_.Value.ToLowerInvariant() })
+}
+# Everything that is NOT a letter, a digit or whitespace: punctuation, symbols, emoji. The
+# symbol side of the derivation check works on these as a SEQUENCE, not a count, because a count
+# is an aggregate and aggregates are what let case 1 through.
+function Get-CompareSymbols([string]$s) {
+    @([regex]::Matches((Remove-FenceInfoStrings $s), '[^\p{L}\p{N}\s]') | ForEach-Object { $_.Value })
+}
+# The composer's read-back always carries a trailing newline: an "empty" Chromium composer reads
+# as "\n", a draft as "draft\n". Strip it (and normalise CRLF) before the prefix check, or an
+# empty composer's baseline "\n" is not a prefix of the observed "/review\n" and every single
+# send is refused. Trailing newlines ONLY - no other whitespace is touched, because collapsing
+# whitespace is what blunted contamination detection in two earlier attempts.
+function Get-ComposerCore([string]$s) { (($s -replace "`r`n?", "`n") -replace "`n+\z", '') }
+# Is every element of $subset present in $superset, IN ORDER? (Not contiguously - rendering
+# deletes from the middle.) This is the anti-injection direction: it can only be satisfied by
+# elements that genuinely came from the source, so a substituted or invented word fails it even
+# when the totals match exactly.
+#
+# Naming, because the reviewer's sketch called these ($needle, $haystack): that reads as "find
+# this block inside that text", which is NOT the relation here and got the argument order
+# questioned twice. The relation is subset-of, and the order is (what landed, what we sent).
+function Test-IsOrderedSubsetOf($subset, $superset) {
+    # Re-wrap both. PowerShell UNROLLS a single-element array when it is passed as an argument,
+    # so a one-word delta arrives as a bare string - and indexing a string yields CHARACTERS.
+    # Same trap that made Get-WordCoverage report 0% for a one-word payload.
+    $sub = @($subset); $sup = @($superset)
+    if ($sub.Count -eq 0) { return $true }   # nothing landed that needs justifying
+    $j = 0
+    foreach ($v in $sup) {
+        if ($j -lt $sub.Count -and $v -ceq $sub[$j]) { $j++ }
+    }
+    return ($j -eq $sub.Count)
 }
 function Get-AlnumLength([string]$s) { ($s -replace '[^\p{L}\p{N}]', '').Length }
 # Everything that is NOT a letter or digit: punctuation, symbols, emoji, whitespace.
@@ -3437,7 +3494,28 @@ function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed
     $payload = Remove-FenceInfoStrings $payload
     $pw = @(Get-CompareWords $payload)
     if ($pw.Count -eq 0) { return $false }
-    $coverage = Get-WordCoverage $pw (Get-CompareWords $observed)
+
+    # --- Isolate the DELTA: what this paste actually added to the box. ---
+    # If the read-back does not START with the baseline then the paste did not append, and no
+    # part of the box can be attributed to it. Refuse. (See KNOWN LIMITATION above: a caret
+    # parked mid-draft lands here and is refused rather than guessed at.)
+    $baseCore = Get-ComposerCore $baseline
+    $obsCore  = Get-ComposerCore $observed
+    if (-not $obsCore.StartsWith($baseCore, [StringComparison]::Ordinal)) { return $false }
+    $delta = $obsCore.Substring($baseCore.Length)
+
+    # (a) DERIVATION. Every word that appeared must have come from the payload, in order.
+    # Rendering deletes words; it never invents or substitutes them. "xx/review" against the
+    # payload "/review" fails here on the word "xx", and "send omega beta gamma" against
+    # "send alpha beta gamma" fails on "omega" - neither of which any aggregate could see.
+    $dw = @(Get-CompareWords $delta)
+    if (-not (Test-IsOrderedSubsetOf $dw $pw)) { return $false }
+
+    # (b) COVERAGE. Enough of the payload has to be in the delta. An UNCHANGED composer yields an
+    # empty delta and 0 coverage, and the allowance below is capped at floor(n/4) - strictly less
+    # than n for every n - so an empty delta can never clear it. That is what stops a draft which
+    # merely happens to contain the payload's words from confirming a paste that never happened.
+    $coverage = Get-WordCoverage $pw $dw
     $missing  = $pw.Count - ($coverage * $pw.Count)
     # Cap the allowance at a QUARTER of the payload. At half, a two-word payload tolerated one
     # substituted word: "send nu" read back as "send bad" was Confirmed and would have been
@@ -3447,26 +3525,31 @@ function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed
         [Math]::Floor($pw.Count / 4))
     if ($missing -gt $allowedMissing) { return $false }
 
-    $expected = (Get-AlnumLength $baseline) + (Get-AlnumLength $payload)
-    if ($expected -le 0) { return $false }
-    $actual  = Get-AlnumLength $observed
-    $ceiling = $expected + [Math]::Max($script:ExtraCharsAllowed, $expected * $script:ExtraFraction)
-    if ($actual -gt $ceiling) { return $false }               # something else is in the box
-    if ($actual -lt ($expected * $script:MinSizeFraction)) { return $false }
+    # (c) SYMBOLS, by the same ordered-subset rule. Words alone leave punctuation, symbols and
+    # emoji entirely unchecked: "gennemgaa min kode" read back as
+    # "gennemgaa min kode !!! ??? ---> @@@ ***" has a perfectly derived word sequence. Markdown
+    # rendering only DELETES symbols (backticks, asterisks), and a subset check permits deletion
+    # freely - which is why a fenced or bold button still confirms.
+    if (-not (Test-IsOrderedSubsetOf (Get-CompareSymbols $delta) (Get-CompareSymbols $payload))) { return $false }
 
-    # Non-alnum has its own ceiling. Without this the size bound counted letters and digits only,
-    # so a clipboard of emoji, punctuation or symbols was unbounded: "gennemgaa min kode" read
-    # back as "gennemgaa min kode !!! ??? ---> @@@ ***" was Confirmed. Rendering deletes markdown
-    # syntax, which is non-alnum, so this may shrink freely but must not grow.
-    $expectedSym = (Get-NonAlnumLength $baseline) + (Get-NonAlnumLength $payload)
-    $actualSym   = Get-NonAlnumLength $observed
-    $symCeiling  = $expectedSym + [Math]::Max($script:ExtraCharsAllowed, $expectedSym * $script:ExtraFraction)
-    if ($actualSym -gt $symCeiling) { return $false }
+    # (d) SIZE, delta against payload, with NO margin. Rendering only ever deletes, so the delta
+    # cannot legitimately be larger than what we sent in either character class. The 2-character
+    # rounding margin this replaced is exactly how "xx/review" got in.
+    $payAlnum = Get-AlnumLength $payload
+    $paySym   = Get-NonAlnumLength $payload
+    if (($payAlnum + $paySym) -le 0) { return $false }
+    $delAlnum = Get-AlnumLength $delta
+    if ($delAlnum -gt $payAlnum) { return $false }
+    if ((Get-NonAlnumLength $delta) -gt $paySym) { return $false }
+    # ...and a floor, so a paste that landed only fractionally is not confirmed on the strength
+    # of a few surviving words.
+    if ($delAlnum -lt ($payAlnum * $script:MinSizeFraction)) { return $false }
     return $true
 }
 
-# Wait until the composer holds the baseline plus our payload, judged by word coverage and
-# size (see Test-PasteLanded above for why text equality cannot work here).
+# Wait until the composer holds the baseline plus our payload, judged by whether the text the
+# paste ADDED derives from the payload (see Test-PasteLanded above for why text equality cannot
+# work here, and why aggregates over the whole read-back could not either).
 #
 # Ctrl+V is asynchronous: the keystroke is queued and the app reads the clipboard later. If the
 # clipboard is restored before that read, the app pastes the USER'S clipboard instead - the
@@ -3478,20 +3561,17 @@ function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed
 #                           landed (e.g. a stale clipboard). FAIL CLOSED.
 #          'Unverifiable' - the composer exposed no readable text at all. We do not know.
 #
-# The size bound is what makes this stricter than "contains the payload". A bare containment
-# probe passes when a stale clipboard is pasted ALONGSIDE our text, which is precisely the leak
-# this function exists to stop.
+# Working on the DELTA is what makes this stricter than "contains the payload". A bare
+# containment probe passes when a stale clipboard is pasted ALONGSIDE our text, and - worse - it
+# passes when NOTHING was pasted and the user's own draft merely resembles the payload. Both are
+# precisely the leaks this function exists to stop.
 function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 1200) {
-    # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
-    # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
-    # terminator in the MIDDLE of the expected string ("draft\n/cmd") while the paste appends
-    # before it ("draft/cmd"), so every click with a draft in the box compared unequal and
-    # refused to send. The empty case only passed because Trim() happened to eat both newlines.
-    # KNOWN LIMITATION: this assumes the paste APPENDS at the end. If the caret sits mid-draft,
-    # or text is selected (paste replaces the selection), the result is not baseline+payload and
-    # this returns Mismatch - a refusal on a legitimate action. Refusing is the safe direction,
-    # but it is a real usability cost and it is not automatically testable here, because
-    # positioning a caret requires synthetic input.
+    # The baseline is passed through as-is; Test-PasteLanded normalises it. An "empty" Chromium
+    # composer does not read as "" - it reads as "\n" - and a draft reads as "draft\n", so the
+    # trailing terminator has to come off both sides before the prefix check, or every click with
+    # a draft in the box is refused. (An earlier version CONCATENATED baseline+payload and
+    # compared, which put that terminator in the middle of the expected string; the empty case
+    # only passed because Trim() happened to eat both newlines.)
     $base = [string]$baseline
     # A payload with no words at all can never be verified: coverage is undefined and the poll
     # would otherwise confirm a paste that never happened, then submit whatever the user already
@@ -3731,7 +3811,7 @@ function Invoke-PillClick($btn) {
             # fell to the Mismatch branch, which told the user to inspect a composer that
             # nothing had been written to.
             $pasteState = 'NotAttempted'
-            $backup = $null; $snapOk = $false; $pasted = $false
+            $backup = $null; $snapOk = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
                 $backup = New-Object System.Windows.Forms.DataObject
@@ -3766,7 +3846,6 @@ function Invoke-PillClick($btn) {
                 # we cannot see what happened. Wait-PasteLanded polls for its full timeout and
                 # returns 'Unverifiable' by itself when nothing is readable.
                 $pasteState = Wait-PasteLanded $composerEl $baseline $textToSend
-                $pasted = ($pasteState -eq 'Confirmed')
             } catch {
                 Write-CkLog "Clipboard unavailable; nothing was pasted or sent: $($_.Exception.Message)"
             } finally {
@@ -3795,33 +3874,53 @@ function Invoke-PillClick($btn) {
             # So we leave the composer exactly as it is. Whatever is in there stays visible and
             # unsent, and the user decides. That is the only outcome that cannot lose their
             # data or say something on their behalf.
-            if (-not $pasted) {
-                if ($pasteState -eq 'NotAttempted') {
-                    # Nothing was ever pasted, so telling the user to inspect the box for
-                    # contamination would send them hunting for something that cannot be there.
-                    Write-CkLog 'Clipboard was unavailable; nothing was pasted or sent'
-                    Show-SendWarning (L 'sendNoClipboard')
-                } elseif ($pasteState -eq 'Unverifiable') {
-                    Write-CkLog 'Paste could not be verified (composer text unreadable); not sending'
-                    Show-SendWarning (L 'sendUnverified')
-                } else {
-                    Write-CkLog 'Paste did not land as expected; composer left untouched and NOT sent'
-                    Show-SendWarning (L 'sendMismatch')
+            #
+            # SHAPE MATTERS, not just the condition. This used to be a NEGATIVE guard
+            # (`if (-not $pasted) { warn; return }`) with the submit below it, and the tests only
+            # asserted that the assignment `$pasted = ($pasteState -eq 'Confirmed')` existed
+            # somewhere in the file. Nothing pinned the POSITION of the submit in the control
+            # flow, so moving the Start-Sleep/Test-TargetForeground/SendWait('{ENTER}') block up
+            # to just after that assignment - above the guard - passed all 332 tests while a
+            # Mismatch pressed Enter anyway. That is the precise leak this whole path exists to
+            # prevent, reinstated with a green suite. Verified, not theorised.
+            #
+            # So confirmation is now a POSITIVE STRUCTURAL DOMINATOR: Enter lives inside
+            # `if ($pasteState -ceq 'Confirmed')` and nowhere else. There is no guard to hop
+            # over, and the test asserts the ancestor `if` in the AST with its condition matched
+            # EXACTLY - so `-or` cannot be added to weaken it, and the check cannot be satisfied
+            # by a line that merely exists elsewhere.
+            #
+            # -ceq, not -eq: -eq is case-insensitive in PowerShell, so a state spelled
+            # 'confirmed' would satisfy it. The states are internal, but an exact-text AST
+            # assertion is only worth having if the operator it pins is the strict one.
+            if ($pasteState -ceq 'Confirmed') {
+                # F4: flip the toggle only once the text is actually delivered. Flipping before
+                # the send left it inverted with nothing sent whenever the paste threw and the
+                # typing fallback then aborted on the foreground re-check. On a Shift-click the
+                # command is only parked in the box, not run, so the state must not flip either.
+                if ($isToggle -and -not $holdShift) { Set-ToggleFace $item $newOn }
+                # Per-chat buttons never auto-send: the user must see the text before Enter.
+                # Shift-click suppresses the send too, leaving the text ready to edit.
+                if ($item.submit -and -not $item.chat -and -not $holdShift) {
+                    Start-Sleep -Milliseconds 90
+                    if (-not (Test-TargetForeground)) { return }
+                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
                 }
                 return
             }
-            # F4: flip the toggle only once the text is actually delivered. Flipping before the
-            # send left it inverted with nothing sent whenever the paste threw and the typing
-            # fallback then aborted on the foreground re-check. On a Shift-click the command is
-            # only parked in the box, not run, so the state must not flip either.
-            if ($isToggle -and -not $holdShift) { Set-ToggleFace $item $newOn }
-            # Per-chat buttons never auto-send: the user must see the text before Enter.
-            # Shift-click suppresses the send too, leaving the text ready to edit.
-            if ($item.submit -and -not $item.chat -and -not $holdShift) {
-                Start-Sleep -Milliseconds 90
-                if (-not (Test-TargetForeground)) { return }
-                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            if ($pasteState -ceq 'NotAttempted') {
+                # Nothing was ever pasted, so telling the user to inspect the box for
+                # contamination would send them hunting for something that cannot be there.
+                Write-CkLog 'Clipboard was unavailable; nothing was pasted or sent'
+                Show-SendWarning (L 'sendNoClipboard')
+            } elseif ($pasteState -ceq 'Unverifiable') {
+                Write-CkLog 'Paste could not be verified (composer text unreadable); not sending'
+                Show-SendWarning (L 'sendUnverified')
+            } else {
+                Write-CkLog 'Paste did not land as expected; composer left untouched and NOT sent'
+                Show-SendWarning (L 'sendMismatch')
             }
+            return
         } finally {
             $script:sending = $false
         }

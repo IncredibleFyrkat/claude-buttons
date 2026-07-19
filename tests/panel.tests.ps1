@@ -169,8 +169,11 @@ Check 'an unreadable composer is Unverifiable, never Confirmed' `
     ((PasteState '{"baseline":"\n","payload":"/review","observed":null}') -eq 'Unverifiable')
 
 # Source invariants that cannot be probed: what the caller DOES with the state.
-Check 'nothing is submitted unless the paste was Confirmed' `
-    ($srcText -match "\`$pasted = \(\`$pasteState -eq 'Confirmed'\)")
+# (The "nothing is submitted unless Confirmed" invariant used to live here as a regex for the
+# assignment `$pasted = ($pasteState -eq 'Confirmed')`. That asserted a LINE EXISTS, not that the
+# dangerous path is unreachable: moving the whole submit block above the fail-closed guard left
+# the assignment untouched and passed all 332 tests while a Mismatch pressed Enter. It is now an
+# AST DOMINATOR check further down - search for "structurally dominated".)
 # Assert the fail-closed block sends NOTHING - no keystrokes of any kind. Grepping for the
 # literal `Escape-SendKeys $textToSend` was defeated by binding to a variable first
 # (`$esc = Escape-SendKeys $textToSend; SendWait $esc`), and a regex requiring "some return
@@ -231,15 +234,58 @@ Check "the only keystrokes sent are '^v' and '{ENTER}' (found: $($sendArgs -join
     (($sendArgs -join ' | ') -eq '^v | {ENTER}')
 Check 'the SendKeys text encoder is gone (it existed only to feed the typing fallback)' `
     (-not ($srcText -match 'function Escape-SendKeys'))
-$failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
-Check 'the fail-closed block was located' ($failBlock.Length -gt 40)
-Check 'the fail-closed block ends by returning' ($failBlock -match '(?m)^\s*return\s*$')
+# --- Enter is STRUCTURALLY DOMINATED by Confirmed ---
+# The invariant is not "a correct-looking comparison appears somewhere in the file"; it is "the
+# Enter keystroke is UNREACHABLE unless the paste was confirmed". The old regex asserted the
+# former, and this mutation passed all 332 tests: take the submit block (Start-Sleep 90 ->
+# Test-TargetForeground -> SendWait('{ENTER}')) and move it up to immediately after the
+# `$pasted = ...` assignment, i.e. ABOVE the fail-closed guard. The assignment still matched, so
+# the suite stayed green while a Mismatch pressed Enter and shipped the wrong content. Confirmed
+# by running it, not predicted.
+#
+# So: find the '{ENTER}' SendWait in the AST and require an enclosing `if` whose condition is
+# EXACTLY `$pasteState -ceq 'Confirmed'`. Exact text is deliberate - it forbids `-or`
+# (`if ($pasteState -ceq 'Confirmed' -or $x)`), it forbids the case-insensitive `-eq`, and it
+# forbids indirection through a variable that some other line could set. Moving the block
+# anywhere outside that `if` leaves it with no such ancestor and fails here.
+$enterCall = @($sendCalls | Where-Object {
+    $_.Arguments.Count -eq 1 -and
+    $_.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+    $_.Arguments[0].Value -ceq '{ENTER}'
+})
+Check "the Enter keystroke was located in the AST (found $($enterCall.Count))" ($enterCall.Count -eq 1)
+$enterGuards = @()
+if ($enterCall.Count -eq 1) {
+    $p = $enterCall[0].Parent
+    while ($p) {
+        if ($p -is [System.Management.Automation.Language.IfStatementAst]) {
+            $enterGuards += ($p.Clauses[0].Item1.Extent.Text -replace '\s+', ' ').Trim()
+        }
+        $p = $p.Parent
+    }
+}
+Check "Enter is structurally dominated by `$pasteState -ceq 'Confirmed' (guards: $($enterGuards -join ' / '))" `
+    ($enterGuards -contains "`$pasteState -ceq 'Confirmed'")
+# ...and that state may only ever be produced by the verifier. If anything else could assign
+# 'Confirmed', the dominator above would be satisfiable without a verified paste.
+$confirmAssigns = @($srcAst.FindAll({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Right.Extent.Text -match "'Confirmed'"
+}, $true) | ForEach-Object { $_.Extent.Text })
+Check "nothing assigns 'Confirmed' outside Wait-PasteLanded's own returns (found: $($confirmAssigns -join ', '))" `
+    ($confirmAssigns.Count -eq 0)
 Check 'no undo/select-all recovery was introduced (it would eat a user draft)' `
     (-not ($srcText -match "SendWait\('\^z'\)|SendWait\('\^a'\)"))
 # Both abandoned-send branches must TELL the user. Without this the failure is silent except
 # for a log line nobody reads, and "I clicked and nothing happened" is indistinguishable from
 # a successful send - which is how this class of bug stayed invisible in the first place.
 # F17: these three fixes were real but unguarded - reverting each passed the whole suite.
+# The warning branches are now what FOLLOWS the confirmed block rather than a `-not $pasted`
+# block, so they are located by the state they test rather than by brace matching.
+$failBlock = [regex]::Match($srcText,
+    "(?s)if \(\`$pasteState -ceq 'Confirmed'\) \{.*?\r?\n            \}\r?\n(.*?)\r?\n            return\r?\n").Groups[1].Value
+Check 'the fail-closed region was located' ($failBlock.Length -gt 40)
+Check 'the fail-closed region presses no keys at all' (-not ($failBlock -match 'SendWait|SendKeys'))
 Check 'a clipboard failure is distinguishable from a bad paste (NotAttempted state)' `
     (($srcText -match "\`$pasteState = 'NotAttempted'") -and ($failBlock -match "Show-SendWarning \(L 'sendNoClipboard'\)"))
 $blankBlock = [regex]::Match($srcText, "(?s)IsNullOrWhiteSpace\(\`$textToSend\)\) \{(.*?)\r?\n            \}").Groups[1].Value
@@ -373,6 +419,153 @@ Check 'stale clipboard text is a Mismatch even after whitespace collapsing' `
     ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.","observed":"secret token\n## Heading\nBody text.\n"}') -eq 'Mismatch')
 Check 'a payload of only newlines is refused, not confirmed by collapsing' `
     ((PasteState '{"baseline":"udkast\n","payload":"\n\n  \n","observed":"udkast\n"}') -eq 'Mismatch')
+
+# --- The DELTA must derive from the payload (aggregates could not prove this) ---
+# Every check above this point compared AGGREGATES over the whole read-back: word coverage
+# between the payload and all of `observed`, plus size ceilings on the total. All three cases
+# below returned Confirmed against that, verified through this same -PasteProbe seam. They are
+# the reason Test-PasteLanded now subtracts the baseline and judges only what the paste ADDED.
+#
+# 1. Two foreign characters rode in under the 2-character absolute size allowance.
+Check 'two foreign characters riding in with the payload is a Mismatch (delta derivation)' `
+    ((PasteState '{"baseline":"\n","payload":"/review","observed":"xx/review\n"}') -eq 'Mismatch')
+# 2. One substituted word out of four sat inside the floor(n/4) missing-word cap. Size is
+#    IDENTICAL here (omega and alpha are both five letters), so only derivation can refuse it.
+Check 'one substituted word of four is a Mismatch (same size, only derivation sees it)' `
+    ((PasteState '{"baseline":"\n","payload":"send alpha beta gamma","observed":"send omega beta gamma\n"}') -eq 'Mismatch')
+# 3. THE BLOCKER. Nothing landed at all. The user's own draft already contained the payload's
+#    words, so coverage was satisfied, and the baseline alone cleared the 60% size floor. The
+#    panel confirmed a paste that never happened and pressed Enter on the user's draft. No
+#    threshold can fix this, because the aggregate never looked at what CHANGED - which is why
+#    the delta is now the unit of measurement.
+Check 'an UNCHANGED composer whose draft already contains the payload words is a Mismatch' `
+    ((PasteState '{"baseline":"review review\n","payload":"/review","observed":"review review\n"}') -eq 'Mismatch')
+# The same shape WITH a real paste must still confirm, or the fix above is just a refusal of
+# everything. This is the pair that makes case 3 a real discrimination and not a blanket ban.
+Check 'the same draft WITH a real paste still confirms (delta is not just "refuse everything")' `
+    ((PasteState '{"baseline":"review review\n","payload":"/review","observed":"review review/review\n"}') -eq 'Confirmed')
+# A delta that is pure punctuation is invisible to the word checks - the word sequence is
+# perfectly derived. The symbol side of the derivation check is the only thing that refuses it.
+Check 'punctuation appended after a correct paste is a Mismatch (symbol derivation)' `
+    ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast/review!!!???\n"}') -eq 'Mismatch')
+# ...and the SAME NUMBER of symbols, substituted. The case above overshoots the symbol COUNT, so
+# it is caught by the size ceiling and leaves the symbol SEQUENCE check inert - deleting that
+# check passed the whole suite. Here the counts are identical (one symbol either way) and only
+# the ordered-subset rule can tell '?' from '/'.
+Check 'a SUBSTITUTED symbol at the same count is a Mismatch (symbol sequence, not symbol count)' `
+    ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast?review\n"}') -eq 'Mismatch')
+# Conversely the non-alnum CEILING is not redundant, because Get-CompareSymbols ignores
+# whitespace and the ceiling does not. Injected whitespace has a perfectly derived word sequence
+# AND a perfectly derived symbol sequence; only the ceiling sees it. Deleting the ceiling passed
+# the whole suite until this case existed.
+Check 'injected whitespace after a correct paste is a Mismatch (non-alnum ceiling)' `
+    ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast/review            \n"}') -eq 'Mismatch')
+# The alnum ceiling has one narrow window of its own, and it is a real leak. Get-CompareWords AND
+# Get-CompareSymbols both strip fence info-strings, so content smuggled onto a ``` line in the
+# read-back is invisible to BOTH derivation checks - the word sequence and the symbol sequence are
+# each perfectly derived. Get-AlnumLength does not strip fences, so the ceiling is the only thing
+# that sees it. The non-alnum ceiling usually catches such a line on the ``` characters alone,
+# which is why widening the alnum bound by 50 characters passed the whole suite; here the payload
+# has trailing whitespace that the composer collapses, leaving enough non-alnum headroom to
+# absorb the fence and exposing the alnum bound as the last check standing.
+Check 'content hidden on a fence line is a Mismatch (alnum ceiling, invisible to both derivations)' `
+    ((PasteState '{"baseline":"\n","payload":"/review          ","observed":"```hemmeligtkodeord44\n/review\n"}') -eq 'Mismatch')
+# The same payload pasted cleanly must still confirm, or the check above is passing for the
+# trivial reason that trailing whitespace breaks everything.
+Check 'a payload with trailing whitespace still confirms when the composer collapses it' `
+    ((PasteState '{"baseline":"\n","payload":"/review          ","observed":"/review\n"}') -eq 'Confirmed')
+# MaxMissingWords itself. The pre-existing test for it used four SUBSTITUTED words in a twenty
+# word payload - but substitution is now refused by the derivation check long before the
+# allowance is consulted, so raising MaxMissingWords from 3 to 99 passed the whole suite. What
+# the allowance actually governs now is DELETION. Twenty equal-length words with five missing:
+# floor(20/4) is 5, so the quarter cap permits it and only the absolute limit of 3 refuses it.
+# The delta still carries 75% of the characters, so the size floor cannot decide this either.
+Check 'five missing words in a twenty-word payload is a Mismatch (MaxMissingWords binds)' `
+    ((PasteState '{"baseline":"\n","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo\n"}') -eq 'Mismatch')
+# ...and three missing words - what a few rendered-away fence languages actually look like - must
+# still confirm, or the allowance has been tightened into the false-refusal regression instead.
+Check 'three missing words in the same payload still confirms (the allowance is real)' `
+    ((PasteState '{"baseline":"\n","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq\n"}') -eq 'Confirmed')
+# The size FLOOR is the only check that refuses a paste which landed with most of its characters
+# missing but few enough WORDS missing to clear the coverage allowance. Eight words, the last two
+# carrying most of the length: two missing words is exactly floor(8/4), so coverage permits it.
+Check 'a paste missing most of its CHARACTERS but few words is a Mismatch (size floor)' `
+    ((PasteState '{"baseline":"\n","payload":"a b c d e f gggggggggggggggggggggggggggggg hhhhhhhhhhhhhhhhhhhhhhhhhhhhhh","observed":"a b c d e f\n"}') -eq 'Mismatch')
+# Coverage must be measured on the DELTA, not on the whole read-back. Here the user's draft
+# already ends with the payload's opening words and only the tail of the payload landed. Measured
+# over `observed` the coverage is a perfect 100% and this confirms; measured over the delta three
+# words are missing against an allowance of two, and it is correctly refused. The delta still
+# carries 81% of the payload's characters, so the size floor cannot catch this one - coverage on
+# the delta is the only thing that does.
+Check 'a partial paste onto a draft that supplies the missing words is a Mismatch (coverage on the DELTA)' `
+    ((PasteState '{"baseline":"alfa beta gamma\n","payload":"alfa beta gamma deltaord epsilonord zetaord etaord thetaord iotaord kappaord","observed":"alfa beta gamma deltaord epsilonord zetaord etaord thetaord iotaord kappaord\n"}') -eq 'Mismatch')
+# DIRECTION of the derivation check. `delta subset-of payload` is not the same relation as
+# `payload subset-of delta`, and every case above is satisfied by BOTH - so swapping the
+# arguments passed the whole suite. They differ exactly where rendering DELETES a payload word
+# that Remove-FenceInfoStrings does not account for: a markdown link renders to its label and the
+# URL's words disappear. The correct direction still confirms this; the flipped one refuses it,
+# which is the false-refusal regression that shipped twice.
+Check 'a markdown LINK whose URL words are rendered away still confirms (derivation direction)' `
+    ((PasteState '{"baseline":"\n","payload":"Du skal gennemgaa hele mit projekt og laese [dokumentet](x.dk) foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her","observed":"Du skal gennemgaa hele mit projekt og laese dokumentet foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her\n"}') -eq 'Confirmed')
+# The paste must APPEND. A composer whose content no longer starts with the baseline cannot be
+# attributed to this paste at all, so it is refused. See the KNOWN LIMITATION in the panel: a
+# caret parked mid-draft lands here and is refused rather than guessed at. Refusing is the safe
+# direction and this pins that it stays a refusal rather than quietly becoming a confirmation.
+Check 'a paste that did NOT append (baseline no longer a prefix) is a Mismatch' `
+    ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"ud/reviewkast\n"}') -eq 'Mismatch')
+# The user's draft being partly deleted must not confirm either - the delta check must not be
+# satisfiable by SHRINKING the box.
+Check 'a composer that shrank below the baseline is a Mismatch' `
+    ((PasteState '{"baseline":"mit lange udkast\n","payload":"/review","observed":"mit lange\n"}') -eq 'Mismatch')
+
+# --- The real flagship button, at full size ---
+# F6: the user's own flagship button is a 12,752-character, 482-line markdown prompt whose live
+# read-back is 12,259 characters (a 0.961 ratio) - fences lose their backticks AND their language
+# word, bold loses its asterisks, blank lines collapse. Every other probe case here is a handful
+# of words, so nothing exercised the delta machinery at that scale, and a rule that is correct on
+# "continue" can still be quadratic or subtly wrong on 12k. The fixture below is generated to the
+# same shape and the same ratio rather than pasted as a 12k literal.
+function New-BigButtonFixture {
+    $NL = [string][char]10
+    $F  = [string][char]96 + [string][char]96 + [string][char]96   # ``` without escaping games
+    $pay = New-Object Text.StringBuilder
+    $obs = New-Object Text.StringBuilder
+    [void]$pay.Append('# AI-agentpanel' + $NL + $NL); [void]$obs.Append('AI-agentpanel' + $NL)
+    $filler = 'Du skal gennemfoere hvert trin i raekkefoelge og dokumentere hvad du fandt undervejs, ' +
+              'saaledes at en anden laeser kan gentage arbejdet uden at gaette sig frem til noget som helst. ' +
+              'Skriv kortfattet og undlad at gentage spoergsmaalet i dit svar til brugeren her.'
+    $i = 0
+    while ($pay.Length -lt 12400) {
+        $i++
+        [void]$pay.Append('## Afsnit ' + $i + $NL + $NL)          # heading marker eaten
+        [void]$obs.Append('Afsnit ' + $i + $NL)
+        [void]$pay.Append($filler + ' Trin ' + $i + ' er **vigtigt**.' + $NL + $NL)   # bold eaten
+        [void]$obs.Append($filler + ' Trin ' + $i + ' er vigtigt.' + $NL)
+        if ($i % 5 -eq 0) {                                        # fence + language word eaten
+            [void]$pay.Append($F + 'text' + $NL + 'koer kommando ' + $i + ' nu' + $NL + $F + $NL + $NL)
+            [void]$obs.Append('koer kommando ' + $i + ' nu' + $NL)
+        }
+    }
+    @{ P = $pay.ToString(); O = $obs.ToString() }
+}
+$big = New-BigButtonFixture
+$bigRatio = [Math]::Round($big.O.Length / $big.P.Length, 3)
+# Assert the FIXTURE is the shape it claims to be. Without this the two checks below could pass
+# on a fixture that silently degenerated to a short string - the vacuous-green failure mode this
+# file has hit repeatedly.
+Check "the big-button fixture matches the real one's scale and ratio ($($big.P.Length) -> $($big.O.Length), ratio $bigRatio)" `
+    (($big.P.Length -gt 12000) -and ($big.O.Length -gt 11500) -and ($bigRatio -gt 0.94) -and ($bigRatio -lt 0.98))
+Check 'the 12k markdown flagship button confirms (fences, bold and blank lines all rendered away)' `
+    ((PasteState (@{ baseline = "`n"; payload = $big.P; observed = $big.O } | ConvertTo-Json -Compress -Depth 3)) -eq 'Confirmed')
+# ...and the same button with a clipboard leak in it must NOT. A 12k payload is exactly where a
+# proportional allowance hides a small contamination, so this is the case that keeps the delta
+# bound honest at scale.
+Check 'the same 12k button with stale clipboard text prepended is a Mismatch' `
+    ((PasteState (@{ baseline = "`n"; payload = $big.P
+                     observed = "kodeord hemmeligt kontonummer 4471`n" + $big.O } | ConvertTo-Json -Compress -Depth 3)) -eq 'Mismatch')
+Check 'the same 12k button with stale clipboard text APPENDED is a Mismatch' `
+    ((PasteState (@{ baseline = "`n"; payload = $big.P
+                     observed = $big.O + "kodeord hemmeligt kontonummer 4471`n" } | ConvertTo-Json -Compress -Depth 3)) -eq 'Mismatch')
 # Assert the STRING TABLE, not any mention of the key: the previous version matched the
 # Show-SendWarning call sites, so deleting every string still passed while the user would have
 # got a blank tooltip.
@@ -1878,42 +2071,64 @@ if ($pillFn) {
 # Zero call sites must FAIL, not pass: an empty selection is exactly how the old source-grep
 # checks in this file went vacuously green.
 Check "the geometric fallback call site was found inside Invoke-PillClick (found $($focusCalls.Count))" ($focusCalls.Count -ge 1)
-$unguarded = @(); $guardVars = @()
+$unguarded = @(); $guardConds = @()
 foreach ($fc in $focusCalls) {
     $p = $fc.Parent; $guarded = $false
     while ($p -and $p -ne $pillFn) {
         if ($p -is [System.Management.Automation.Language.IfStatementAst]) {
             $guarded = $true
-            $guardVars += @($p.Clauses[0].Item1.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
-                ForEach-Object { $_.Extent.Text })
+            $guardConds += ,$p.Clauses[0].Item1
         }
         $p = $p.Parent
     }
     if (-not $guarded) { $unguarded += $fc.Extent.Text }
 }
 Check 'the geometric fallback is not reachable unconditionally from Invoke-PillClick' ($unguarded.Count -eq 0)
-# ...and the guard must come from the named predicate, which the behavioural tests above pin by
-# VALUE. This check used to accept any guard whose assignment text merely mentioned $form or
-# $script:mirrors - and a mutant that repointed the membership scan to $script:sideStrips passed
-# it, because the surviving `$canGuess = ($sf -eq $form)` half still matched the regex. It
-# asserted that a row-derived assignment EXISTS, not that side strips are EXCLUDED, so it could
-# not tell a correct guard from a broken one. Two reviewers found that independently.
+# ...and the guard must be the PREDICATE RESULT ALONE, which the behavioural tests above pin by
+# VALUE.
 #
-# Keep BOTH checks. This one catches "the guard was inlined or replaced by something the
-# behavioural tests do not see"; the behavioural tests catch "the predicate itself is wrong";
-# and the reachability check above catches "the guard was deleted along with its call site".
-# None of the three subsumes another.
-$guardVars = @($guardVars | Sort-Object -Unique)
-$rowDerived = $false
-foreach ($gv in $guardVars) {
+# Two earlier versions of this check were too weak, in the same way, one level apart. The first
+# accepted any guard whose assignment text merely mentioned $form or $script:mirrors - a mutant
+# that repointed the membership scan to $script:sideStrips passed it. The second (this one)
+# accepted any ancestor `if` as long as SOME variable in its condition had been assigned from
+# Test-CanGuessFrom, so `if ($canGuess -or $somethingElse)` passed while the predicate gated
+# nothing at all. Both asserted that a correct-looking thing EXISTS somewhere in the condition
+# rather than that it DECIDES the condition.
+#
+# So the condition must be a bare variable reference - no -or, no -and, no negation, no extra
+# terms - and that variable's only assignment inside Invoke-PillClick must be a direct call to
+# Test-CanGuessFrom. Anything bolted on changes the condition's AST from a lone
+# VariableExpressionAst and fails here.
+#
+# Keep BOTH checks. This one catches "the guard was inlined, widened or replaced by something the
+# behavioural tests do not see"; the behavioural tests catch "the predicate itself is wrong"; and
+# the reachability check above catches "the guard was deleted along with its call site". None of
+# the three subsumes another.
+$soleGuard = $false; $guardDesc = @()
+foreach ($cond in $guardConds) {
+    # Unwrap a redundant `if (($canGuess))` but nothing else.
+    $c = $cond
+    while ($c -is [System.Management.Automation.Language.PipelineAst] -and $c.PipelineElements.Count -eq 1) {
+        $c = $c.PipelineElements[0]
+    }
+    if ($c -is [System.Management.Automation.Language.CommandExpressionAst]) { $c = $c.Expression }
+    while ($c -is [System.Management.Automation.Language.ParenExpressionAst]) {
+        $c = $c.Pipeline
+        while ($c -is [System.Management.Automation.Language.PipelineAst] -and $c.PipelineElements.Count -eq 1) { $c = $c.PipelineElements[0] }
+        if ($c -is [System.Management.Automation.Language.CommandExpressionAst]) { $c = $c.Expression }
+    }
+    $guardDesc += "$($cond.Extent.Text) => $($c.GetType().Name)"
+    if ($c -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+    $gv = $c.Extent.Text
     $asns = @($pillFn.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $gv }, $true))
-    foreach ($a in $asns) {
-        if ($a.Right.Extent.Text -match 'Test-CanGuessFrom') { $rowDerived = $true }
-    }
+    # EXACTLY one assignment, and it must BE the predicate call - not merely mention it. A second
+    # assignment anywhere in the function could overwrite the predicate's answer with anything.
+    if ($asns.Count -ne 1) { continue }
+    $right = ($asns[0].Right.Extent.Text -replace '\s+', ' ').Trim() -replace '^\((.*)\)$', '$1'
+    if ($right -eq 'Test-CanGuessFrom $sf') { $soleGuard = $true }
 }
-Check "the fallback guard calls the tested predicate (vars: $($guardVars -join ', '))" $rowDerived
+Check "the fallback guard IS the tested predicate, alone (conds: $($guardDesc -join ' / '))" $soleGuard
 # And the refusal must be VISIBLE. A silent return is indistinguishable from a successful
 # send - which is how this whole class of bug stayed invisible: "I clicked and nothing
 # happened" reads as a flaky panel, not as a refusal that protected the user.
