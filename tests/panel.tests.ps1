@@ -623,6 +623,39 @@ Check 'floor maps every strip index to its own pane' $mapOk
 Check '[int] does NOT (guards the fix from being reverted to it)' $roundBroke
 Check 'the source uses Floor for the strip->pane map' (((Get-Content $panel -Raw) -split "`n" | Where-Object { $_ -match '\$pIdx = ' } | Where-Object { $_ -notmatch 'Floor' }).Count -eq 0)
 
+# --- Reordering is per-bar ---
+# The bars share one array. Ordering across the whole of it would let a move on the row
+# reshuffle the side bars, or land a row button in the middle of a side bar's run.
+function Get-ButtonBar($b) { $v = [string]$b.bar; if (@('row','left','right') -contains $v) { $v } else { 'row' } }
+function Reorder-InBar($btns, $t, [int]$dir) {
+    $btns = @($btns)
+    $bar = Get-ButtonBar $t
+    $idxs = @()
+    for ($i = 0; $i -lt $btns.Count; $i++) { if ((Get-ButtonBar $btns[$i]) -eq $bar) { $idxs += $i } }
+    $blocks = @(Get-ButtonBlocks @($idxs | ForEach-Object { $btns[$_] }))
+    $bi = -1
+    for ($i = 0; $i -lt $blocks.Count; $i++) { if (Same-Button $blocks[$i].items[0] $t) { $bi = $i; break } }
+    $nb = $bi + $dir
+    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
+    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
+    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
+    for ($k = 0; $k -lt $idxs.Count; $k++) { $btns[$idxs[$k]] = $out[$k] }
+    $btns
+}
+$mix = @(
+    [pscustomobject]@{ label = 'R1'; text = '/r1' },
+    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
+    [pscustomobject]@{ label = 'R2'; text = '/r2' },
+    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' }
+)
+$m = @(Reorder-InBar $mix $mix[1] 1)
+Check 'moving a left-bar button reorders only the left bar' ((($m | ForEach-Object { $_.label }) -join ',') -eq 'R1,L2,R2,L1')
+Check 'the row buttons keep their own positions' ((($m | Where-Object { -not $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'R1,R2')
+$m2 = @(Reorder-InBar $mix $mix[0] 1)
+Check 'moving a row button does not disturb the side bar' ((($m2 | Where-Object { $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'L1,L2')
+$m3 = @(Reorder-InBar $mix $mix[1] -1)
+Check 'the first button on a bar cannot move further down' ((($m3 | ForEach-Object { $_.label }) -join ',') -eq 'R1,L1,R2,L2')
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

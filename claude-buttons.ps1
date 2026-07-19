@@ -840,6 +840,7 @@ $script:strings = @{
         groupTitle = 'Move to group'; groupAsk = 'Group name (empty = no group):'
         groupNew = 'New group...'; groupNone = 'No group'
         moveBar = 'Move to bar'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
+        moveUp = 'Move up'; moveDown = 'Move down'
         colours = 'Colours'; colDefault = 'Default'
         kind_text = 'Prompts'; kind_command = 'Commands'; kind_group = 'Groups'
         kind_toggle = 'Toggles'
@@ -873,6 +874,7 @@ $script:strings = @{
         groupTitle = 'Flyt til gruppe'; groupAsk = 'Gruppenavn (tomt = ingen gruppe):'
         groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
         moveBar = 'Flyt til bjælke'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
+        moveUp = 'Flyt op'; moveDown = 'Flyt ned'
         colours = 'Farver'; colDefault = 'Standard'
         kind_text = 'Prompts'; kind_command = 'Kommandoer'; kind_group = 'Grupper'
         kind_toggle = 'Kontakter'
@@ -2393,8 +2395,16 @@ $btnMenu.add_Opening({
     $miEdit.Text = L 'editText'
     $miIcon.Text = L 'setIcon'
     $miToggle.Text = L 'toggleMode'
-    $miLeft.Text = L 'moveLeft'
-    $miRight.Text = L 'moveRight'
+    # On a vertical bar the same gesture is up/down. dir +1 walks outward from the control row
+    # (BottomUp lays Controls out from the bottom), so 'up' is the +1 direction.
+    $srcBar = if ($script:menuSource -and $script:menuSource.Tag) { Get-ButtonBar $script:menuSource.Tag } else { 'row' }
+    if ($srcBar -eq 'row') {
+        $miLeft.Text = L 'moveLeft'
+        $miRight.Text = L 'moveRight'
+    } else {
+        $miLeft.Text = L 'moveDown'
+        $miRight.Text = L 'moveUp'
+    }
     $miGroup.Text = L 'groupTitle'
     $miRemove.Text = L 'remove'
     $miIcon.Enabled = ($null -ne $script:iconFont)
@@ -2649,7 +2659,12 @@ function Move-PinButton([int]$dir) {
         $ok = Update-Buttons {
             param($btns)
             $btns = @($btns)
-            $blocks = @(Get-ButtonBlocks $btns)
+            # Reorder only within this button's OWN bar. Ordering across the whole array would
+            # let a move on one bar reshuffle another, since the bars share the array.
+            $bar = Get-ButtonBar $t
+            $idxs = @()
+            for ($i = 0; $i -lt $btns.Count; $i++) { if ((Get-ButtonBar $btns[$i]) -eq $bar) { $idxs += $i } }
+            $blocks = @(Get-ButtonBlocks @($idxs | ForEach-Object { $btns[$_] }))
             # A group is identified by name (it owns no row); a plain button by value.
             $bi = -1
             for ($i = 0; $i -lt $blocks.Count; $i++) {
@@ -2665,7 +2680,8 @@ function Move-PinButton([int]$dir) {
             $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
             $out = @()
             foreach ($blk in $blocks) { $out += $blk.items }
-            $out
+            for ($k = 0; $k -lt $idxs.Count; $k++) { $btns[$idxs[$k]] = $out[$k] }
+            $btns
         }
         if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }   # sync the order across all strips
     } catch { Write-CkLog "Move error: $($_.Exception.Message)" }
