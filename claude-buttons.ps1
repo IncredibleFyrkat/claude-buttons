@@ -1678,6 +1678,7 @@ function Update-UiaInfo {
         # give us the exact element to focus when a button on that strip is clicked.
         # Sort into ROWS by a coarse Y band (so 1px render jitter between same-row panes can't
         # flip their order and swap strips), then left-to-right by X within each row.
+        $script:dockDiag = @()
         $composers = @(Get-Composers $root | Sort-Object @{ e = { [int]($_.Y / 50) } }, @{ e = { $_.X } })
         $newPanes = @()
         # Once composer detection has worked, losing it means the composers left the tree - a
@@ -1751,8 +1752,32 @@ function Update-UiaInfo {
                 # different element than the one it looked like on screen. The composer bounds
                 # every one of them and does not move.
                 $rowR = $c.X + $c.W
-                $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
-                $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
+                # Diagnostic: n is how many controls the cluster walk matched. When it is 0 the
+                # dock falls back to the composer's own left edge and a synthetic Y, which puts
+                # the strip at the far left and at the wrong height.
+                $script:dockDiag += ("{0}:n={1}/{2}" -f $newPanes.Count, $n, $rowBtns.Count)
+                if ($n -gt 0) {
+                    $dockX = [int]$rightEdge
+                    $dockY = [int]($sumY / $n)
+                } else {
+                    # The cluster walk found nothing. Collapsing to the composer's own left edge
+                    # and a synthetic Y throws the strip across the row ON TOP of the app's own
+                    # controls and at the wrong height - and it happens per pane, so one chat
+                    # breaks while the one below it is fine. A detection miss must degrade to the
+                    # LAST KNOWN GOOD offset for this pane, not to a position we know is wrong.
+                    $prev = $null
+                    foreach ($op in $script:panes) {
+                        if ($op.Cx -and [Math]::Abs($op.Cx - $c.X) -le (SW 40) -and
+                            [Math]::Abs($op.Cy - $c.Y) -le (SW 40) -and $null -ne $op.DockDX) { $prev = $op; break }
+                    }
+                    if ($prev) {
+                        $dockX = [int]($c.X + $prev.DockDX)
+                        $dockY = [int](($c.Y + $c.H) + $prev.DockDY)
+                    } else {
+                        $dockX = [int]$c.X
+                        $dockY = [int]($cBottom + (SW 20))
+                    }
+                }
                 $newPanes += @{
                     OffL = $c.X - $wr.Left; OffT = $c.Y - $wr.Top; Width = $c.W
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
@@ -1788,6 +1813,7 @@ function Update-UiaInfo {
             }
         }
         } finally { $cacheScope.Dispose() }
+        if ($script:dockDiag.Count) { Write-CkLog ("DOCK " + ($script:dockDiag -join ' ')) }
         Set-PaneSideRooms $newPanes $wr
         $script:panes = $newPanes
 
