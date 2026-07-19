@@ -3524,16 +3524,14 @@ $timer.add_Tick({
             if (-not $pn.Cx) { if ($sForm.Visible) { $sForm.Hide() }; continue }
             $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
             if ($room -lt ((S $script:sideMinBtn) + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
-            # Hug the pane's OUTER edge rather than the composer's, so each bar uses the margin
-            # it actually has. Anchoring both to the composer put the right bar tight against it
-            # while leaving the room past it empty. Clamped so a wide margin can never let a bar
-            # drift back over the composer.
-            $edgeGap = S 6
-            $sx = if ($st.Side -eq 'left') {
-                      [Math]::Min([int]($pn.PaneL + $edgeGap), [int]($pn.Cx - $sForm.Width - 2))
-                  } else {
-                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($pn.Cx + $pn.Cw + 2))
-                  }
+            # Anchor to the CHAT's own left/right edges, exactly as the row bar anchors to its
+            # bottom edge. Hugging a derived "pane edge" instead gave every pane a different
+            # answer: a pane edge is not measured, it is the midpoint between neighbouring
+            # composers, so the leftmost pane threw its bar out to the window edge and the
+            # middle panes dropped theirs in the gap between two chats.
+            $edgeGap = S 4   # its own gap: stripGap tunes the row's distance from the mic
+            $sx = if ($st.Side -eq 'left') { [int]($pn.Cx - $edgeGap - $sForm.Width) }
+                  else { [int]($pn.Cx + $pn.Cw + $edgeGap) }
             # Bottom edge level with the control row's buttons, so the lowest side button lines up
             # with the row instead of floating above it.
             $sy = [int]($pn.DockY + [int]($pillH / 2) + (SW $script:vNudge) - $sForm.Height)
@@ -3542,6 +3540,8 @@ $timer.add_Tick({
             $sVis = [bool]$pn.Anchored
             if ($sVis) { $sVis = Test-PaneVisible ([int]($sx + $sForm.Width / 2)) ([int]($sy + $sForm.Height - 4)) }
             if (-not $sVis) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            Write-CkLog ("SIDE i={0} pane={1} side={2} paneL={3} paneR={4} cX={5} cW={6} w={7} sx={8} sy={9} n={10}" -f `
+                $si, $pIdx, $st.Side, $pn.PaneL, $pn.PaneR, $pn.Cx, $pn.Cw, $sForm.Width, $sx, $sy, $sForm.Controls[0].Controls.Count)
             $sDesired = New-Object System.Drawing.Point($sx, $sy)
             if ($sForm.Location -ne $sDesired) { $sForm.Location = $sDesired }
             if (-not $sForm.Visible) { $sForm.Show(); Update-LayeredStrip $sForm $st.Panel }
