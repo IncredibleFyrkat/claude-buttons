@@ -3122,21 +3122,6 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
     $panel.SuspendLayout()
     $old = @($panel.Controls)
     $panel.Controls.Clear()
-    if ($script:kebabBar -eq $strip.Side) {
-        $sg = New-Object GripHandle
-        $sg.BackColor = $script:barColor
-        $sg.DotColor = $colIcon
-        $sg.HoverFill = $colHover
-        $sg.DownFill = $colDown
-        $sg.Width = $btnSize; $sg.Height = $btnSize
-        $sg.Margin = New-Object System.Windows.Forms.Padding(0, (S(2)), 0, (S(2)))
-        $sg.ContextMenuStrip = $gripMenu
-        $sg.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($this, $_.Location) } })
-        $sg.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
-        $sg.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
-        $sg.add_Repaint({ Render-StripFor $this })
-        $panel.Controls.Add($sg)
-    }
     $vis = @(Get-VisibleButtons $paneTitle $isPrimary)
     $seenGroup = @{}
     foreach ($src in $vis) {
@@ -3180,6 +3165,23 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
         $btn.add_Repaint({ Render-StripFor $this })
         if ($b.__isGroup) { $btn.add_MouseEnter({ Show-GroupFlyout $this $false }) }
         $panel.Controls.Add($btn)
+    }
+    # Added LAST so BottomUp puts it at the OUTER end of the stack. Added first, it sat at
+    # the bottom under every button, reading as an afterthought tacked beneath the bar.
+    if ($script:kebabBar -eq $strip.Side) {
+        $sg = New-Object GripHandle
+        $sg.BackColor = $script:barColor
+        $sg.DotColor = $colIcon
+        $sg.HoverFill = $colHover
+        $sg.DownFill = $colDown
+        $sg.Width = $btnSize; $sg.Height = $btnSize
+        $sg.Margin = New-Object System.Windows.Forms.Padding(0, (S(2)), 0, (S(2)))
+        $sg.ContextMenuStrip = $gripMenu
+        $sg.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($this, $_.Location) } })
+        $sg.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+        $sg.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+        $sg.add_Repaint({ Render-StripFor $this })
+        $panel.Controls.Add($sg)
     }
     $panel.ResumeLayout()
     foreach ($o in $old) { $o.Dispose() }
