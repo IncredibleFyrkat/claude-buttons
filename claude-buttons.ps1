@@ -40,10 +40,66 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
 using System;
 using System.Text;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Windows.Forms;
+
+// Centring a glyph is not the same as centring its string. DrawString centres the font's
+// METRICS box - advance width plus the full line height - and icon fonts carry asymmetric
+// side bearings and a lot of headroom above the ink, so a perfectly centred string draws a
+// visibly off-centre picture (high and to one side inside its own button).
+// Measure the ink once per glyph+font and shift by the difference. Cached, so the offscreen
+// render happens once per icon for the life of the process, never on a paint.
+public static class GlyphInk {
+    static readonly Dictionary<string, PointF> cache = new Dictionary<string, PointF>();
+    public static PointF Offset(string text, Font font) {
+        if (string.IsNullOrEmpty(text) || font == null) return PointF.Empty;
+        string key = text + "" + font.Name + "" + font.Size + "" + (int)font.Style;
+        lock (cache) { PointF hit; if (cache.TryGetValue(key, out hit)) return hit; }
+        PointF off = PointF.Empty;
+        try {
+            int n = Math.Max(48, (int)(font.Size * 6));
+            using (var bmp = new Bitmap(n, n, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp)) {
+                g.Clear(Color.Transparent);
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                using (var sf = new StringFormat()) {
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.FormatFlags = StringFormatFlags.NoWrap;
+                    g.DrawString(text, font, Brushes.White, new RectangleF(0, 0, n, n), sf);
+                }
+                var data = bmp.LockBits(new Rectangle(0, 0, n, n), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try {
+                    int[] px = new int[n * n];
+                    Marshal.Copy(data.Scan0, px, 0, px.Length);
+                    int minX = n, maxX = -1, minY = n, maxY = -1;
+                    for (int y = 0; y < n; y++) {
+                        for (int x = 0; x < n; x++) {
+                            // Alpha only: the glyph is white on transparent, and a low
+                            // threshold keeps antialiased edges from skewing the bounds.
+                            if ((px[y * n + x] >> 24 & 0xFF) > 24) {
+                                if (x < minX) minX = x;
+                                if (x > maxX) maxX = x;
+                                if (y < minY) minY = y;
+                                if (y > maxY) maxY = y;
+                            }
+                        }
+                    }
+                    if (maxX >= minX && maxY >= minY) {
+                        // How far the ink's centre sits from the box's centre, negated.
+                        off = new PointF((n - 1 - maxX - minX) / 2f, (n - 1 - maxY - minY) / 2f);
+                    }
+                } finally { bmp.UnlockBits(data); }
+            }
+        } catch { }
+        lock (cache) { cache[key] = off; }
+        return off;
+    }
+}
 
 public static class CkDpi {
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
@@ -144,6 +200,7 @@ public class PillButton : Control {
     public Color ToggleFore = Color.FromArgb(255, 255, 255); // 5.11:1 on ToggleFill
     public Color Accent = Color.Empty; // border on per-chat buttons
     public bool Bold = false;          // draw the glyph with extra stroke weight (icons)
+    public bool Glyph = false;         // the Text is an icon glyph, so centre its INK, not its metrics box
     bool toggled;
     public bool Toggled { get { return toggled; } set { toggled = value; Invalidate(); FireRepaint(); } }
     bool hover, down;
@@ -219,15 +276,20 @@ public class PillButton : Control {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (var hit = new SolidBrush(Color.FromArgb(1, 0, 0, 0)))
             g.FillRectangle(hit, new Rectangle(ox, oy, Width, Height));
-        var rc = new Rectangle(ox, oy, Width - 1, Height - 1);
+        // Horizontal only: filling at Width-1 left the highlight a pixel short on its RIGHT,
+        // which is invisible on the bar but shows as lopsided padding inside the group flyout.
+        // Height keeps its -1 - the vertical was already correct and changing it moved the
+        // bottom edge into the flyout's border.
+        var rcFill = new Rectangle(ox, oy, Width, Height - 1);
+        var rcEdge = new Rectangle(ox, oy, Width - 1, Height - 1);
         int rad = Math.Max(4, Height / 4);
         if (hover || down || toggled) {
             Color f = down ? DownFill : (toggled ? ToggleFill : HoverFill);
-            using (var path = RoundRect(rc, rad))
+            using (var path = RoundRect(rcFill, rad))
             using (var b = new SolidBrush(Color.FromArgb(255, f))) g.FillPath(b, path);
         }
         if (Accent != Color.Empty) {
-            using (var path = RoundRect(rc, rad))
+            using (var path = RoundRect(rcEdge, rad))
             using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
         }
         int textLeft = 0;
@@ -244,6 +306,13 @@ public class PillButton : Control {
             sf.LineAlignment = StringAlignment.Center;
             sf.FormatFlags = StringFormatFlags.NoWrap;
             var rect = new RectangleF(ox + textLeft, oy, Width - textLeft, Height);
+            // Optically centre the glyph, not its metrics box. Icon glyphs are drawn as a
+            // picture, so their INK is what has to sit in the middle of the button; text
+            // labels are read as text and keep their baseline/advance centring.
+            if (Glyph) {
+                var ink = GlyphInk.Offset(Text, Font);
+                rect.Offset(ink.X, ink.Y);
+            }
             using (var b = new SolidBrush(toggled ? ToggleFore : ForeColor)) {
                 if (Bold) {
                     // Faux-bold: redraw the glyph at sub-pixel offsets to thicken strokes
@@ -263,6 +332,85 @@ public class PillButton : Control {
 // The menu button: a vertical 3-dot kebab that is visually IDENTICAL to an icon
 // PillButton (same square size, hover/press highlight, and white dots) - it just draws
 // dots instead of a glyph and opens the menu instead of sending text.
+// The group flyout: a pill of member buttons ABOVE the group button, joined to it by a stem so
+// the two read as one shape (a T) rather than a popup that happens to be nearby. Drawn as a
+// single unioned path on a per-pixel-alpha layered window, so the "one outline" is literal.
+// Near a pane edge the pill shifts and the stem lands off-centre - a T becomes a corner shape.
+public class FlyoutSurface : Control {
+    public Color Surface = Color.FromArgb(46, 45, 43);
+    public Color EdgeColor = Color.FromArgb(78, 75, 70);
+    public int StemLeft, StemWidth, StemTop;   // where the group button sits, in flyout coords
+    // ONE corner radius for the whole silhouette, set to the button hover's radius. Deriving it
+    // from each part's own height gave the pill, the stem and the hover highlight three
+    // different roundings, so the member row read as blobbier than the button it hangs off.
+    public int Rad = 6;
+    public int BottomPad;                      // transparent margin so the stem's rounded corner is not clipped
+    public int PillHeight;
+    public FlyoutSurface() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false);
+    }
+    static void AddRound(GraphicsPath p, RectangleF r, float rad) {
+        float d = rad * 2;
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+    }
+    // Square top, rounded bottom. The stem's top corners sit UNDER the pill, so rounding them
+    // pinched the silhouette into a waist where the two shapes met.
+    static void AddRoundBottom(GraphicsPath p, RectangleF r, float rad) {
+        float d = rad * 2;
+        p.AddLine(r.X, r.Y, r.Right, r.Y);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+    }
+    // Union of pill + stem. Drawn a half pixel in from the bitmap edge, or the antialiased
+    // outer edge falls outside the bitmap and the border looks shaved off on one side.
+    public GraphicsPath BuildShape(float inset) {
+        var path = new GraphicsPath(FillMode.Winding);
+        float o = inset + 0.5f;
+        float rad = Rad;
+        float bottom = Height - BottomPad;
+        // Same width (a single member) is one plain rounded rectangle - there is no junction to
+        // pinch, and building it as a union produced a visible seam.
+        if (Math.Abs(StemWidth - Width) <= 1) {
+            AddRound(path, new RectangleF(o, o, Width - 2 * o, bottom - 2 * o), rad);
+            return path;
+        }
+        AddRound(path, new RectangleF(o, o, Width - 2 * o, PillHeight - 2 * o), rad);
+        // Overlap up into the pill so the two fuse. Kept independent of the radius: shrinking
+        // the corner must not also shrink the join, or a sharper look reopens the seam.
+        float stemTop = PillHeight - Math.Max(6f, rad);
+        AddRoundBottom(path, new RectangleF(StemLeft + o, stemTop,
+                                           StemWidth - 2 * o, (bottom - o) - stemTop), rad);
+        return path;
+    }
+    public GraphicsPath BuildShape() { return BuildShape(0f); }
+    public void RenderTo(Graphics g, int ox, int oy) {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var st = g.Save();
+        g.TranslateTransform(ox, oy);
+        // Outline by inflation, NOT by stroking the union: stroking draws both sub-shapes'
+        // outlines including the internal edge where pill meets stem, which reads as a seam
+        // through the middle. Filling the border colour and then the surface inset by 1px
+        // leaves only the outer silhouette.
+        using (var outer = BuildShape(0f))
+        using (var inner = BuildShape(1f)) {
+            using (var b = new SolidBrush(EdgeColor)) g.FillPath(b, outer);
+            using (var b2 = new SolidBrush(Surface)) g.FillPath(b2, inner);
+        }
+        g.Restore(st);
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        e.Graphics.Clear(BackColor);
+        RenderTo(e.Graphics, 0, 0);
+    }
+}
+
 public class GripHandle : Control {
     public Color DotColor = Color.White;
     public Color HoverFill = Color.FromArgb(48, 48, 47);
@@ -297,7 +445,9 @@ public class GripHandle : Control {
     void DrawFace(Graphics g, int ox, int oy) {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         if (hover || down) {
-            var rc = new Rectangle(ox, oy, Width - 1, Height - 1);
+            // Width (not Width-1) to match PillButton's highlight exactly - otherwise the
+            // kebab's hover box is a pixel narrower than every button next to it.
+            var rc = new Rectangle(ox, oy, Width, Height - 1);
             int rad = Math.Max(4, Height / 4);
             Color f = down ? DownFill : HoverFill;
             using (var path = RoundRect(rc, rad))
@@ -307,7 +457,10 @@ public class GripHandle : Control {
         // faux-bold stacking (center + 4 sub-pixel offsets) so its edges are reinforced and it
         // reads as solid/bright as a glyph stroke, not a faded single-pass circle.
         float d = Math.Max(1.8f, Height / 12f);
-        float cx = ox + Width / 2f, cy = oy + Height / 2f, vgap = d * 2f;
+        // Centre on the PIXEL grid, not the box edge. A 27px button covers pixels 0..26, whose
+        // centre is 13 - not 13.5. Rounding to the box centre biased the dots half a pixel down
+        // and right, which showed up as the kebab sitting a row lower than every glyph beside it.
+        float cx = ox + (Width - 1) / 2f, cy = oy + (Height - 1) / 2f, vgap = d * 2f;
         float o = 0.3f;
         float[] dx = { 0f, -o, o, 0f, 0f };
         float[] dy = { 0f, 0f, 0f, -o, o };
@@ -667,6 +820,7 @@ $script:strings = @{
         dupPin = 'That command is already pinned in this scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
+        tipGroup = 'Group of {0}'; tipGroupHint = 'Hover to open - right-click: rename / set icon'
         tipShift = 'Shift-click: insert without sending'
         sendBlank = 'Not sent: this button has no text to send. Check its text in buttons.json.'
         sendNoClipboard = 'Not sent: the clipboard was unavailable, so nothing was pasted. The message box was not changed.'
@@ -681,6 +835,13 @@ $script:strings = @{
         toggleMode = 'On/off (toggle) mode'
         tipToggle = 'toggle on/off'
         editText = 'Edit text/prompt...'; editTextTitle = 'Edit button text'
+        groupTitle = 'Move to group'; groupAsk = 'Group name (empty = no group):'
+        groupNew = 'New group...'; groupNone = 'No group'
+        colours = 'Colours'; colDefault = 'Default'
+        kind_text = 'Prompts'; kind_command = 'Commands'; kind_group = 'Groups'
+        kind_toggle = 'Toggles'
+        col_gray = 'Grey'; col_blue = 'Blue'; col_green = 'Green'
+        col_amber = 'Amber'; col_red = 'Red'; col_purple = 'Purple'
         dlgOk = 'OK'; dlgCancel = 'Cancel'
     }
     da = @{
@@ -691,6 +852,7 @@ $script:strings = @{
         dupPin = 'Kommandoen er allerede pinnet i dette scope.'
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
+        tipGroup = 'Gruppe med {0}'; tipGroupHint = 'Hold musen over for at åbne - højreklik: omdøb / vælg ikon'
         tipShift = 'Shift-klik: indsæt uden at sende'
         sendBlank = 'Ikke sendt: denne knap har ingen tekst at sende. Tjek dens tekst i buttons.json.'
         sendNoClipboard = 'Ikke sendt: udklipsholderen var utilgængelig, så intet blev indsat. Beskedfeltet blev ikke ændret.'
@@ -705,6 +867,13 @@ $script:strings = @{
         toggleMode = 'On/off-tilstand (toggle)'
         tipToggle = 'tænd/sluk'
         editText = 'Redigér tekst/prompt…'; editTextTitle = 'Redigér knappens tekst'
+        groupTitle = 'Flyt til gruppe'; groupAsk = 'Gruppenavn (tomt = ingen gruppe):'
+        groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
+        colours = 'Farver'; colDefault = 'Standard'
+        kind_text = 'Prompts'; kind_command = 'Kommandoer'; kind_group = 'Grupper'
+        kind_toggle = 'Kontakter'
+        col_gray = 'Grå'; col_blue = 'Blå'; col_green = 'Grøn'
+        col_amber = 'Rav'; col_red = 'Rød'; col_purple = 'Lilla'
         dlgOk = 'OK'; dlgCancel = 'Annuller'
     }
 }
@@ -749,6 +918,43 @@ function Update-Buttons([scriptblock]$transform) {
         if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
         return $false
     } finally { [void]$script:cfgLock.ReleaseMutex() }
+}
+
+# Same lock + atomic write as Update-Buttons, but the transform sees the WHOLE config.
+# Groups live under config.groups (not in the buttons array), so their icon and label are
+# unreachable through Update-Buttons - which is why "Set icon..." on a group used to save
+# nothing at all.
+function Update-Config([scriptblock]$transform) {
+    $held = $false
+    try { $held = $script:cfgLock.WaitOne(2000) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    catch { $held = $false }
+    if (-not $held) { Write-CkLog 'Config lock busy - change not saved'; return $false }
+    try {
+        $fresh = Read-FreshConfig
+        if (-not $fresh) { return $false }
+        $fresh = & $transform $fresh
+        if (-not $fresh) { return $false }
+        if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
+        return $false
+    } finally { [void]$script:cfgLock.ReleaseMutex() }
+}
+
+# Set one property on a group definition, creating the groups map / entry as needed.
+function Set-GroupProp([string]$name, [string]$prop, $value) {
+    if (-not $name) { return $false }
+    Update-Config {
+        param($cfg)
+        if (-not $cfg.PSObject.Properties['groups'] -or -not $cfg.groups) {
+            $cfg | Add-Member -NotePropertyName groups -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        if (-not $cfg.groups.PSObject.Properties[$name]) {
+            $cfg.groups | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        if ($null -eq $value -or $value -eq '') { $cfg.groups.$name.PSObject.Properties.Remove($prop) }
+        else { $cfg.groups.$name | Add-Member -NotePropertyName $prop -NotePropertyValue $value -Force }
+        $cfg
+    }
 }
 
 function Same-Button($a, $b) {
@@ -1434,6 +1640,48 @@ $colDown  = [System.Drawing.Color]::FromArgb(58, 58, 56)   # a touch brighter fo
 $colText  = [System.Drawing.Color]::FromArgb(214, 210, 202)
 $colIcon  = [System.Drawing.Color]::FromArgb(168, 168, 168)   # a8a8a8 - icon glyphs + kebab dots (soft grey, like Claude's own)
 $colAccent = [System.Drawing.Color]::FromArgb(198, 146, 78)   # border on per-chat buttons (brightened for WCAG 1.4.11)
+
+# ---------- Per-KIND colors ----------
+# Buttons are coloured by what they DO, not one at a time: prompts, slash commands, groups
+# and toggles each get their own colour, so the bar reads as categories instead of confetti.
+# Every swatch is light enough on the 1d1d1c bar to clear WCAG 1.4.11 (3:1 non-text).
+$script:ckPalette = [ordered]@{
+    gray   = [System.Drawing.Color]::FromArgb(168, 168, 168)
+    blue   = [System.Drawing.Color]::FromArgb(107, 166, 232)
+    green  = [System.Drawing.Color]::FromArgb(123, 196, 127)
+    amber  = [System.Drawing.Color]::FromArgb(217, 162,  95)
+    red    = [System.Drawing.Color]::FromArgb(224, 138, 123)
+    purple = [System.Drawing.Color]::FromArgb(183, 155, 224)
+}
+# Which colour slot a button draws from. Toggles are asked twice - off and on - because the
+# whole point of a toggle is that its two states look different.
+function Get-ColorKind($b) {
+    if ($b.__isGroup) { return 'group' }
+    if ($b.toggle) { return 'toggle' }
+    if ([string]$b.text -match '^\s*/') { return 'command' }
+    return 'text'
+}
+# $null means "no override": the button keeps the default grey it has always had, which is
+# why text and commands look unchanged until someone actually picks a colour for them.
+function Get-KindColor($b, [bool]$isOn) {
+    $kind = Get-ColorKind $b
+    # The ON state is deliberately NOT colourable: its white-on-amber is 4.67:1, and every
+    # palette entry measures 1.8-2.2:1 on that fill. There is no choice here that is not a
+    # regression, so the kind colour applies to the OFF state only.
+    if ($isOn) { return $null }
+    $name = $null
+    try { $name = [string]$script:config.colors.$kind } catch {}
+    if (-not $name) { return $null }
+    if ($script:ckPalette.Contains($name)) { return $script:ckPalette[$name] }
+    return $null
+}
+# The fore colour a button should actually draw with, kind override or the historic default.
+function Get-ButtonFore($b, [bool]$isOn) {
+    $c = Get-KindColor $b $isOn
+    if ($c) { return $c }
+    if ($b.icon) { return $colIcon }
+    return $colText
+}
 $pillH = S(27)   # square icon buttons; the glyph font stays fixed, so this is padding around the icon
 
 # Strip background color (alias kept so the transparent-strip work has one knob).
@@ -1461,6 +1709,185 @@ function Update-LayeredStrip($frm, $pnl) {
     } catch { Write-CkLog "Update-LayeredStrip error: $($_.Exception.Message)" }
     finally { if ($g) { $g.Dispose() }; if ($bmp) { $bmp.Dispose() } }
 }
+# ---------- Group flyout ----------
+$script:flyForm = $null      # the layered flyout window (one, reused)
+$script:flySurface = $null   # the T-shaped background it draws
+$script:flyOwner = $null     # the group button it is currently attached to
+$script:flyLeftAt = $null
+$script:flyPinned = $false   # opened by click: stays until dismissed, not just while hovered
+
+function Hide-GroupFlyout {
+    if ($script:flyForm -and $script:flyForm.Visible) { $script:flyForm.Hide() }
+    $script:flyOwner = $null
+    $script:flyPinned = $false
+}
+
+# Compose the flyout the same way the strips are drawn: one ARGB bitmap pushed to a layered
+# window. The T shape is painted first, then the member buttons on top of it.
+function Update-FlyoutSurface {
+    $frm = $script:flyForm
+    if (-not $frm -or -not $frm.IsHandleCreated) { return }
+    $w = $frm.Width; $h = $frm.Height
+    if ($w -le 0 -or $h -le 0) { return }
+    $bmp = $null; $g = $null
+    try {
+        $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::FromArgb(0, 0, 0, 0))
+        $script:flySurface.RenderTo($g, 0, 0)
+        foreach ($c in $frm.Controls) {
+            if ($c -is [PillButton]) { $c.RenderTo($g, $c.Left, $c.Top) }
+        }
+        # The group button is a real child control now (see Show-GroupFlyout), so the loop
+        # above already painted it in the same pass as the members.
+        [Layered]::Push($frm.Handle, $bmp, $frm.Left, $frm.Top)
+    } catch { Write-CkLog "Update-FlyoutSurface error: $($_.Exception.Message)" }
+    finally { if ($g) { $g.Dispose() }; if ($bmp) { $bmp.Dispose() } }
+}
+
+# Open (or re-target) the flyout for a group button. $pin = opened by click, so it survives the
+# cursor leaving until dismissed; hover-opened flyouts close on the tick's cursor check.
+function Show-GroupFlyout($btn, [bool]$pin) {
+    try {
+        $tag = $btn.Tag
+        if (-not $tag -or -not $tag.__isGroup) { return }
+        $members = @($tag.members)
+        if ($members.Count -eq 0) { return }
+        if (-not $script:flyForm) {
+            $script:flyForm = New-Object LayeredForm
+            $script:flyForm.Text = 'Claude Buttons'
+            $script:flyForm.TopMost = $true
+            $script:flyForm.FormBorderStyle = 'None'
+            $script:flyForm.ShowInTaskbar = $false
+            $script:flyForm.StartPosition = 'Manual'
+            $script:flySurface = New-Object FlyoutSurface
+        }
+        $frm = $script:flyForm
+        foreach ($c in @($frm.Controls)) { $frm.Controls.Remove($c); $c.Dispose() }
+
+        # Lay the member buttons out left to right inside the pill.
+        $pad = S 5; $gap = S 4
+        $mh = $pillH
+        $mbs = @()
+        foreach ($m in $members) {
+            $mb = New-Object PillButton
+            $mb.Tag = $m
+            $mb.Height = $mh
+            Set-PillFace $mb
+            if ($m.toggle) { $mb.Toggled = (Get-ToggleState $m) }
+            $mb.ForeColor = Get-ButtonFore $m $false
+            $mb.Fill = if ($m.icon) { $script:barColor } else { $colFill }
+            $mb.Bold = [bool]$m.icon
+            $mb.Glyph = [bool]$m.icon
+            $mb.HoverFill = $colHover
+            $mb.DownFill = $colDown
+            if ($m.chat) { $mb.Accent = $colAccent }
+            $mb.AccessibleName = [string]$m.label
+            $mb.ContextMenuStrip = $btnMenu
+            $mb.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
+            $mb.add_Click({ $b = $this; Hide-GroupFlyout; Invoke-PillClick $b })
+            # Hover tracking, so members get the same tooltip as buttons on the bar. Without
+            # this the tip box only ever knew about strip buttons and the flyout was silent.
+            $mb.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+            $mb.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+            $mb.add_Repaint({ Update-FlyoutSurface })
+            $frm.Controls.Add($mb)
+            $mbs += $mb
+        }
+        $stemW = $btn.Width + 2 * (S 3)
+        $runW = 0
+        foreach ($mb in $mbs) { $runW += $mb.Width }
+        if ($mbs.Count -gt 1) { $runW += $gap * ($mbs.Count - 1) }
+        $pillW = [Math]::Max($runW + 2 * $pad, $stemW)
+        # A single member (or anything barely wider than the stem) should read as one seamless
+        # rectangle, not a blob with a step where pill meets stem - so snap the widths equal.
+        if ($pillW -le $stemW + (S 8)) { $pillW = $stemW }
+        # Centre the run in the FINAL width. Laying out from a fixed left pad left the icon a
+        # couple of px right of centre once the pill snapped to the (narrower) stem width.
+        $x = [int](($pillW - $runW) / 2)
+        foreach ($mb in $mbs) { $mb.Left = $x; $mb.Top = $pad; $x += $mb.Width + $gap }
+        $pillH2 = $mh + 2 * $pad
+
+        # Geometry: pill centred over the group button where possible, clamped to the pane so it
+        # never hangs off the edge. The stem marks where the group button sits underneath.
+        $bScreen = $btn.PointToScreen([System.Drawing.Point]::new(0, 0))
+        $desiredLeft = $bScreen.X + [int]($btn.Width / 2) - [int]($pillW / 2)
+        $left = $desiredLeft
+        # Clamp to the pane this button actually belongs to. Using the primary pane's rect put
+        # every other column's flyout inside that one pane instead of over its own group button.
+        $ownPane = Get-PaneForForm $btn.FindForm()
+        if ($ownPane -and $ownPane.Cx) {
+            $minL = [int]$ownPane.Cx + (S 4)
+            $maxL = [int]($ownPane.Cx + $ownPane.Cw) - $pillW - (S 4)
+            if ($maxL -lt $minL) { $maxL = $minL }
+            $left = [Math]::Max($minL, [Math]::Min($desiredLeft, $maxL))
+        }
+        $stemLeft = $bScreen.X - (S 3) - $left
+        # The stem has to stay EXACTLY centred on the group button, or the button reads as
+        # off-centre inside its own stem (its highlight sits nearer one wall than the other).
+        # Sliding the stem to keep it inside the pill was the wrong knob: it silently broke
+        # that centring near a pane edge. Move the PILL instead, so the T stays true and only
+        # the pane-edge margin gives.
+        $stemMax = $pillW - $stemW
+        if ($stemLeft -lt 0) { $left += $stemLeft; $stemLeft = 0 }
+        elseif ($stemLeft -gt $stemMax) { $left += $stemLeft - $stemMax; $stemLeft = $stemMax }
+        $gapY = S 2
+        $top = $bScreen.Y - $pillH2 - $gapY
+        $botPad = S 2
+        $height = $pillH2 + $gapY + $btn.Height + $botPad
+
+        # Same formula PillButton uses for its hover highlight, so the flyout's corners and the
+        # corners of the buttons sitting in it are the same shape.
+        # Floor, not [int]: PowerShell's [int] ROUNDS (27/4 -> 7) while C#'s int division
+        # truncates (-> 6). Rounding here would set the flyout a pixel rounder than the very
+        # buttons it is matching.
+        $script:flySurface.Rad = [Math]::Max(4, [Math]::Floor($mh / 4))
+        $script:flySurface.PillHeight = $pillH2
+        $script:flySurface.StemTop = $pillH2 + $gapY
+        $script:flySurface.StemLeft = $stemLeft
+        $script:flySurface.StemWidth = $stemW
+        $script:flySurface.BottomPad = $botPad
+        $script:flySurface.Width = $pillW
+        $script:flySurface.Height = $height
+
+        # The group button itself, as a REAL control inside the flyout rather than a picture
+        # painted onto it. The flyout covers the strip, so a drawn-only button swallowed every
+        # right-click, hover and tooltip aimed at it - it looked interactive and was not.
+        # Positioned from the strip button's own screen point, so it stays pixel-identical.
+        $ob = New-Object PillButton
+        $ob.Tag = $tag
+        $ob.Width = $btn.Width; $ob.Height = $btn.Height
+        Set-PillFace $ob
+        $ob.ForeColor = $btn.ForeColor
+        $ob.Fill = $btn.Fill
+        $ob.Bold = $btn.Bold
+        $ob.Glyph = $btn.Glyph
+        $ob.HoverFill = $colHover
+        $ob.DownFill = $colDown
+        $ob.AccessibleName = $btn.AccessibleName
+        $ob.Left = $bScreen.X - $left
+        $ob.Top  = $bScreen.Y - $top
+        $ob.ContextMenuStrip = $btnMenu
+        $ob.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
+        $ob.add_Click({ Hide-GroupFlyout })   # clicking the open group closes it
+        $ob.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+        $ob.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+        $ob.add_Repaint({ Update-FlyoutSurface })
+        $frm.Controls.Add($ob)
+
+        $frm.Size = New-Object System.Drawing.Size($pillW, $height)
+        $frm.Location = New-Object System.Drawing.Point($left, $top)
+        $frm.Tag = $btn.FindForm()   # owning strip, so member clicks resolve to the right pane
+        Write-CkLog ("FLY btnW={0} btnScrX={1} pillW={2} stemW={3} stemLeft={4} wantLeft={5} setLeft={6} frmLeft={7} memX={8}" -f `
+            $btn.Width, $bScreen.X, $pillW, $stemW, $stemLeft, $desiredLeft, $left, $frm.Left, $(if ($mbs.Count) { $mbs[0].Left } else { -1 }))
+        $script:flyOwner = $btn
+        $script:flyPinned = $pin
+        if (-not $frm.Visible) { $frm.Show() }
+        Update-FlyoutSurface
+    } catch { Write-CkLog "Show-GroupFlyout error: $($_.Exception.Message)" }
+}
+
 # Re-push the strip that owns a control (fired from a button's Repaint event on hover/toggle).
 function Render-StripFor($ctrl) {
     if (-not $ctrl) { return }
@@ -1552,6 +1979,11 @@ function Show-SendWarning([string]$text) {
 
 # Hover-tekst for en knap: valgfri "desc"-forklaring + kommando + scope + betjening
 function Get-TipText($b) {
+    # A group stands for a set, not a prompt: there is no text to preview and none of the
+    # send/insert wording applies.
+    if ($b.__isGroup) {
+        return "$($b.label)`n$((L 'tipGroup') -f @($b.members).Count)`n$(L 'tipGroupHint')"
+    }
     $head = if ($b.icon) { "$($b.label): $($b.text)" } else { [string]$b.text }
     $head = $head -replace "`r`n", ' ' -replace "`n", ' '
     if ($head.Length -gt 140) { $head = $head.Substring(0, 140) + [char]0x2026 }
@@ -1592,6 +2024,29 @@ function Get-PinCatalog {
         @{ text = '/simplify'; label = 'Simplify code'; short = 'Simplify' },
         @{ text = '/verify'; label = 'Verify change'; short = 'Verify' },
         @{ text = 'continue'; label = 'Continue'; short = 'Cont.' }
+    ) }
+    # Claude Code's own built-in commands. These are compiled into Claude Code, not files on
+    # disk, so unlike skills they cannot be discovered and have to be listed. Only commands that
+    # actually DO something when typed into the composer are here: /config, /model, /mcp,
+    # /doctor, /memory, /resume and friends open an interactive terminal panel, so pinning them
+    # would create a button that silently does nothing in the desktop app.
+    $cat += if ($script:lang -eq 'da') { @(
+        @{ text = '/compact'; label = 'Komprimér samtale'; short = 'Kompakt' },
+        @{ text = '/context'; label = 'Kontekstforbrug'; short = 'Kontekst' },
+        @{ text = '/usage'; label = 'Forbrug og pris'; short = 'Forbrug' },
+        @{ text = '/status'; label = 'Sessionsstatus'; short = 'Status' },
+        @{ text = '/export'; label = 'Eksportér samtale'; short = 'Eksport' },
+        @{ text = '/help'; label = 'Hjælp'; short = 'Hjælp' },
+        @{ text = '/clear'; label = 'Ny samtale (rydder)'; short = 'Ryd'; confirm = $true }
+    ) } else { @(
+        @{ text = '/compact'; label = 'Compact conversation'; short = 'Compact' },
+        @{ text = '/context'; label = 'Context usage'; short = 'Context' },
+        @{ text = '/usage'; label = 'Usage and cost'; short = 'Usage' },
+        @{ text = '/status'; label = 'Session status'; short = 'Status' },
+        @{ text = '/export'; label = 'Export conversation'; short = 'Export' },
+        @{ text = '/help'; label = 'Help'; short = 'Help' },
+        # Discards the conversation, so it gets the same two-click confirm as shutdown/delete.
+        @{ text = '/clear'; label = 'New conversation (clears)'; short = 'Clear'; confirm = $true }
     ) }
     $known = @($cat | ForEach-Object { $_.text })
     # Your own skills under ~/.claude/skills appear in the menu automatically
@@ -1650,6 +2105,54 @@ $subDa.add_Click({ Set-CkLang 'da' })
 [void]$miLang.DropDownItems.Add($subEn)
 [void]$miLang.DropDownItems.Add($subDa)
 [void]$gripMenu.Items.Add($miLang)
+# Colours, one submenu per kind. Nested submenus are native here (unlike the bar flyout,
+# which stays one level deep on purpose) - the kebab is a real menu, so a menu inside a menu
+# behaves the way every other Windows menu does.
+$miColors = New-Object System.Windows.Forms.ToolStripMenuItem 'Colours'
+[void]$gripMenu.Items.Add($miColors)
+$script:ckKinds = @('text', 'command', 'group', 'toggle')
+$script:miKind = @{}
+foreach ($k in $script:ckKinds) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem $k
+    $script:miKind[$k] = $mi
+    [void]$miColors.DropDownItems.Add($mi)
+}
+
+function Set-KindColor([string]$kind, [string]$name) {
+    $ok = Update-Config {
+        param($cfg)
+        if (-not $cfg.PSObject.Properties['colors'] -or -not $cfg.colors) {
+            $cfg | Add-Member -NotePropertyName colors -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        if ($name) { $cfg.colors | Add-Member -NotePropertyName $kind -NotePropertyValue $name -Force }
+        else { $cfg.colors.PSObject.Properties.Remove($kind) }
+        $cfg
+    }
+    if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }
+}
+
+# One palette submenu for a kind, current pick ticked. Each swatch is drawn IN its own colour
+# rather than named, so the list shows what it will look like.
+function Fill-ColorMenu($sub, [string]$kind) {
+    $sub.DropDownItems.Clear()
+    $cur = ''
+    try { $cur = [string]$script:config.colors.$kind } catch {}
+    $def = New-Object System.Windows.Forms.ToolStripMenuItem (L 'colDefault')
+    $def.Tag = @{ kind = $kind; name = '' }
+    $def.Checked = -not $cur
+    $def.add_Click({ $t = $this.Tag; Set-KindColor $t.kind $t.name })
+    [void]$sub.DropDownItems.Add($def)
+    [void]$sub.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    foreach ($n in $script:ckPalette.Keys) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem (L "col_$n")
+        $mi.ForeColor = $script:ckPalette[$n]
+        $mi.Tag = @{ kind = $kind; name = $n }
+        $mi.Checked = ($n -eq $cur)
+        $mi.add_Click({ $t = $this.Tag; Set-KindColor $t.kind $t.name })
+        [void]$sub.DropDownItems.Add($mi)
+    }
+}
+
 $miTips = New-Object System.Windows.Forms.ToolStripMenuItem 'Hover tooltips'
 $miTips.CheckOnClick = $true
 $miTips.Checked = -not $script:tipsOff
@@ -1708,6 +2211,11 @@ $gripMenu.add_Opening({
     $miLang.Text = L 'language'
     $subEn.Checked = ($script:lang -eq 'en')
     $subDa.Checked = ($script:lang -eq 'da')
+    $miColors.Text = L 'colours'
+    foreach ($k in $script:ckKinds) {
+        $script:miKind[$k].Text = L "kind_$k"
+        Fill-ColorMenu $script:miKind[$k] $k
+    }
     $piThis.Text = L 'onlyChat'; $piGlob.Text = L 'globalScope'
     Fill-PinScope $piThis $false
     Fill-PinScope $piGlob $true
@@ -1725,8 +2233,16 @@ $btnMenu.add_Opening({
     $miToggle.Text = L 'toggleMode'
     $miLeft.Text = L 'moveLeft'
     $miRight.Text = L 'moveRight'
+    $miGroup.Text = L 'groupTitle'
     $miRemove.Text = L 'remove'
     $miIcon.Enabled = ($null -ne $script:iconFont)
+    # A group button stands for a set, not a prompt: only its face (label + icon) is editable.
+    # The rest operated on the buttons array, where a group has no row, so they used to look
+    # available and then quietly do nothing.
+    $isGrp = [bool]($script:menuSource -and $script:menuSource.Tag -and $script:menuSource.Tag.__isGroup)
+    # Move stays live for a group: it reorders the whole group as one block on the bar.
+    foreach ($mi in @($miEdit, $miToggle, $miGroup, $miRemove)) { $mi.Enabled = -not $isGrp }
+    if (-not $isGrp) { Fill-GroupMenu } else { $miGroup.DropDownItems.Clear() }
     if ($script:menuSource -and $script:menuSource.Tag) { $miToggle.Checked = [bool]$script:menuSource.Tag.toggle } else { $miToggle.Checked = $false }
 })
 
@@ -1752,7 +2268,81 @@ $miToggle = $btnMenu.Items.Add('On/off (toggle) mode')
 $miLeft   = $btnMenu.Items.Add('Move left')
 $miRight  = $btnMenu.Items.Add('Move right')
 [void]$btnMenu.Items.Add('-')
+$miGroup = $btnMenu.Items.Add('Move to group...')
 $miRemove = $btnMenu.Items.Add('Remove this button')
+
+# Assign a button to a named group (or clear it). Grouped buttons collapse behind one group
+# button in the row and open in its flyout, which is how a crowded control row stays usable.
+function Set-ButtonGroup([string]$gname) {
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag)) { return }
+        $t = $src.Tag
+        if ($t.__isGroup) { return }   # a group button is not itself groupable
+        $ok = Update-Buttons { param($btns)
+            foreach ($b in $btns) {
+                if (Same-Button $b $t) {
+                    if ($gname) { $b | Add-Member -NotePropertyName group -NotePropertyValue $gname -Force }
+                    else { $b.PSObject.Properties.Remove('group') }
+                }
+            }
+            $btns
+        }
+        if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }
+    } catch { Write-CkLog "Set group error: $($_.Exception.Message)" }
+}
+
+function New-ButtonGroup {
+    $val = Show-InputDialog (L 'groupTitle') (L 'groupAsk') ''
+    if ($null -eq $val) { return }   # cancelled
+    Set-ButtonGroup $val.Trim()
+}
+
+# Every group that exists right now: the names buttons refer to, plus any that only have a
+# saved definition (icon/label) because their last member was moved out.
+function Get-GroupNames {
+    $names = @()
+    try {
+        foreach ($b in $script:config.buttons) {
+            $n = [string]$b.group
+            if ($n -and $names -notcontains $n) { $names += $n }
+        }
+    } catch {}
+    try {
+        foreach ($p in $script:config.groups.PSObject.Properties) {
+            if ($names -notcontains $p.Name) { $names += $p.Name }
+        }
+    } catch {}
+    return ($names | Sort-Object)
+}
+
+# Existing groups as a submenu, listed by LABEL, with the current one ticked. Typing the name
+# into a prompt meant knowing it exactly - and a group shows on the bar as a glyph, so its
+# name is not written anywhere on screen. Rebuilt on every open, so a group made a moment ago
+# is already in the list.
+function Fill-GroupMenu {
+    $miGroup.DropDownItems.Clear()
+    $cur = if ($script:menuSource -and $script:menuSource.Tag) { [string]$script:menuSource.Tag.group } else { '' }
+    foreach ($n in (Get-GroupNames)) {
+        $def = Get-GroupDef $n
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem ([string]$def.label)
+        $mi.Tag = $n
+        $mi.Checked = ($n -eq $cur)
+        $mi.add_Click({ Set-ButtonGroup ([string]$this.Tag) })
+        [void]$miGroup.DropDownItems.Add($mi)
+    }
+    if ($miGroup.DropDownItems.Count -gt 0) {
+        [void]$miGroup.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
+    $miNew = New-Object System.Windows.Forms.ToolStripMenuItem (L 'groupNew')
+    $miNew.add_Click({ New-ButtonGroup })
+    [void]$miGroup.DropDownItems.Add($miNew)
+    if ($cur) {
+        $miNone = New-Object System.Windows.Forms.ToolStripMenuItem (L 'groupNone')
+        $miNone.add_Click({ Set-ButtonGroup '' })
+        [void]$miGroup.DropDownItems.Add($miNone)
+    }
+}
 
 $miIcon.add_Click({
     try {
@@ -1761,6 +2351,12 @@ $miIcon.add_Click({
         $t = $src.Tag
         $val = Show-IconPicker ([string]$t.icon)
         if ($null -eq $val) { return }   # cancelled
+        # A group button is synthetic - it is not a row in the buttons array, so the
+        # Same-Button walk below can never match it. Its icon lives on the group def.
+        if ($t.__isGroup) {
+            if (Set-GroupProp $t.group 'icon' $val) { Hide-GroupFlyout; Rebuild-Buttons }
+            return
+        }
         $ok = Update-Buttons { param($btns)
             foreach ($b in $btns) {
                 if (Same-Button $b $t) {
@@ -1810,34 +2406,89 @@ $miRename.add_Click({
         $t = $src.Tag
         $new = Show-InputDialog (L 'renameTitle') (L 'renameAsk') ([string]$t.label)
         if ([string]::IsNullOrWhiteSpace($new)) { return }
+        # Groups are not rows in the buttons array; their label lives on the group def.
+        if ($t.__isGroup) {
+            if (Set-GroupProp $t.group 'label' $new) { Hide-GroupFlyout; Rebuild-Buttons }
+            return
+        }
         if (Update-Buttons { param($btns) foreach ($b in $btns) { if (Same-Button $b $t) { $b.label = $new } }; $btns }) {
             Rebuild-Buttons
         }
     } catch { Write-CkLog "Rename error: $($_.Exception.Message)" }
 })
 
+# The bar shows BLOCKS, not buttons: an ungrouped button is one block, and a whole group is a
+# single block sitting where its first member is. Left/right has to swap blocks - swapping raw
+# array entries would drag one member out of its group and leave the rest behind.
+function Get-ButtonBlocks($btns) {
+    $blocks = @(); $seen = @{}
+    foreach ($b in $btns) {
+        $g = [string]$b.group
+        if ($g) {
+            if ($seen.ContainsKey($g)) { continue }
+            $seen[$g] = $true
+            $blocks += , @{ key = "g:$g"; items = @($btns | Where-Object { [string]$_.group -eq $g }) }
+        } else {
+            $blocks += , @{ key = $null; items = @($b) }
+        }
+    }
+    return $blocks
+}
+
+# Reorder a button WITHIN its group, i.e. inside the flyout. Same gesture as on the bar, but
+# the neighbours are the other members rather than the other blocks.
+function Move-GroupMember($t, [int]$dir) {
+    Update-Buttons {
+        param($btns)
+        $btns = @($btns)
+        $g = [string]$t.group
+        $idxs = @()
+        for ($i = 0; $i -lt $btns.Count; $i++) { if ([string]$btns[$i].group -eq $g) { $idxs += $i } }
+        $pos = -1
+        for ($k = 0; $k -lt $idxs.Count; $k++) { if (Same-Button $btns[$idxs[$k]] $t) { $pos = $k } }
+        if ($pos -lt 0) { return $btns }
+        $np = $pos + $dir
+        if ($np -lt 0 -or $np -ge $idxs.Count) { return $btns }   # already at the end
+        $a = $idxs[$pos]; $b = $idxs[$np]
+        $tmp = $btns[$a]; $btns[$a] = $btns[$b]; $btns[$b] = $tmp
+        $btns
+    }
+}
+
 function Move-PinButton([int]$dir) {
     try {
         $src = $script:menuSource
         if (-not ($src -and $src.Tag)) { return }
-        $hostPanel = $src.Parent   # the strip that was right-clicked (primary or mirror)
-        $idx = $hostPanel.Controls.IndexOf($src)
-        $newIdx = $idx + $dir
-        if ($newIdx -lt 1 -or $newIdx -ge $hostPanel.Controls.Count) { return }  # index 0 is the grip
-        $neighbor = $hostPanel.Controls[$newIdx].Tag
         $t = $src.Tag
+        # Inside the flyout the gesture means "reorder within this group".
+        $inFlyout = $false
+        try { $inFlyout = ($script:flyForm -and $src.FindForm() -eq $script:flyForm -and -not $t.__isGroup) } catch {}
+        if ($inFlyout) {
+            if (Move-GroupMember $t $dir) { Hide-GroupFlyout; Rebuild-Buttons }
+            return
+        }
         $ok = Update-Buttons {
             param($btns)
             $btns = @($btns)
-            $i1 = -1; $i2 = -1
-            for ($i = 0; $i -lt $btns.Count; $i++) {
-                if (Same-Button $btns[$i] $t) { $i1 = $i }
-                elseif (Same-Button $btns[$i] $neighbor) { $i2 = $i }
+            $blocks = @(Get-ButtonBlocks $btns)
+            # A group is identified by name (it owns no row); a plain button by value.
+            $bi = -1
+            for ($i = 0; $i -lt $blocks.Count; $i++) {
+                if ($t.__isGroup) {
+                    if ($blocks[$i].key -eq "g:$([string]$t.group)") { $bi = $i; break }
+                } elseif (-not $blocks[$i].key) {
+                    if (Same-Button $blocks[$i].items[0] $t) { $bi = $i; break }
+                }
             }
-            if ($i1 -ge 0 -and $i2 -ge 0) { $tmp = $btns[$i1]; $btns[$i1] = $btns[$i2]; $btns[$i2] = $tmp }
-            $btns
+            if ($bi -lt 0) { return $btns }
+            $nb = $bi + $dir
+            if ($nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }   # already at the end
+            $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
+            $out = @()
+            foreach ($blk in $blocks) { $out += $blk.items }
+            $out
         }
-        if ($ok) { Rebuild-Buttons }   # sync the order across all strips
+        if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }   # sync the order across all strips
     } catch { Write-CkLog "Move error: $($_.Exception.Message)" }
 }
 $miLeft.add_Click({ Move-PinButton -1 })
@@ -1876,6 +2527,10 @@ function Test-TargetForeground {
 # grid an adjacent pane's composer can score closer and the text lands in the wrong chat.
 function Get-PaneForForm($frm) {
     if (-not $frm) { return $null }
+    # A button inside the group flyout belongs to the pane of the strip that opened it - the
+    # flyout is its own window and maps to no pane, which would fall back to geometric guessing
+    # and send to a neighbouring chat.
+    if ($script:flyForm -and $frm -eq $script:flyForm -and $frm.Tag) { $frm = $frm.Tag }
     if ($frm -eq $form) { if ($script:panes.Count -gt 0) { return $script:panes[0] }; return $null }
     for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
         if ($script:mirrors[$i].Form -eq $frm) {
@@ -2050,13 +2705,19 @@ function Set-ToggleFace($item, [bool]$on) {
     $script:toggleState[(Get-ButtonKey $item)] = $on
     foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
         foreach ($c in $pnl.Controls) {
-            if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) { $c.Toggled = $on }
+            if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) {
+                $c.Toggled = $on
+            }
         }
     }
 }
 
 function Invoke-PillClick($btn) {
     if ($script:sending) { return }   # guard against reentrancy while a send is in progress
+    # A group button has nothing to send: it opens (or pins open) its flyout instead. Checked
+    # before lastClickedBtn is set, so opening a group never re-points an abandoned-send warning
+    # at the group instead of the button that actually failed.
+    if ($btn.Tag -and $btn.Tag.__isGroup) { Show-GroupFlyout $btn $true; return }
     $script:lastClickedBtn = $btn     # so an abandoned send can warn next to the button clicked
     # Shift-click = insert the text but do NOT press Enter, so it can be edited or extended
     # first. Read it up front: Shift may be released during the focus + paste round-trip.
@@ -2281,17 +2942,49 @@ function New-MirrorStrip {
 }
 
 # Fill one strip panel with the buttons visible for a given pane
+# A group's own face in the row. Falls back to the group name + a generic icon when the config
+# has no "groups" entry for it, so grouping works the moment a button gets a group field.
+function Get-GroupDef([string]$name) {
+    $icon = 'more'; $label = $name; $short = $null
+    try {
+        $g = $script:config.groups.$name
+        if ($g) {
+            if ($g.icon) { $icon = [string]$g.icon }
+            if ($g.label) { $label = [string]$g.label }
+            if ($g.short) { $short = [string]$g.short }
+        }
+    } catch {}
+    return @{ icon = $icon; label = $label; short = $short }
+}
+
 function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPrimary) {
     $destPanel.SuspendLayout()
     $old = @($destPanel.Controls | Where-Object { $_ -ne $destGrip })
     $destPanel.Controls.Clear()
     $destPanel.Controls.Add($destGrip)
+    # Resolve visibility first, so buttons sharing a "group" can collapse behind ONE group
+    # button that opens a flyout. The group takes the row position of its first member.
+    $vis = @()
     foreach ($b in $script:config.buttons) {
         $visible = if (-not $b.chat -and -not $b.chatTitle) { $true }                 # global: every pane
                    elseif ($b.chatTitle) { $paneTitle -and ($b.chatTitle -eq $paneTitle) }
                    elseif ($isPrimary) { Test-ChatButtonVisible $b }                  # session-id fallback: primary only
                    else { $false }
-        if (-not $visible) { continue }
+        if ($visible) { $vis += $b }
+    }
+    $seenGroup = @{}
+    foreach ($src in $vis) {
+        $gname = [string]$src.group
+        if ($gname) {
+            if ($seenGroup.ContainsKey($gname)) { continue }   # already represented by its group button
+            $seenGroup[$gname] = $true
+            $def = Get-GroupDef $gname
+            $b = [pscustomobject]@{
+                __isGroup = $true; group = $gname
+                members = @($vis | Where-Object { [string]$_.group -eq $gname })
+                text = ''; label = $def.label; short = $def.short; icon = $def.icon
+            }
+        } else { $b = $src }
         $btn = New-Object PillButton
         $btn.Tag = $b
         $btn.Height = $pillH
@@ -2301,11 +2994,12 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
         $btn.BackColor = $script:barColor
         # Icon glyphs use a soft grey (like Claude's own toolbar icons, not stark white);
         # text buttons stay the warmer off-white so long labels are less harsh.
-        $btn.ForeColor = if ($b.icon) { $colIcon } else { $colText }
+        $btn.ForeColor = Get-ButtonFore $b $false
         # Icon buttons carry no pill background (they blend into the bar like Claude's own
         # toolbar icons, with only a hover highlight); text buttons keep the subtle fill.
         $btn.Fill = if ($b.icon) { $script:barColor } else { $colFill }
         $btn.Bold = [bool]$b.icon   # thicker strokes on icon glyphs
+        $btn.Glyph = [bool]$b.icon
         $btn.HoverFill = $colHover
         $btn.DownFill = $colDown
         if ($b.chat) { $btn.Accent = $colAccent }
@@ -2320,6 +3014,7 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
         $btn.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
         $btn.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
         $btn.add_Repaint({ Render-StripFor $this })   # recomposite the layered strip on hover/toggle/press
+        if ($b.__isGroup) { $btn.add_MouseEnter({ Show-GroupFlyout $this $false }) }
         $destPanel.Controls.Add($btn)
     }
     $destPanel.ResumeLayout()
@@ -2434,6 +3129,7 @@ $timer.add_Tick({
             if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
+            Hide-GroupFlyout
             return
         }
 
@@ -2637,10 +3333,31 @@ $timer.add_Tick({
             }
         }
 
+        # Group flyout dismissal. The group button and the flyout count as ONE region, or moving
+        # diagonally toward the flyout would clip a neighbouring button and close it (the classic
+        # menu-travel bug). A short grace period covers the gap between the two rects.
+        # An open context menu holds the cursor off the flyout, so without this guard
+        # right-clicking a member (or the group itself) closed the flyout out from under
+        # the menu that was being opened on it.
+        if ($script:flyForm -and $script:flyForm.Visible -and -not $script:flyPinned -and $menusOpen.Count -eq 0) {
+            $cpF = [System.Windows.Forms.Cursor]::Position
+            $inside = $script:flyForm.Bounds.Contains($cpF)
+            if (-not $inside -and $script:flyOwner) {
+                try { $inside = $script:flyOwner.RectangleToScreen($script:flyOwner.ClientRectangle).Contains($cpF) } catch {}
+            }
+            if ($inside) { $script:flyLeftAt = $null }
+            else {
+                if (-not $script:flyLeftAt) { $script:flyLeftAt = Get-Date }
+                elseif (((Get-Date) - $script:flyLeftAt).TotalMilliseconds -gt 350) { Hide-GroupFlyout; $script:flyLeftAt = $null }
+            }
+        }
+
         # Fast hover-clear: WM_MOUSELEAVE can lag on a layered window, so proactively drop
         # the highlight on any button/kebab the cursor is no longer over (renders only on change).
         $cp = [System.Windows.Forms.Cursor]::Position
-        foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+        $sweep = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel })
+        if ($script:flyForm -and $script:flyForm.Visible) { $sweep += $script:flyForm }
+        foreach ($pnl in $sweep) {
             foreach ($c in $pnl.Controls) {
                 if ($c -is [PillButton] -or $c -is [GripHandle]) {
                     try { if (-not $c.RectangleToScreen($c.ClientRectangle).Contains($cp)) { $c.ClearHover() } } catch {}

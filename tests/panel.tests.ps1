@@ -548,6 +548,50 @@ foreach ($s in @('pin', 'unpin')) {
     Check "the /$s skill uses the locked CLI entry point" ($sk -match '-(Add|Remove)Button')
     Check "the /$s skill is told not to write buttons.json itself" ($sk -match '(?i)do NOT (read, edit or )?write buttons\.json')
 }
+# --- Ordering: groups move as ONE block ---
+# Left/right used to swap two adjacent array entries. Once a group could span several entries
+# that was wrong twice over: moving a group dragged a single member out of it, and moving a
+# plain button past a group landed it in the group's middle. Both silently lose a button from
+# the bar, so the block algebra is checked directly.
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($panel, [ref]$null, [ref]$null)
+foreach ($fn in @('Get-ButtonBlocks')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text }
+}
+function Same-Button($a, $b) { ($a.label -eq $b.label) -and ($a.text -eq $b.text) -and ([string]$a.chat -eq [string]$b.chat) }
+
+function Swap-Blocks($btns, $key, [int]$dir) {
+    $blocks = @(Get-ButtonBlocks $btns)
+    $bi = -1
+    for ($i = 0; $i -lt $blocks.Count; $i++) {
+        if ($blocks[$i].key -eq $key) { $bi = $i; break }
+        if (-not $key -and -not $blocks[$i].key) { }
+    }
+    $nb = $bi + $dir
+    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
+    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
+    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
+    $out
+}
+
+$cfg = @(
+    [pscustomobject]@{ label = 'A'; text = '/a' },
+    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' },
+    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'grp' },
+    [pscustomobject]@{ label = 'B'; text = '/b' }
+)
+$blocks = @(Get-ButtonBlocks $cfg)
+Check 'a group collapses to one block (A, grp, B)' ($blocks.Count -eq 3 -and $blocks[1].key -eq 'g:grp' -and $blocks[1].items.Count -eq 2)
+
+$moved = @(Swap-Blocks $cfg 'g:grp' -1)
+Check 'moving a group left keeps its members together' ((($moved | ForEach-Object { $_.label }) -join ',') -eq 'G1,G2,A,B')
+Check 'moving a group never loses a button' ($moved.Count -eq $cfg.Count)
+
+$moved2 = @(Swap-Blocks $cfg 'g:grp' 1)
+Check 'moving a group right jumps the whole block past B' ((($moved2 | ForEach-Object { $_.label }) -join ',') -eq 'A,B,G1,G2')
+
+$edge = @(Swap-Blocks $cfg 'g:grp' -99)
+Check 'an out-of-range move is a no-op, not a truncation' ($edge.Count -eq $cfg.Count)
 
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
