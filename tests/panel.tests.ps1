@@ -124,7 +124,31 @@ $srcText = $src -join "`n"   # defined here too: these checks run before the doc
 # nine injected defects survived - including one that reinstated the leak verbatim, and two
 # i18n "tests" whose regex was satisfied by the CALL SITES rather than the string table, so
 # deleting every string still passed.
+# WHAT AN EMPTY COMPOSER ACTUALLY READS AS. This is the single most expensive fact in this file.
+#
+# Three separate times a fixture here has fed the comparator a baseline the real composer never
+# produces - "" and then "\n" - and each time a fully green suite certified a panel that could
+# not send. 1.10.2 is the third: it added a prefix check, every fixture said an empty composer
+# reads as "\n", and every real click into an empty composer was refused.
+#
+# MEASURED read-only through UIA against the running app: an EMPTY composer's TextPattern returns
+# the PLACEHOLDER, "Type / for commands\n" - 20 characters, UIA children
+# [Text 'Type / for commands', Text '\n' (class ProseMirror-trailingBreak)]. It does not read as
+# empty and it never has.
+#
+# So fixtures do not write a baseline shape any more. They write the TOKEN <EMPTY>, which says
+# what is meant - "the composer was empty" - and this one constant decides what that looks like.
+# When the placeholder changes (it is English prose and will), it changes in exactly one place,
+# and the guards below fail loudly if it is ever quietly reverted to a shape reality does not
+# produce. A fixture you have to READ to validate is what kept failing here; these are checked.
+$script:EmptyComposerReadback = "Type / for commands`n"
+# Derived, never typed twice: two hand-escaped copies of the same string is one more thing that
+# can drift apart silently.
+$script:EmptyComposerJson = ($script:EmptyComposerReadback | ConvertTo-Json).Trim('"')
+
 function PasteState([string]$json, [switch]$Raw) {
+    # Expand the <EMPTY> token to the measured placeholder before the probe ever sees the JSON.
+    $json = $json.Replace('<EMPTY>', $script:EmptyComposerJson)
     # Run from a throwaway dir with its own config and LOCALAPPDATA. Running the panel out of
     # the repo made every test run append "buttons.json unreadable at startup" to the
     # developer's real %LOCALAPPDATA%\claude-buttons.log.
@@ -148,25 +172,61 @@ function PasteState([string]$json, [switch]$Raw) {
         Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+# --- GUARDS ON THE FIXTURES THEMSELVES ---------------------------------------------------
+# The failure mode this file keeps hitting is not a wrong assertion, it is a fixture that is
+# internally consistent and describes a composer that does not exist. These three checks are
+# aimed at the fixtures rather than at the panel, so the shape cannot silently drift back.
+
+# 1. An empty composer is NOT empty. If <EMPTY> is ever redefined to "", "\n" or any other
+#    whitespace, this fails - the placeholder is prose and must contain words.
+Check 'the EMPTY-composer fixture reads as placeholder TEXT, not as whitespace' `
+    (($script:EmptyComposerReadback.Trim().Length -gt 0) -and
+     ($script:EmptyComposerReadback -match '[\p{L}]'))
+
+# 2. No fixture may hand-write the old fake shape. This is the exact literal that shipped three
+#    regressions; it is now a test failure rather than a code review someone has to catch.
+$fakeBaselines = @([regex]::Matches(
+    [IO.File]::ReadAllText($PSCommandPath), '"baseline":"(\\n)?"').Count)
+Check 'no fixture hardcodes an empty/newline-only baseline (use <EMPTY>)' `
+    ($fakeBaselines[0] -eq 0)
+
+# 3. THE ONE THAT WOULD HAVE CAUGHT 1.10.2. With a real empty composer the read-back after a
+#    paste does NOT start with the baseline - the placeholder is replaced, not appended to. So
+#    the empty-composer fixtures must exercise the NON-prefix path. If <EMPTY> is reverted to
+#    "\n" the fixtures still "pass" their own assertions but stop testing the real code path,
+#    and this check is what notices.
+$emptyLanded = $script:EmptyComposerJson.Replace('\n','') # placeholder without its terminator
+Check 'the EMPTY-composer fixtures exercise the replaced-placeholder path, not append' `
+    (-not ('/review').StartsWith($emptyLanded, [StringComparison]::Ordinal))
+
 Check 'a clean paste into an EMPTY composer is Confirmed' `
-    ((PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
+# The genuine 12,752-character button the user actually clicks, and the genuine 12,259-character
+# read-back UIA returned for it (rendering ate the fence markers and languages). Recorded live.
+# This is a REAL shape, not a constructed one - which is the whole point of it being here.
+Check 'a real markdown button pasted into an empty composer is Confirmed' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"# Titel\n\n**fed** tekst\n\n```powershell\nGet-Date\n```\n\n- punkt et\n- punkt to","observed":"# Titel\nfed tekst\nGet-Date\n- punkt et\n- punkt to\n"}') -eq 'Confirmed')
+# ...and the same empty composer where the paste never landed: the placeholder is still all
+# that is in the box. This must NEVER confirm - it is defect 3 in its empty-composer form.
+Check 'an empty composer where NOTHING landed is a Mismatch' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"<EMPTY>"}') -eq 'Mismatch')
 # The regression that would have made the panel useless in daily use: an "empty" Chromium
 # composer reads as "\n" and a draft as "draft\n", so concatenating the raw baseline put that
 # terminator mid-string and every click with a draft in the box refused to send.
 Check 'a clean paste on top of a USER DRAFT is Confirmed (not refused)' `
     ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast/review\n"}') -eq 'Confirmed')
 Check 'a stale clipboard landing instead of the payload is a Mismatch' `
-    ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"secret token\n"}') -eq 'Mismatch')
 # The exact shape reported in PR #4: stale text prepended, our payload also present. A
 # "contains the payload" probe would call this a success and submit both.
 Check 'stale text PLUS our payload is still a Mismatch' `
-    ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token/review\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"secret token/review\n"}') -eq 'Mismatch')
 # A payload that normalizes away would make want == baseline, satisfying the poll on its first
 # read - confirming a paste that never happened and submitting whatever the user already had.
 Check 'a whitespace-only payload can never be Confirmed' `
     ((PasteState '{"baseline":"udkast\n","payload":"   ","observed":"udkast\n"}') -eq 'Mismatch')
 Check 'an unreadable composer is Unverifiable, never Confirmed' `
-    ((PasteState '{"baseline":"\n","payload":"/review","observed":null}') -eq 'Unverifiable')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":null}') -eq 'Unverifiable')
 
 # Source invariants that cannot be probed: what the caller DOES with the state.
 # (The "nothing is submitted unless Confirmed" invariant used to live here as a regex for the
@@ -332,8 +392,8 @@ Check 'Wait-PasteLanded has a non-trivial default timeout' `
 # differential it was flaky in BOTH directions - three runs on a clean tree gave +112ms, -60ms
 # and +252ms, so it red-lighted good code and could pass a real defect. The probe now reports
 # its own elapsed time, which contains only the poll.
-$unverRaw = PasteState '{"baseline":"\n","payload":"/review","observed":null}' -Raw
-$quickRaw = PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}' -Raw
+$unverRaw = PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":null}' -Raw
+$quickRaw = PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"/review\n"}' -Raw
 $unver = ($unverRaw -split '\|')[0]; $unverMs = [int]($unverRaw -split '\|')[1]
 $quick = ($quickRaw -split '\|')[0]; $quickMs = [int]($quickRaw -split '\|')[1]
 Check 'an unreadable composer returns Unverifiable' ($unver -eq 'Unverifiable')
@@ -364,16 +424,16 @@ Check "a confirmed paste returns well inside the timeout (${quickMs}ms vs ${unve
 # composer RENDERS markdown - a ```text fence loses its backticks AND the word "text". No
 # whitespace normalisation can reconcile that, which is what 1.8.0 and 1.8.1 both tried.
 Check 'a rendered code fence (backticks AND language word gone) still confirms' `
-    ((PasteState '{"baseline":"\n","payload":"## Titel\n\n```text\nDu skal svare.\n```","observed":"## Titel\nDu skal svare.\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"## Titel\n\n```text\nDu skal svare.\n```","observed":"## Titel\nDu skal svare.\n"}') -eq 'Confirmed')
 Check 'rendered bold (asterisks eaten) still confirms' `
-    ((PasteState '{"baseline":"\n","payload":"gør det **nu** og grundigt","observed":"gør det nu og grundigt\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"gør det **nu** og grundigt","observed":"gør det nu og grundigt\n"}') -eq 'Confirmed')
 # PowerShell unrolls a single-element array when it is passed as an argument, so a one-word
 # payload reached the coverage walk as a bare string and it indexed CHARACTERS. A perfect paste
 # measured 0% coverage and was refused. Caught by the existing draft test; pinned here too.
 Check 'a ONE-WORD payload confirms (single-element array unrolling)' `
-    ((PasteState '{"baseline":"\n","payload":"continue","observed":"continue\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"continue","observed":"continue\n"}') -eq 'Confirmed')
 Check 'markdown whose blank lines the composer collapsed still confirms' `
-    ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.\n\n- item","observed":"## Heading\nBody text.\n- item\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"## Heading\n\nBody text.\n\n- item","observed":"## Heading\nBody text.\n- item\n"}') -eq 'Confirmed')
 # Coverage alone is satisfied by "stale clipboard THEN our payload" - an in-order walk just
 # skips the prefix. The size bound is the half that catches it, so it needs its own test.
 # THE COVERAGE HALF WAS ENTIRELY UNPINNED. Five mutants passed all 85 tests: raising
@@ -383,40 +443,40 @@ Check 'markdown whose blank lines the composer collapsed still confirms' `
 # bound - so nothing measured coverage at all. These cases hold size constant and vary only the
 # words, so they can ONLY be caught by coverage.
 Check 'a substituted word at the SAME length is a Mismatch (coverage, not size)' `
-    ((PasteState '{"baseline":"\n","payload":"send nu","observed":"send bad\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"send nu","observed":"send bad\n"}') -eq 'Mismatch')
 Check 'a wholly different text of the same size is a Mismatch (coverage)' `
-    ((PasteState '{"baseline":"\n","payload":"gennemgaa min kode","observed":"kontonummer 5479 1122\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"gennemgaa min kode","observed":"kontonummer 5479 1122\n"}') -eq 'Mismatch')
 Check 'words in the WRONG ORDER are a Mismatch (coverage is ordered)' `
-    ((PasteState '{"baseline":"\n","payload":"alfa beta gamma delta epsilon zeta","observed":"zeta epsilon delta gamma beta alfa\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"alfa beta gamma delta epsilon zeta","observed":"zeta epsilon delta gamma beta alfa\n"}') -eq 'Mismatch')
 # Non-alnum growth was unbounded: the ceiling counted letters and digits only, so a clipboard of
 # emoji or punctuation rode in at any length and was Confirmed.
 # The three cases above are all SHORT, so the floor(n/4) cap decides them and MaxMissingWords /
 # MaxMissingFraction stay inert - raising them to 99 and 0.90 passed the whole suite. This one is
 # 20 words with 4 substituted: the cap allows 5, so only the allowance of 3 can refuse it.
 Check 'four substituted words in a twenty-word payload is a Mismatch (MaxMissingWords binds)' `
-    ((PasteState '{"baseline":"\n","payload":"et to tre fire fem seks syv otte ni ti elleve tolv tretten fjorten femten seksten sytten atten nitten tyve","observed":"et to xyz fire fem seks qqq otte ni ti zzzzzz tolv tretten fjorten wwwwww seksten sytten atten nitten tyve\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"et to tre fire fem seks syv otte ni ti elleve tolv tretten fjorten femten seksten sytten atten nitten tyve","observed":"et to xyz fire fem seks qqq otte ni ti zzzzzz tolv tretten fjorten wwwwww seksten sytten atten nitten tyve\n"}') -eq 'Mismatch')
 # Likewise every size-based Mismatch above overshoots the ceiling so far that ExtraFraction stayed
 # inert - 0.0 -> 0.50 passed everything. This appends ~30% extra, which only the tight ceiling refuses.
 Check 'a 30% overshoot is a Mismatch (ExtraFraction binds, not just the absolute margin)' `
-    ((PasteState '{"baseline":"\n","payload":"alfa beta gamma delta epsilon zeta eta theta","observed":"alfa beta gamma delta epsilon zeta eta theta kodeord1234\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"alfa beta gamma delta epsilon zeta eta theta","observed":"alfa beta gamma delta epsilon zeta eta theta kodeord1234\n"}') -eq 'Mismatch')
 Check 'injected punctuation/symbols are a Mismatch (non-alnum ceiling)' `
-    ((PasteState '{"baseline":"\n","payload":"gennemgaa min kode","observed":"gennemgaa min kode !!! ??? ---> @@@ *** ~~~ %%%\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"gennemgaa min kode","observed":"gennemgaa min kode !!! ??? ---> @@@ *** ~~~ %%%\n"}') -eq 'Mismatch')
 # The false refusal that shipped twice, in its remaining form: each fence language counted as a
 # missing payload word, so four or more fenced blocks in a short button exceeded the allowance.
 Check 'a button with FOUR fenced code blocks still confirms' `
-    ((PasteState '{"baseline":"\n","payload":"Kør disse:\n```powershell\nGet-Date\n```\n```powershell\nGet-Host\n```\n```json\n{}\n```\n```bash\nls\n```","observed":"Kør disse:\nGet-Date\nGet-Host\n{}\nls\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"Kør disse:\n```powershell\nGet-Date\n```\n```powershell\nGet-Host\n```\n```json\n{}\n```\n```bash\nls\n```","observed":"Kør disse:\nGet-Date\nGet-Host\n{}\nls\n"}') -eq 'Confirmed')
 Check 'a short button that is ONLY a fenced block still confirms' `
-    ((PasteState '{"baseline":"\n","payload":"```json\n{\"a\":1}\n```","observed":"{\"a\":1}\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"```json\n{\"a\":1}\n```","observed":"{\"a\":1}\n"}') -eq 'Confirmed')
 Check 'stale clipboard text pasted ALONGSIDE the payload is a Mismatch (size bound)' `
-    ((PasteState '{"baseline":"\n","payload":"## Titel\n\nDu skal svare.","observed":"kodeord hemmeligt kontonummer 4471 privat besked\n## Titel\nDu skal svare.\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"## Titel\n\nDu skal svare.","observed":"kodeord hemmeligt kontonummer 4471 privat besked\n## Titel\nDu skal svare.\n"}') -eq 'Mismatch')
 Check 'a multi-line payload with blank lines confirms' `
-    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\nline three\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"line one\n\nline three","observed":"line one\nline three\n"}') -eq 'Confirmed')
 Check 'a multi-line payload missing its last line is still a Mismatch' `
-    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\n\n\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"line one\n\nline three","observed":"line one\n\n\n"}') -eq 'Mismatch')
 # Collapsing whitespace must not blunt contamination detection: stale clipboard text differs in
 # its characters, not its spacing, so it must still fail however the composer reflowed it.
 Check 'stale clipboard text is a Mismatch even after whitespace collapsing' `
-    ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.","observed":"secret token\n## Heading\nBody text.\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"## Heading\n\nBody text.","observed":"secret token\n## Heading\nBody text.\n"}') -eq 'Mismatch')
 Check 'a payload of only newlines is refused, not confirmed by collapsing' `
     ((PasteState '{"baseline":"udkast\n","payload":"\n\n  \n","observed":"udkast\n"}') -eq 'Mismatch')
 
@@ -428,11 +488,11 @@ Check 'a payload of only newlines is refused, not confirmed by collapsing' `
 #
 # 1. Two foreign characters rode in under the 2-character absolute size allowance.
 Check 'two foreign characters riding in with the payload is a Mismatch (delta derivation)' `
-    ((PasteState '{"baseline":"\n","payload":"/review","observed":"xx/review\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"xx/review\n"}') -eq 'Mismatch')
 # 2. One substituted word out of four sat inside the floor(n/4) missing-word cap. Size is
 #    IDENTICAL here (omega and alpha are both five letters), so only derivation can refuse it.
 Check 'one substituted word of four is a Mismatch (same size, only derivation sees it)' `
-    ((PasteState '{"baseline":"\n","payload":"send alpha beta gamma","observed":"send omega beta gamma\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"send alpha beta gamma","observed":"send omega beta gamma\n"}') -eq 'Mismatch')
 # 3. THE BLOCKER. Nothing landed at all. The user's own draft already contained the payload's
 #    words, so coverage was satisfied, and the baseline alone cleared the 60% size floor. The
 #    panel confirmed a paste that never happened and pressed Enter on the user's draft. No
@@ -444,6 +504,13 @@ Check 'an UNCHANGED composer whose draft already contains the payload words is a
 # everything. This is the pair that makes case 3 a real discrimination and not a blanket ban.
 Check 'the same draft WITH a real paste still confirms (delta is not just "refuse everything")' `
     ((PasteState '{"baseline":"review review\n","payload":"/review","observed":"review review/review\n"}') -eq 'Confirmed')
+# The narrow way the placeholder fallback could reintroduce defect 3, and the reason the fallback
+# is tried INSTEAD of the delta rather than AFTER it. This draft is a perfect ordered subset of
+# the button's text and clears every size bound on its own, so if a rejected delta were allowed a
+# second attempt against the WHOLE read-back, a paste that never happened would be Confirmed and
+# the user's draft submitted. The delta is empty here; that must remain the only verdict taken.
+Check 'a draft that IS the button text, with nothing pasted, is a Mismatch' `
+    ((PasteState '{"baseline":"review\n","payload":"/review","observed":"review\n"}') -eq 'Mismatch')
 # A delta that is pure punctuation is invisible to the word checks - the word sequence is
 # perfectly derived. The symbol side of the derivation check is the only thing that refuses it.
 Check 'punctuation appended after a correct paste is a Mismatch (symbol derivation)' `
@@ -469,11 +536,11 @@ Check 'injected whitespace after a correct paste is a Mismatch (non-alnum ceilin
 # has trailing whitespace that the composer collapses, leaving enough non-alnum headroom to
 # absorb the fence and exposing the alnum bound as the last check standing.
 Check 'content hidden on a fence line is a Mismatch (alnum ceiling, invisible to both derivations)' `
-    ((PasteState '{"baseline":"\n","payload":"/review          ","observed":"```hemmeligtkodeord44\n/review\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review          ","observed":"```hemmeligtkodeord44\n/review\n"}') -eq 'Mismatch')
 # The same payload pasted cleanly must still confirm, or the check above is passing for the
 # trivial reason that trailing whitespace breaks everything.
 Check 'a payload with trailing whitespace still confirms when the composer collapses it' `
-    ((PasteState '{"baseline":"\n","payload":"/review          ","observed":"/review\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review          ","observed":"/review\n"}') -eq 'Confirmed')
 # MaxMissingWords itself. The pre-existing test for it used four SUBSTITUTED words in a twenty
 # word payload - but substitution is now refused by the derivation check long before the
 # allowance is consulted, so raising MaxMissingWords from 3 to 99 passed the whole suite. What
@@ -481,16 +548,16 @@ Check 'a payload with trailing whitespace still confirms when the composer colla
 # floor(20/4) is 5, so the quarter cap permits it and only the absolute limit of 3 refuses it.
 # The delta still carries 75% of the characters, so the size floor cannot decide this either.
 Check 'five missing words in a twenty-word payload is a Mismatch (MaxMissingWords binds)' `
-    ((PasteState '{"baseline":"\n","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo\n"}') -eq 'Mismatch')
 # ...and three missing words - what a few rendered-away fence languages actually look like - must
 # still confirm, or the allowance has been tightened into the false-refusal regression instead.
 Check 'three missing words in the same payload still confirms (the allowance is real)' `
-    ((PasteState '{"baseline":"\n","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt","observed":"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq\n"}') -eq 'Confirmed')
 # The size FLOOR is the only check that refuses a paste which landed with most of its characters
 # missing but few enough WORDS missing to clear the coverage allowance. Eight words, the last two
 # carrying most of the length: two missing words is exactly floor(8/4), so coverage permits it.
 Check 'a paste missing most of its CHARACTERS but few words is a Mismatch (size floor)' `
-    ((PasteState '{"baseline":"\n","payload":"a b c d e f gggggggggggggggggggggggggggggg hhhhhhhhhhhhhhhhhhhhhhhhhhhhhh","observed":"a b c d e f\n"}') -eq 'Mismatch')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"a b c d e f gggggggggggggggggggggggggggggg hhhhhhhhhhhhhhhhhhhhhhhhhhhhhh","observed":"a b c d e f\n"}') -eq 'Mismatch')
 # Coverage must be measured on the DELTA, not on the whole read-back. Here the user's draft
 # already ends with the payload's opening words and only the tail of the payload landed. Measured
 # over `observed` the coverage is a perfect 100% and this confirms; measured over the delta three
@@ -506,7 +573,7 @@ Check 'a partial paste onto a draft that supplies the missing words is a Mismatc
 # URL's words disappear. The correct direction still confirms this; the flipped one refuses it,
 # which is the false-refusal regression that shipped twice.
 Check 'a markdown LINK whose URL words are rendered away still confirms (derivation direction)' `
-    ((PasteState '{"baseline":"\n","payload":"Du skal gennemgaa hele mit projekt og laese [dokumentet](x.dk) foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her","observed":"Du skal gennemgaa hele mit projekt og laese dokumentet foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her\n"}') -eq 'Confirmed')
+    ((PasteState '{"baseline":"<EMPTY>","payload":"Du skal gennemgaa hele mit projekt og laese [dokumentet](x.dk) foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her","observed":"Du skal gennemgaa hele mit projekt og laese dokumentet foerst, og derefter skrive et kort resume af hvad du fandt, saaledes at en anden laeser kan forstaa det uden at aabne noget som helst andet end dit svar her\n"}') -eq 'Confirmed')
 # The paste must APPEND. A composer whose content no longer starts with the baseline cannot be
 # attributed to this paste at all, so it is refused. See the KNOWN LIMITATION in the panel: a
 # caret parked mid-draft lands here and is refused rather than guessed at. Refusing is the safe
@@ -556,15 +623,15 @@ $bigRatio = [Math]::Round($big.O.Length / $big.P.Length, 3)
 Check "the big-button fixture matches the real one's scale and ratio ($($big.P.Length) -> $($big.O.Length), ratio $bigRatio)" `
     (($big.P.Length -gt 12000) -and ($big.O.Length -gt 11500) -and ($bigRatio -gt 0.94) -and ($bigRatio -lt 0.98))
 Check 'the 12k markdown flagship button confirms (fences, bold and blank lines all rendered away)' `
-    ((PasteState (@{ baseline = "`n"; payload = $big.P; observed = $big.O } | ConvertTo-Json -Compress -Depth 3)) -eq 'Confirmed')
+    ((PasteState (@{ baseline = $script:EmptyComposerReadback; payload = $big.P; observed = $big.O } | ConvertTo-Json -Compress -Depth 3)) -eq 'Confirmed')
 # ...and the same button with a clipboard leak in it must NOT. A 12k payload is exactly where a
 # proportional allowance hides a small contamination, so this is the case that keeps the delta
 # bound honest at scale.
 Check 'the same 12k button with stale clipboard text prepended is a Mismatch' `
-    ((PasteState (@{ baseline = "`n"; payload = $big.P
+    ((PasteState (@{ baseline = $script:EmptyComposerReadback; payload = $big.P
                      observed = "kodeord hemmeligt kontonummer 4471`n" + $big.O } | ConvertTo-Json -Compress -Depth 3)) -eq 'Mismatch')
 Check 'the same 12k button with stale clipboard text APPENDED is a Mismatch' `
-    ((PasteState (@{ baseline = "`n"; payload = $big.P
+    ((PasteState (@{ baseline = $script:EmptyComposerReadback; payload = $big.P
                      observed = $big.O + "kodeord hemmeligt kontonummer 4471`n" } | ConvertTo-Json -Compress -Depth 3)) -eq 'Mismatch')
 # Assert the STRING TABLE, not any mention of the key: the previous version matched the
 # Show-SendWarning call sites, so deleting every string still passed while the user would have

@@ -3547,12 +3547,52 @@ function Get-ComposerText($el) {
 # (a) and (c) are subset checks, so they are inherently permissive to deletion - which is exactly
 # what markdown rendering does, and why a fenced or bold button still confirms.
 #
-# KNOWN LIMITATION (deliberate, and it is the same one the old baseline concatenation had): this
-# assumes the paste APPENDS at the end of the composer. If the caret sits mid-draft, or text is
-# selected so the paste replaces it, `observed` does not begin with `baseline`, the prefix check
-# fails and the send is REFUSED. That is a usability cost on a legitimate action, and it is the
-# safe direction: nothing is sent and nothing is lost. It is not automatically testable here,
-# because positioning a caret requires synthetic input.
+# THE BASELINE IS NOT "" AND IT IS NOT "\n". AN EMPTY COMPOSER READS AS ITS PLACEHOLDER.
+#
+# MEASURED, read-only, against the live app: an empty composer's TextPattern returns
+# "Type / for commands\n" - 20 characters - and its UIA children are
+# [Text 'Type / for commands', Text '\n' (class ProseMirror-trailingBreak)]. The moment the paste
+# lands the placeholder is GONE and the box holds the pasted text alone.
+#
+# So for the overwhelmingly common case - clicking a button into an empty composer - `observed`
+# can NEVER begin with `baseline`. 1.10.2 shipped with a bare prefix check and every such send
+# was refused: four consecutive live clicks logged "Paste did not land as expected". The tests
+# missed it because every fixture used "\n" for an empty composer, a shape the real app does not
+# produce.
+#
+# WHY NOT JUST RECOGNISE THE PLACEHOLDER. Two ways were considered and both were rejected:
+#   - STRUCTURALLY, through the UIA tree. Measured: the placeholder is a plain Text child with an
+#     EMPTY ClassName and no AutomationId - i.e. structurally indistinguishable from the Text node
+#     a one-line draft would produce. There is no marker to key on. Worse, confirming that a
+#     DRAFTED composer differs would require typing into the live app, so the premise could not be
+#     verified even in principle here.
+#   - AS A STRING, hardcoded or as a config knob beside uiaComposerName. "Type / for commands" is
+#     app-specific English prose. Any Claude update or a localised UI changes it, and the failure
+#     mode is not a degraded feature - it is THIS regression again, every send refused, silently.
+#     A knob that must be correct for the product to work at all is a knob that will be wrong.
+#
+# INSTEAD, MAKE THE PREFIX CHECK FALL BACK, and never name the placeholder at all. If `observed`
+# begins with `baseline`, subtract it and judge the delta, exactly as before. If it does NOT, do
+# not refuse outright - judge the ENTIRE read-back under the SAME four rules. That is not a
+# loosening: the whole box then has to be payload-derived, which is precisely the standard the
+# empty case is held to anyway (there the delta IS the whole box).
+#
+# WHY THE FALLBACK STILL REFUSES "NOTHING LANDED" - the defect (3) below, the important one.
+# The fallback is reachable ONLY when the prefix check fails, and when nothing lands the prefix
+# check CANNOT fail: `observed` is then character-for-character the `baseline` we captured, so it
+# trivially starts with it, the delta is empty, coverage is 0, and 0 can never clear an allowance
+# capped at floor(n/4). This holds for a draft AND for an empty composer, because the placeholder
+# is simply what the baseline read returned. Case 3 is refused by the same construction as before
+# - the fallback never sees it. (It is also why the fallback must NOT be tried as a second chance
+# when the prefix holds but the delta is rejected: that WOULD re-expose case 3.)
+#
+# KNOWN LIMITATION (deliberate, and narrower than it was): this still assumes the paste does not
+# interleave. If the caret sits mid-draft, `observed` neither starts with the baseline nor is
+# wholly payload-derived - the surviving draft words are not in the payload - so derivation fails
+# and the send is REFUSED. Safe direction: nothing is sent and nothing is lost. A paste that
+# REPLACES a selected draft now confirms rather than being refused, and what is submitted is
+# verified payload-derived; the draft was destroyed by the user's own selection, not by us.
+# Neither is automatically testable here, because positioning a caret requires synthetic input.
 #
 # Rendering deletes a few payload words (fence languages), so the coverage side needs an
 # ABSOLUTE allowance as well as a proportional one. A percentage alone fails on short payloads:
@@ -3642,36 +3682,25 @@ function Get-WordCoverage($payloadWords, $observedWords) {
     return ($hit / $pw.Count)
 }
 
-function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed) {
-    # Strip the fence info-strings ONCE and measure everything against the result. Stripping them
-    # for the word count but not for the size count made it worse, not better: `powershell` and
-    # `json` still inflated the expected length, the rendered read-back fell under MinSizeFraction
-    # and a four-fence button was refused on size instead of on words. The baseline is itself a
-    # read-back, so it is already rendered and has no fences to strip.
-    $payload = Remove-FenceInfoStrings $payload
-    $pw = @(Get-CompareWords $payload)
-    if ($pw.Count -eq 0) { return $false }
-
-    # --- Isolate the DELTA: what this paste actually added to the box. ---
-    # If the read-back does not START with the baseline then the paste did not append, and no
-    # part of the box can be attributed to it. Refuse. (See KNOWN LIMITATION above: a caret
-    # parked mid-draft lands here and is refused rather than guessed at.)
-    $baseCore = Get-ComposerCore $baseline
-    $obsCore  = Get-ComposerCore $observed
-    if (-not $obsCore.StartsWith($baseCore, [StringComparison]::Ordinal)) { return $false }
-    $delta = $obsCore.Substring($baseCore.Length)
-
+# The four rules, applied to one candidate string: the text we are asking to attribute to the
+# paste. Factored out because it is now applied to TWO candidates - the delta when the paste
+# appended, and the whole read-back when the composer's prior contents vanished (an empty
+# composer showing its placeholder). Identical rules, so the fallback cannot be a weaker gate;
+# $payload arrives already stripped of fence info-strings, with $pw its words.
+function Test-DeltaDerives([string]$candidate, [string]$payload, $pw) {
     # (a) DERIVATION. Every word that appeared must have come from the payload, in order.
     # Rendering deletes words; it never invents or substitutes them. "xx/review" against the
     # payload "/review" fails here on the word "xx", and "send omega beta gamma" against
     # "send alpha beta gamma" fails on "omega" - neither of which any aggregate could see.
-    $dw = @(Get-CompareWords $delta)
+    # This is also what refuses a leftover placeholder: its words are not the payload's.
+    $dw = @(Get-CompareWords $candidate)
     if (-not (Test-IsOrderedSubsetOf $dw $pw)) { return $false }
 
-    # (b) COVERAGE. Enough of the payload has to be in the delta. An UNCHANGED composer yields an
-    # empty delta and 0 coverage, and the allowance below is capped at floor(n/4) - strictly less
-    # than n for every n - so an empty delta can never clear it. That is what stops a draft which
-    # merely happens to contain the payload's words from confirming a paste that never happened.
+    # (b) COVERAGE. Enough of the payload has to be present. An UNCHANGED composer yields an
+    # empty candidate and 0 coverage, and the allowance below is capped at floor(n/4) - strictly
+    # less than n for every n - so an empty candidate can never clear it. That is what stops a
+    # draft which merely happens to contain the payload's words from confirming a paste that
+    # never happened.
     $coverage = Get-WordCoverage $pw $dw
     $missing  = $pw.Count - ($coverage * $pw.Count)
     # Cap the allowance at a QUARTER of the payload. At half, a two-word payload tolerated one
@@ -3687,21 +3716,50 @@ function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed
     # "gennemgaa min kode !!! ??? ---> @@@ ***" has a perfectly derived word sequence. Markdown
     # rendering only DELETES symbols (backticks, asterisks), and a subset check permits deletion
     # freely - which is why a fenced or bold button still confirms.
-    if (-not (Test-IsOrderedSubsetOf (Get-CompareSymbols $delta) (Get-CompareSymbols $payload))) { return $false }
+    if (-not (Test-IsOrderedSubsetOf (Get-CompareSymbols $candidate) (Get-CompareSymbols $payload))) { return $false }
 
-    # (d) SIZE, delta against payload, with NO margin. Rendering only ever deletes, so the delta
-    # cannot legitimately be larger than what we sent in either character class. The 2-character
-    # rounding margin this replaced is exactly how "xx/review" got in.
+    # (d) SIZE, candidate against payload, with NO margin. Rendering only ever deletes, so what
+    # landed cannot legitimately be larger than what we sent in either character class. The
+    # 2-character rounding margin this replaced is exactly how "xx/review" got in.
     $payAlnum = Get-AlnumLength $payload
     $paySym   = Get-NonAlnumLength $payload
     if (($payAlnum + $paySym) -le 0) { return $false }
-    $delAlnum = Get-AlnumLength $delta
+    $delAlnum = Get-AlnumLength $candidate
     if ($delAlnum -gt $payAlnum) { return $false }
-    if ((Get-NonAlnumLength $delta) -gt $paySym) { return $false }
+    if ((Get-NonAlnumLength $candidate) -gt $paySym) { return $false }
     # ...and a floor, so a paste that landed only fractionally is not confirmed on the strength
     # of a few surviving words.
     if ($delAlnum -lt ($payAlnum * $script:MinSizeFraction)) { return $false }
     return $true
+}
+
+function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed) {
+    # Strip the fence info-strings ONCE and measure everything against the result. Stripping them
+    # for the word count but not for the size count made it worse, not better: `powershell` and
+    # `json` still inflated the expected length, the rendered read-back fell under MinSizeFraction
+    # and a four-fence button was refused on size instead of on words. The baseline is itself a
+    # read-back, so it is already rendered and has no fences to strip.
+    $payload = Remove-FenceInfoStrings $payload
+    $pw = @(Get-CompareWords $payload)
+    if ($pw.Count -eq 0) { return $false }
+
+    # --- Decide WHAT to attribute to the paste, then judge it. ---
+    # If the read-back starts with the baseline, the paste appended and only the DELTA is ours.
+    # If it does not, the composer's prior contents are gone - which is what an empty composer
+    # showing its placeholder does the instant the paste lands - so the WHOLE read-back has to be
+    # ours, judged by the same rules. See the long note above for why this cannot rescue a paste
+    # that never happened: when nothing lands, observed IS baseline and the prefix check passes.
+    $baseCore = Get-ComposerCore $baseline
+    $obsCore  = Get-ComposerCore $observed
+    $candidate = if ($obsCore.StartsWith($baseCore, [StringComparison]::Ordinal)) {
+        $obsCore.Substring($baseCore.Length)
+    } else {
+        $obsCore
+    }
+    # Deliberately ONE attempt. Trying the delta and then falling back to the whole read-back
+    # when the delta is rejected would let a draft that already contains the payload's words
+    # confirm a paste that never happened - defect 3, straight back in.
+    return (Test-DeltaDerives ([string]$candidate) $payload $pw)
 }
 
 # Wait until the composer holds the baseline plus our payload, judged by whether the text the

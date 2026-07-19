@@ -22,8 +22,8 @@ satisfied, and the draft's own length cleared the size floor. Nothing had been p
 passed anyway, and the panel then pressed Enter — submitting **the user's own unfinished text**.
 No threshold fixes that, because the measurement never looked at what *changed*.
 
-**Verification now judges the delta, not the total.** The read-back must begin with the composer's
-prior contents; that prefix is subtracted, and only what the paste actually *added* is examined:
+**Verification now judges the delta, not the total.** Where the paste appends, the composer's
+prior contents are subtracted and only what the paste actually *added* is examined:
 
 - every word in the delta must occur in the button's text, **in order** — rendering deletes
   words, it never invents or substitutes them, so an ordered subset is exactly what a genuine
@@ -37,6 +37,37 @@ An unchanged composer yields an empty delta, and an empty delta has zero coverag
 allowance capped below 100%, so case 3 is now refused **by construction** rather than by a
 threshold that could be tuned wrong again.
 
+**An empty composer does not read as empty — it reads as its placeholder.** This is a property of
+the Chromium composer, measured read-only through the accessibility tree against the running app:
+an empty box reports `Type / for commands` followed by a newline — 20 characters — and the moment
+a paste lands the placeholder is *gone*, replaced rather than appended to. A first cut of the
+delta check above required the read-back to *begin with* the prior contents, which an empty
+composer can therefore never satisfy: **every click into an empty composer was refused**, the
+panel's single most common action. It was caught before release, on this machine, by clicking a
+real button four times and reading the composer back each time.
+
+The prefix requirement now **falls back** instead of refusing. If the read-back begins with the
+prior contents, the delta is judged as above. If it does not — the prior contents are gone, which
+is exactly what an empty composer's placeholder does — then the **entire** read-back must be
+button-derived, under the same four rules. That is not a loosening: it is the identical standard,
+and it is the one the empty case was always held to, since there the delta *is* the whole box.
+
+Deliberately, the panel does **not** try to recognise the placeholder. Its wording is English
+prose that any Claude update or a localised UI will change, and matching on it — hardcoded or as
+a setting — would fail as a total loss of function rather than a degraded one. In the tree the
+placeholder is also an ordinary text node with no distinguishing attributes, so there is nothing
+structural to key on either. The fallback needs to know none of this.
+
+A paste that never happened is still refused, and by construction rather than by threshold: when
+nothing lands, the read-back *is* the prior contents — placeholder or draft alike — so it trivially
+begins with them, the fallback is never reached, and the empty delta fails coverage as before. The
+fallback is deliberately not attempted as a second chance when the delta is rejected, since that
+would let case 3 back in.
+
+One known limit above is narrower as a result: a paste that **replaces a selected draft** now
+sends, and what is submitted is verified button-derived. A caret parked *mid*-draft is still
+refused — the surviving draft words are not in the button's text.
+
 Formatted buttons still send: the two ordered-subset rules permit deletion freely, which is all
 markdown rendering does. The 12,752-character flagship button whose read-back is 12,259
 characters is now a test fixture rather than a story, together with fenced blocks, bold, markdown
@@ -44,12 +75,13 @@ links whose URLs render away, collapsed blank lines, and one-word buttons.
 
 **Known limits, stated plainly** (these replace the allowance table further down this file):
 
-- **The paste must append.** Verification assumes the text lands at the end of the composer. If
-  the caret is parked in the middle of a draft, or text is selected so the paste replaces it, the
-  read-back does not begin with the prior contents and **the send is refused**. Nothing is sent
-  and nothing is lost, but a legitimate click does nothing except show a warning. This is a real
-  usability cost, deliberately taken: refusing is the safe direction, and it cannot be tested
-  automatically because positioning a caret requires synthesising input.
+- **The paste must append, or replace everything.** Verification handles the text landing at the
+  end of the composer, and the composer's prior contents being wholly replaced. It does not handle
+  the two mixing: a caret parked in the *middle* of a draft leaves surviving draft words that are
+  not in the button's text, and **the send is refused**. Nothing is sent and nothing is lost, but
+  a legitimate click does nothing except show a warning. This is a real usability cost,
+  deliberately taken: refusing is the safe direction, and it cannot be tested automatically
+  because positioning a caret requires synthesising input.
 - **An incomplete paste can still be sent.** The remaining tolerance is one-sided: content may be
   *missing* from the delta, never *added* to it. Up to `min(max(3, 2%·n), floor(n/4))` of the
   button's `n` words may be absent and the send still goes through — 0 words for a 2–3 word
@@ -78,6 +110,15 @@ both verified by running the mutation first rather than reasoning about it:
 
 All three are the same underlying mistake: asserting that a correct-looking line exists, instead
 of asserting that the dangerous path cannot be reached.
+
+**And the fixtures are now answerable to the app.** Three times running, a paste fixture has
+described a composer the real app never produces — first an empty read-back, then a newline —
+and each time a fully green suite certified a panel that could not send. The suite no longer
+lets a fixture assert a shape: an empty composer is written as the token `<EMPTY>`, one measured
+constant decides what that expands to, and three checks aimed at the *fixtures* rather than the
+panel fail if the placeholder is ever redefined to whitespace, if any fixture hand-writes the old
+newline baseline again, or — the one that would have caught this release — if the empty-composer
+fixtures stop exercising the replaced-placeholder path and quietly revert to testing appends.
 
 ## 1.10.1 — 2026-07-19
 
