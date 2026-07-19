@@ -837,6 +837,7 @@ $script:strings = @{
         editText = 'Edit text/prompt...'; editTextTitle = 'Edit button text'
         groupTitle = 'Move to group'; groupAsk = 'Group name (empty = no group):'
         groupNew = 'New group...'; groupNone = 'No group'
+        moveBar = 'Move to bar'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
         colours = 'Colours'; colDefault = 'Default'
         kind_text = 'Prompts'; kind_command = 'Commands'; kind_group = 'Groups'
         kind_toggle = 'Toggles'
@@ -869,6 +870,7 @@ $script:strings = @{
         editText = 'Redigér tekst/prompt…'; editTextTitle = 'Redigér knappens tekst'
         groupTitle = 'Flyt til gruppe'; groupAsk = 'Gruppenavn (tomt = ingen gruppe):'
         groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
+        moveBar = 'Flyt til bjælke'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
         colours = 'Farver'; colDefault = 'Standard'
         kind_text = 'Prompts'; kind_command = 'Kommandoer'; kind_group = 'Grupper'
         kind_toggle = 'Kontakter'
@@ -955,6 +957,36 @@ function Set-GroupProp([string]$name, [string]$prop, $value) {
         else { $cfg.groups.$name | Add-Member -NotePropertyName $prop -NotePropertyValue $value -Force }
         $cfg
     }
+}
+
+# ---------- Bars ----------
+# A button lives on one of three bars: the control row (default, unchanged) or a vertical strip
+# in the pane's left/right margin. Unset means 'row', so every existing config keeps working and
+# nothing moves until it is asked to.
+$script:ckBars = @('row', 'left', 'right')
+function Get-ButtonBar($b) {
+    $v = [string]$b.bar
+    if ($script:ckBars -contains $v) { return $v }
+    return 'row'
+}
+function Set-ButtonBar($t, [string]$bar) {
+    $ok = Update-Buttons {
+        param($btns)
+        foreach ($b in $btns) {
+            if ($t.__isGroup) {
+                # Moving a group moves its whole membership, or the group would split across bars.
+                if ([string]$b.group -eq [string]$t.group) {
+                    if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
+                    else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
+                }
+            } elseif (Same-Button $b $t) {
+                if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
+                else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
+            }
+        }
+        $btns
+    }
+    if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }
 }
 
 function Same-Button($a, $b) {
@@ -1403,6 +1435,40 @@ $script:uiaCache = New-Object System.Windows.Automation.CacheRequest
 $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::NameProperty)
 $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRectangleProperty)
 
+# How much room sits beside each composer, for the vertical side bars.
+#
+# The composer path knows composer rects but not pane rects, and in a grid the usable margin is
+# bounded by the NEIGHBOURING pane, not the window. So panes are grouped into rows by a coarse Y
+# band (the same quantisation the strip ordering uses, because raw Y jitter reorders panes) and
+# each one's boundary is the midpoint to its neighbour in that row. Single-column layouts fall
+# through to the window edges, which is the same answer.
+function Set-PaneSideRooms($panes, $wr) {
+    if (-not $panes -or $panes.Count -eq 0) { return }
+    $rows = @{}
+    foreach ($p in $panes) {
+        if (-not $p.Cx) { continue }
+        $band = [int]([Math]::Round($p.Cy / 100))
+        if (-not $rows.ContainsKey($band)) { $rows[$band] = @() }
+        $rows[$band] += $p
+    }
+    foreach ($band in $rows.Keys) {
+        $row = @($rows[$band] | Sort-Object { $_.Cx })
+        for ($i = 0; $i -lt $row.Count; $i++) {
+            $p = $row[$i]
+            $left = if ($i -eq 0) { [double]$wr.Left }
+                    else { $prev = $row[$i - 1]; (($prev.Cx + $prev.Cw) + $p.Cx) / 2 }
+            $right = if ($i -eq ($row.Count - 1)) { [double]$wr.Right }
+                     else { $nx = $row[$i + 1]; (($p.Cx + $p.Cw) + $nx.Cx) / 2 }
+            $p.PaneL = [int]$left
+            $p.PaneR = [int]$right
+            $p.LeftRoom = [int]($p.Cx - $left)
+            $p.RightRoom = [int]($right - ($p.Cx + $p.Cw))
+        }
+    }
+    Write-CkLog ("MARGIN panes={0} leftRoom={1} rightRoom={2} pillH={3}" -f `
+        $panes.Count, $panes[0].LeftRoom, $panes[0].RightRoom, $pillH)
+}
+
 # Measure one chat pane: geometry, displayed chat title, bottom button row.
 # Must run inside an active $script:uiaCache scope (reads .Cached.*).
 function Measure-Pane($pane, $wr, $btnCond) {
@@ -1579,6 +1645,7 @@ function Update-UiaInfo {
             }
         }
         } finally { $cacheScope.Dispose() }
+        Set-PaneSideRooms $newPanes $wr
         $script:panes = $newPanes
 
         # Primary aliases = first pane (kept for the main strip and pinning)
@@ -2243,6 +2310,8 @@ $btnMenu.add_Opening({
     # Move stays live for a group: it reorders the whole group as one block on the bar.
     foreach ($mi in @($miEdit, $miToggle, $miGroup, $miRemove)) { $mi.Enabled = -not $isGrp }
     if (-not $isGrp) { Fill-GroupMenu } else { $miGroup.DropDownItems.Clear() }
+    $miBar.Text = L 'moveBar'
+    Fill-BarMenu
     if ($script:menuSource -and $script:menuSource.Tag) { $miToggle.Checked = [bool]$script:menuSource.Tag.toggle } else { $miToggle.Checked = $false }
 })
 
@@ -2269,6 +2338,7 @@ $miLeft   = $btnMenu.Items.Add('Move left')
 $miRight  = $btnMenu.Items.Add('Move right')
 [void]$btnMenu.Items.Add('-')
 $miGroup = $btnMenu.Items.Add('Move to group...')
+$miBar   = $btnMenu.Items.Add('Move to bar')
 $miRemove = $btnMenu.Items.Add('Remove this button')
 
 # Assign a button to a named group (or clear it). Grouped buttons collapse behind one group
@@ -2320,6 +2390,20 @@ function Get-GroupNames {
 # into a prompt meant knowing it exactly - and a group shows on the bar as a glyph, so its
 # name is not written anywhere on screen. Rebuilt on every open, so a group made a moment ago
 # is already in the list.
+# Which bar this button lives on. A group moves as a unit, so its members follow it.
+function Fill-BarMenu {
+    $miBar.DropDownItems.Clear()
+    $cur = 'row'
+    if ($script:menuSource -and $script:menuSource.Tag) { $cur = Get-ButtonBar $script:menuSource.Tag }
+    foreach ($bar in $script:ckBars) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem (L "bar_$bar")
+        $mi.Tag = $bar
+        $mi.Checked = ($bar -eq $cur)
+        $mi.add_Click({ Set-ButtonBar $script:menuSource.Tag ([string]$this.Tag) })
+        [void]$miBar.DropDownItems.Add($mi)
+    }
+}
+
 function Fill-GroupMenu {
     $miGroup.DropDownItems.Clear()
     $cur = if ($script:menuSource -and $script:menuSource.Tag) { [string]$script:menuSource.Tag.group } else { '' }
@@ -2906,6 +2990,92 @@ function Invoke-PillClick($btn) {
 # Mirror strips: one extra strip per additional chat pane in side-by-side/grid view
 $script:mirrors = @()
 
+# ---------- Vertical side bars ----------
+# One strip per pane per side, in the margin beside that pane's composer. Buttons stack UPWARD
+# from the control row, so the first one always sits nearest the row the eye is already on.
+# Created lazily: a pane with nothing assigned to a side costs nothing.
+$script:sideStrips = @()
+$script:sideMinBtn = 18   # narrower than this and the margin is not worth drawing into
+
+function New-SideStrip([string]$side) {
+    $sf = New-Object LayeredForm
+    $sf.Text = 'Claude Buttons'
+    $sf.TopMost = $true
+    $sf.FormBorderStyle = 'None'
+    $sf.ShowInTaskbar = $false
+    $sf.AutoSize = $true
+    $sf.AutoSizeMode = 'GrowAndShrink'
+    $sf.StartPosition = 'Manual'
+    $sf.Location = New-Object System.Drawing.Point(-4000, -4000)
+    $sf.BackColor = $script:barColor
+    $sp = New-Object System.Windows.Forms.FlowLayoutPanel
+    $sp.FlowDirection = 'BottomUp'      # first button at the bottom, nearest the control row
+    $sp.WrapContents = $false
+    $sp.AutoSize = $true
+    $sp.AutoSizeMode = 'GrowAndShrink'
+    $sp.Padding = New-Object System.Windows.Forms.Padding((S(2)), (S(3)), (S(2)), (S(3)))
+    [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($sp, $true, $null)
+    $sf.Controls.Add($sp)
+    @{ Form = $sf; Panel = $sp; Side = $side }
+}
+
+# Fill one side strip. Side buttons are ALWAYS square icons: the bar is only as wide as the
+# margin allows, and a text pill would either overflow into the composer or force the bar wide
+# enough to cover chat content. A button with no icon falls back to a two-character initialism.
+function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btnSize) {
+    $panel = $strip.Panel
+    $panel.SuspendLayout()
+    $old = @($panel.Controls)
+    $panel.Controls.Clear()
+    $vis = @(Get-VisibleButtons $paneTitle $isPrimary)
+    $seenGroup = @{}
+    foreach ($src in $vis) {
+        if ((Get-ButtonBar $src) -ne $strip.Side) { continue }
+        $gname = [string]$src.group
+        if ($gname) {
+            if ($seenGroup.ContainsKey($gname)) { continue }
+            $seenGroup[$gname] = $true
+            $def = Get-GroupDef $gname
+            $b = [pscustomobject]@{
+                __isGroup = $true; group = $gname
+                members = @($vis | Where-Object { [string]$_.group -eq $gname })
+                text = ''; label = $def.label; short = $def.short; icon = $def.icon; bar = $strip.Side
+            }
+        } else { $b = $src }
+        $btn = New-Object PillButton
+        $btn.Tag = $b
+        $btn.Width = $btnSize; $btn.Height = $btnSize
+        $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
+        if ($glyph) {
+            $btn.Font = $script:iconFont; $btn.Text = $glyph; $btn.Glyph = $true; $btn.Bold = $true
+        } else {
+            $btn.Font = $script:btnFont
+            $lbl = [string]$(if ($b.short) { $b.short } else { $b.label })
+            $btn.Text = if ($lbl.Length -gt 2) { $lbl.Substring(0, 2) } else { $lbl }
+        }
+        $btn.Margin = New-Object System.Windows.Forms.Padding(0, (S(2)), 0, (S(2)))
+        $btn.BackColor = $script:barColor
+        $btn.Fill = $script:barColor
+        $btn.HoverFill = $colHover
+        $btn.DownFill = $colDown
+        if ($b.toggle) { $btn.Toggled = (Get-ToggleState $b) }
+        $btn.ForeColor = Get-ButtonFore $b $false
+        if ($b.chat) { $btn.Accent = $colAccent }
+        $btn.AccessibleName = [string]$b.label
+        $btn.ContextMenuStrip = $btnMenu
+        $btn.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
+        $btn.add_Click({ Invoke-PillClick $this })
+        $btn.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+        $btn.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+        $btn.add_Repaint({ Render-StripFor $this })
+        if ($b.__isGroup) { $btn.add_MouseEnter({ Show-GroupFlyout $this $false }) }
+        $panel.Controls.Add($btn)
+    }
+    $panel.ResumeLayout()
+    foreach ($o in $old) { $o.Dispose() }
+    return $panel.Controls.Count
+}
+
 function New-MirrorStrip {
     $mf = New-Object LayeredForm
     $mf.Text = 'Claude Buttons'
@@ -2957,13 +3127,8 @@ function Get-GroupDef([string]$name) {
     return @{ icon = $icon; label = $label; short = $short }
 }
 
-function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPrimary) {
-    $destPanel.SuspendLayout()
-    $old = @($destPanel.Controls | Where-Object { $_ -ne $destGrip })
-    $destPanel.Controls.Clear()
-    $destPanel.Controls.Add($destGrip)
-    # Resolve visibility first, so buttons sharing a "group" can collapse behind ONE group
-    # button that opens a flyout. The group takes the row position of its first member.
+# Which buttons apply to a pane, by scope alone (bar assignment is the caller's business).
+function Get-VisibleButtons([string]$paneTitle, [bool]$isPrimary) {
     $vis = @()
     foreach ($b in $script:config.buttons) {
         $visible = if (-not $b.chat -and -not $b.chatTitle) { $true }                 # global: every pane
@@ -2972,6 +3137,18 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
                    else { $false }
         if ($visible) { $vis += $b }
     }
+    return $vis
+}
+
+function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPrimary) {
+    $destPanel.SuspendLayout()
+    $old = @($destPanel.Controls | Where-Object { $_ -ne $destGrip })
+    $destPanel.Controls.Clear()
+    $destPanel.Controls.Add($destGrip)
+    # Resolve visibility first, so buttons sharing a "group" can collapse behind ONE group
+    # button that opens a flyout. The group takes the row position of its first member.
+    # Only the buttons that live on THIS bar; the rest are drawn by the side strips.
+    $vis = @(Get-VisibleButtons $paneTitle $isPrimary | Where-Object { (Get-ButtonBar $_) -eq 'row' })
     $seenGroup = @{}
     foreach ($src in $vis) {
         $gname = [string]$src.group
@@ -3036,6 +3213,23 @@ function Rebuild-Buttons {
         Build-StripPanel $script:mirrors[$i].Panel $script:mirrors[$i].Grip $mTitle $false
         $script:mirrors[$i].Form.ResumeLayout()
         Update-LayeredStrip $script:mirrors[$i].Form $script:mirrors[$i].Panel
+    }
+    # Side strips: sized to the margin they have to live in, so a narrow pane gets smaller
+    # buttons rather than a bar that overlaps the chat.
+    for ($i = 0; $i -lt $script:sideStrips.Count; $i++) {
+        $st = $script:sideStrips[$i]
+        $pIdx = [int]($i / 2)
+        if ($pIdx -ge $script:panes.Count) { if ($st.Form.Visible) { $st.Form.Hide() }; continue }
+        $pn = $script:panes[$pIdx]
+        $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
+        $size = [Math]::Min($pillH, $room - (S 6))
+        $st.BtnSize = $size
+        if ($size -lt (S $script:sideMinBtn)) { $st.Form.Hide(); continue }
+        $st.Form.SuspendLayout()
+        $n = Build-SideStrip $st $pn.Title ($pIdx -eq 0) $size
+        $st.Form.ResumeLayout()
+        if ($n -eq 0) { $st.Form.Hide(); continue }
+        Update-LayeredStrip $st.Form $st.Panel
     }
 }
 [void](Read-ActiveSession)
@@ -3126,6 +3320,7 @@ $timer.add_Tick({
         if (-not $show) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
+            foreach ($ss in $script:sideStrips) { if ($ss.Form.Visible) { $ss.Form.Hide() } }
             if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
@@ -3143,7 +3338,7 @@ $timer.add_Tick({
         # an agent, hook or another machine changes the state behind our back
         if (((Get-Date) - $script:stateGlobLast).TotalMilliseconds -ge 1000) {
             $script:stateGlobLast = Get-Date
-            $allPanels = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel })
+            $allPanels = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel }) + @($script:sideStrips | ForEach-Object { $_.Panel })
             foreach ($pnl in $allPanels) {
                 foreach ($c in $pnl.Controls) {
                     if ($c -is [PillButton] -and $c.Tag -and $c.Tag.toggle -and $c.Tag.stateGlob) {
@@ -3188,6 +3383,7 @@ $timer.add_Tick({
         if ($script:composerLost) {
             if ($form.Visible) { $form.Hide() }
             foreach ($ms in $script:mirrors) { if ($ms.Form.Visible) { $ms.Form.Hide() } }
+            foreach ($ss in $script:sideStrips) { if ($ss.Form.Visible) { $ss.Form.Hide() } }
             if ($tipForm.Visible) { $tipForm.Hide() }
             if ($gripMenu.Visible) { $gripMenu.Close() }
             if ($btnMenu.Visible) { $btnMenu.Close() }
@@ -3205,6 +3401,19 @@ $timer.add_Tick({
             $m = $script:mirrors[$script:mirrors.Count - 1]
             $script:mirrors = @($script:mirrors | Select-Object -First ($script:mirrors.Count - 1))
             try { $m.Form.Close(); $m.Form.Dispose() } catch {}
+            $dirty = $true
+        }
+        # Two side strips per pane, in the same order as $script:panes.
+        $wantSides = $script:panes.Count * 2
+        while ($script:sideStrips.Count -lt $wantSides) {
+            $side = if ($script:sideStrips.Count % 2 -eq 0) { 'left' } else { 'right' }
+            $script:sideStrips = @($script:sideStrips) + (New-SideStrip $side)
+            $dirty = $true
+        }
+        while ($script:sideStrips.Count -gt $wantSides) {
+            $sx = $script:sideStrips[$script:sideStrips.Count - 1]
+            $script:sideStrips = @($script:sideStrips | Select-Object -First ($script:sideStrips.Count - 1))
+            try { $sx.Form.Close(); $sx.Form.Dispose() } catch {}
             $dirty = $true
         }
         if ($dirty) { Rebuild-Buttons }
@@ -3295,6 +3504,36 @@ $timer.add_Tick({
             if (-not $form.Visible) { $form.Show(); Update-LayeredStrip $form $panel }
         }
 
+        # Side strips: in the margin beside each pane's composer, bottom aligned to the control
+        # row so the stack grows upward from where the eye already is. Hidden by the same rules
+        # as that pane's row strip: no anchor (a Claude modal is over the composer) or another
+        # app covering the pane means the side bars go too, or they float over the dialog.
+        for ($si = 0; $si -lt $script:sideStrips.Count; $si++) {
+            $st = $script:sideStrips[$si]
+            $sForm = $st.Form
+            $pIdx = [int]($si / 2)
+            if ($pIdx -ge $script:panes.Count -or $sForm.Controls[0].Controls.Count -eq 0) {
+                if ($sForm.Visible) { $sForm.Hide() }
+                continue
+            }
+            $pn = $script:panes[$pIdx]
+            if (-not $pn.Cx) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
+            if ($room -lt ((S $script:sideMinBtn) + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            $sx = if ($st.Side -eq 'left') { [int]($pn.Cx - (S 3) - $sForm.Width) }
+                  else { [int]($pn.Cx + $pn.Cw + (S 3)) }
+            # Bottom edge level with the top of the control row, so the stack never covers it.
+            $sy = [int]($pn.DockY - [int]($pillH / 2) - (S 4) - $sForm.Height)
+            $sx = [Math]::Max($r.Left + 2, [Math]::Min($sx, $r.Right - $sForm.Width - 2))
+            $sy = [Math]::Max($r.Top + 2, [Math]::Min($sy, $r.Bottom - $sForm.Height - 2))
+            $sVis = [bool]$pn.Anchored
+            if ($sVis) { $sVis = Test-PaneVisible ([int]($sx + $sForm.Width / 2)) ([int]($sy + $sForm.Height - 4)) }
+            if (-not $sVis) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            $sDesired = New-Object System.Drawing.Point($sx, $sy)
+            if ($sForm.Location -ne $sDesired) { $sForm.Location = $sDesired }
+            if (-not $sForm.Visible) { $sForm.Show(); Update-LayeredStrip $sForm $st.Panel }
+        }
+
         # Mirror strips: dock each under its own pane
         for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
             $mForm = $script:mirrors[$i].Form
@@ -3355,7 +3594,7 @@ $timer.add_Tick({
         # Fast hover-clear: WM_MOUSELEAVE can lag on a layered window, so proactively drop
         # the highlight on any button/kebab the cursor is no longer over (renders only on change).
         $cp = [System.Windows.Forms.Cursor]::Position
-        $sweep = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel })
+        $sweep = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel }) + @($script:sideStrips | ForEach-Object { $_.Panel })
         if ($script:flyForm -and $script:flyForm.Visible) { $sweep += $script:flyForm }
         foreach ($pnl in $sweep) {
             foreach ($c in $pnl.Controls) {

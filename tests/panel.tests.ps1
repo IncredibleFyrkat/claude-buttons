@@ -593,6 +593,21 @@ Check 'moving a group right jumps the whole block past B' ((($moved2 | ForEach-O
 $edge = @(Swap-Blocks $cfg 'g:grp' -99)
 Check 'an out-of-range move is a no-op, not a truncation' ($edge.Count -eq $cfg.Count)
 
+# --- Bars: a button assigned to a side must LEAVE the control row ---
+# The row strip and the side strips share one visibility filter. If the row stopped filtering on
+# bar, a side button would render twice - once in the row and once in the margin.
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"}, {"label":"B","text":"/b","bar":"left"} ] }'
+Check 'a left-bar button is not drawn in the control row' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","bar":"left"}, {"label":"B","text":"/b","bar":"right"} ] }'
+Check 'both sides empty the row entirely' ((Buttons $r.Out) -eq 0 -and $r.Code -eq 0)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a","bar":"nonsense"} ] }'
+Check 'an unknown bar value falls back to the row, not nowhere' ((Buttons $r.Out) -eq 1)
+
+$r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"}, {"label":"B","text":"/b"} ] }'
+Check 'no bar field = every button stays in the row (back-compat)' ((Buttons $r.Out) -eq 2)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
