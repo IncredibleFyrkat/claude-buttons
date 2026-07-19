@@ -5,6 +5,7 @@
 param(
     [switch]$SmokeTest,
     [Parameter(DontShow)][string]$EscapeProbe = $null,
+    [Parameter(DontShow)][string]$PasteProbe = $null,
     [string]$AddButton,
     [string]$RemoveButton
 )
@@ -1935,8 +1936,18 @@ function Normalize-ComposerText([string]$s) { ($s -replace "`r`n", "`n").Trim() 
 # Checking for exact equality rather than "contains the payload" matters: a substring probe
 # passes when the draft already happens to start with the same words, or when a previous button
 # left identical boilerplate, and it cannot detect extra content pasted alongside ours.
-function Wait-PasteLanded($el, [string]$baseline, [string]$payload, [int]$timeoutMs = 1200) {
-    $want = Normalize-ComposerText ($baseline + $payload)
+function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 1200) {
+    # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
+    # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
+    # terminator in the MIDDLE of the expected string ("draft\n/cmd") while the paste appends
+    # before it ("draft/cmd"), so every click with a draft in the box compared unequal and
+    # refused to send. The empty case only passed because Trim() happened to eat both newlines.
+    $base = Normalize-ComposerText ([string]$baseline)
+    $want = Normalize-ComposerText ($base + $payload)
+    # A payload that normalizes away entirely would make want == base, which the poll below
+    # would satisfy on its first read - confirming a paste that never happened and then
+    # submitting whatever the user already had in the box. Refuse instead.
+    if ($want -eq $base) { return 'Mismatch' }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     $sawText = $false
     while ((Get-Date) -lt $deadline) {
@@ -1950,6 +1961,25 @@ function Wait-PasteLanded($el, [string]$baseline, [string]$payload, [int]$timeou
     if ($sawText) { return 'Mismatch' }
     return 'Unverifiable'
 }
+
+# Test seam. Wait-PasteLanded is the whole safety decision, and grepping the source for its
+# shape proved almost worthless: six of nine injected defects survived, including one that
+# reinstated the leak. Driving the real function with a stubbed composer reader exercises the
+# actual state machine. -PasteProbe takes a JSON file {baseline, payload, observed} where
+# `observed` is what the composer will report, and prints the resulting state.
+function Invoke-PasteProbe([string]$jsonPath) {
+    $c = [IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json
+    $script:probeObserved = $c.observed          # $null in JSON => unreadable composer
+    # Shadow the UIA reader for the duration of the probe.
+    function script:Get-ComposerText($el) { $script:probeObserved }
+    $base = if ($null -eq $c.baseline) { $null } else { [string]$c.baseline }
+    [Console]::Out.Write((Wait-PasteLanded $null $base ([string]$c.payload) 120))
+    exit 0
+}
+
+# Runs here, not at the top of the file: it needs Wait-PasteLanded to be defined. Exits before
+# any window is created, so it never touches the live install or takes focus.
+if (-not [string]::IsNullOrEmpty($PasteProbe)) { Invoke-PasteProbe $PasteProbe }
 
 function Focus-ChatInput($stripCenterX, $stripTopY) {
     try {
@@ -2096,6 +2126,9 @@ function Invoke-PillClick($btn) {
             # Re-check foreground BEFORE touching the clipboard so an aborted send never leaves
             # it clobbered, and restore it in finally so it survives an exception.
             if (-not (Test-TargetForeground)) { return }
+            # A payload that is only whitespace can never be verified (it normalizes away),
+            # and buttons.json is hand-editable, so this is reachable. Refuse it up front.
+            if ([string]::IsNullOrWhiteSpace($textToSend)) { Write-CkLog 'Refusing a blank payload'; return }
             # Baseline BEFORE the clipboard is touched, so we can prove afterwards that exactly
             # our payload was added and nothing else. $null means the composer is unreadable,
             # which is not the same as empty - see the Unverifiable branch below.
@@ -2129,11 +2162,15 @@ function Invoke-PillClick($btn) {
                 # Do not restore the clipboard until the payload is OBSERVED in the composer.
                 # The finally block below runs straight after this, so this wait is the only
                 # thing standing between our paste and the user's clipboard going back.
-                $pasteState = if ($null -eq $baseline) { 'Unverifiable' }
-                              else { Wait-PasteLanded $composerEl $baseline $textToSend }
+                # Always wait, even when the composer is unreadable. Short-circuiting to
+                # 'Unverifiable' meant the restore in the finally below ran with NO delay at
+                # all - strictly worse than the fixed 90ms it replaced, on the one path where
+                # we cannot see what happened. Wait-PasteLanded polls for its full timeout and
+                # returns 'Unverifiable' by itself when nothing is readable.
+                $pasteState = Wait-PasteLanded $composerEl $baseline $textToSend
                 $pasted = ($pasteState -eq 'Confirmed')
             } catch {
-                Write-CkLog "Clipboard unavailable, falling back to typing: $($_.Exception.Message)"
+                Write-CkLog "Clipboard unavailable; nothing was pasted or sent: $($_.Exception.Message)"
             } finally {
                 # M1: restore the full prior clipboard - but only if nothing else wrote to it
                 # meanwhile, or we would clobber another app's copy with stale content. If the

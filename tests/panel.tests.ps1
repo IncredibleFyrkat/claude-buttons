@@ -108,27 +108,67 @@ $srcText = $src -join "`n"   # defined here too: these checks run before the doc
 # what turned a detected problem into a sent one, because it appended the right text under the
 # contamination and pressed Enter. These guard the invariant that replaced it: on anything
 # other than a confirmed paste, type nothing, send nothing, change nothing.
+# BEHAVIOURAL, via the -PasteProbe seam: the real Wait-PasteLanded is driven with a stubbed
+# composer reader. The first version of these checks grepped the source instead, and six of
+# nine injected defects survived - including one that reinstated the leak verbatim, and two
+# i18n "tests" whose regex was satisfied by the CALL SITES rather than the string table, so
+# deleting every string still passed.
+function PasteState([string]$json) {
+    $f = Join-Path ([IO.Path]::GetTempPath()) ("cb-pp-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".json")
+    [IO.File]::WriteAllText($f, $json, (New-Object System.Text.UTF8Encoding($false)))
+    try { (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $panel -PasteProbe $f 2>$null) -join '' }
+    finally { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+}
+Check 'a clean paste into an EMPTY composer is Confirmed' `
+    ((PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
+# The regression that would have made the panel useless in daily use: an "empty" Chromium
+# composer reads as "\n" and a draft as "draft\n", so concatenating the raw baseline put that
+# terminator mid-string and every click with a draft in the box refused to send.
+Check 'a clean paste on top of a USER DRAFT is Confirmed (not refused)' `
+    ((PasteState '{"baseline":"udkast\n","payload":"/review","observed":"udkast/review\n"}') -eq 'Confirmed')
+Check 'a stale clipboard landing instead of the payload is a Mismatch' `
+    ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token\n"}') -eq 'Mismatch')
+# The exact shape reported in PR #4: stale text prepended, our payload also present. A
+# "contains the payload" probe would call this a success and submit both.
+Check 'stale text PLUS our payload is still a Mismatch' `
+    ((PasteState '{"baseline":"\n","payload":"/review","observed":"secret token/review\n"}') -eq 'Mismatch')
+# A payload that normalizes away would make want == baseline, satisfying the poll on its first
+# read - confirming a paste that never happened and submitting whatever the user already had.
+Check 'a whitespace-only payload can never be Confirmed' `
+    ((PasteState '{"baseline":"udkast\n","payload":"   ","observed":"udkast\n"}') -eq 'Mismatch')
+Check 'an unreadable composer is Unverifiable, never Confirmed' `
+    ((PasteState '{"baseline":"\n","payload":"/review","observed":null}') -eq 'Unverifiable')
+
+# Source invariants that cannot be probed: what the caller DOES with the state.
 Check 'the send path no longer types a fallback payload' `
-    (-not ($srcText -match 'SendWait\(\(Escape-SendKeys \$textToSend\)\)'))
-Check 'an unconfirmed paste returns instead of pressing Enter' `
-    ($srcText -match '(?s)if \(-not \$pasted\).{0,600}?return')
-Check 'the composer baseline is captured BEFORE the clipboard is touched' `
-    ([regex]::Match($srcText, '(?s)\$baseline = Get-ComposerText.{0,400}?Clipboard\]::GetDataObject').Success)
-Check 'verification compares baseline+payload exactly, not a substring' `
-    (($srcText -match '\$want = Normalize-ComposerText \(\$baseline \+ \$payload\)') -and
-     ($srcText -match '-eq \$want'))
-Check 'an unreadable composer is treated as Unverifiable, never as empty' `
-    ($srcText -match "if \(\`$null -eq \`$baseline\) \{ 'Unverifiable' \}")
-Check 'the three paste outcomes are explicit states, not a nullable boolean' `
-    (($srcText -match "'Confirmed'") -and ($srcText -match "'Mismatch'") -and ($srcText -match "'Unverifiable'"))
-Check 'an abandoned send warns the user rather than only logging' `
-    (($srcText -match 'Show-SendWarning') -and ($srcText -match 'sendMismatch') -and ($srcText -match 'sendUnverified'))
+    (-not ($srcText -match 'Escape-SendKeys \$textToSend'))
+Check 'nothing is submitted unless the paste was Confirmed' `
+    ($srcText -match "\`$pasted = \(\`$pasteState -eq 'Confirmed'\)")
+Check 'an unconfirmed paste returns before the Enter key' `
+    ([regex]::Match($srcText, "(?s)if \(-not \`$pasted\).{0,900}?return.{0,900}?SendWait\('\{ENTER\}'\)").Success)
 Check 'no undo/select-all recovery was introduced (it would eat a user draft)' `
     (-not ($srcText -match "SendWait\('\^z'\)|SendWait\('\^a'\)"))
+# Both abandoned-send branches must TELL the user. Without this the failure is silent except
+# for a log line nobody reads, and "I clicked and nothing happened" is indistinguishable from
+# a successful send - which is how this class of bug stayed invisible in the first place.
+$failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
+Check 'the Mismatch branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendMismatch'\)")
+Check 'the Unverifiable branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendUnverified'\)")
+$blankLine = ($src | Select-String -Pattern 'IsNullOrWhiteSpace\(\$textToSend\)' | Select-Object -First 1).LineNumber
+$clipLine  = ($src | Select-String -Pattern 'Clipboard\]::GetDataObject' | Select-Object -First 1).LineNumber
+Check 'a blank payload is refused BEFORE the clipboard is touched' `
+    (($blankLine -gt 0) -and ($clipLine -gt 0) -and ($blankLine -lt $clipLine))
+# Assert the STRING TABLE, not any mention of the key: the previous version matched the
+# Show-SendWarning call sites, so deleting every string still passed while the user would have
+# got a blank tooltip.
+$stringsOk = $true
 foreach ($lang in @('en', 'da')) {
-    Check "the abandoned-send strings exist in $lang" `
-        (($srcText -match "(?s)\b$lang\s*=\s*@\{.*?sendMismatch") -and ($srcText -match "(?s)\b$lang\s*=\s*@\{.*?sendUnverified"))
+    $block = [regex]::Match($srcText, "(?s)\b$lang\s*=\s*@\{(.*?)\r?\n\s*\}").Groups[1].Value
+    foreach ($k in @('sendMismatch', 'sendUnverified')) {
+        if ($block -notmatch "$k\s*=\s*'[^']{10,}'") { $stringsOk = $false }
+    }
 }
+Check 'both abandoned-send strings are defined with real text in EN and DA' $stringsOk
 
 # --- Version discipline ---
 # v1.7.0 shipped reporting "1.6.0" because a merge resolution silently reverted the bump,
