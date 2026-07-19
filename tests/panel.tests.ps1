@@ -10,6 +10,19 @@ $defCfg = Join-Path $repo 'buttons.default.json'
 $fails  = 0
 $count  = 0
 
+# ---- Never take the user's PRODUCTION config lock during a test run ----
+# The panel serialises config writes on a named mutex. This file used to hold that exact name
+# for ~1.2s per run, and Update-Config gives up after 2000ms by DISCARDING the user's edit with
+# only a log line - so running the suite on a machine with the panel open could silently throw
+# away a pin, a colour choice or a dissolve. It also made two concurrent suite runs fight each
+# other, and the loser exits non-zero while printing no FAIL line, which is exactly the shape
+# that fakes a CAUGHT verdict in mutation testing.
+# Every child powershell.exe INHERITS this variable, so CLI invocations lock on the test name.
+# Start-Job does NOT inherit it - job-based holders must be passed $cbLockName explicitly.
+$cbProdLock = 'Local\ClaudeButtonsConfig'
+$cbLockName = "Local\CbTests-$PID-" + [Guid]::NewGuid().ToString('N').Substring(0,8)
+$env:CB_CONFIG_LOCK = $cbLockName
+
 function Run-Smoke([string]$json) {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ("cb-panel-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -280,8 +293,14 @@ $quick = ($quickRaw -split '\|')[0]; $quickMs = [int]($quickRaw -split '\|')[1]
 Check 'an unreadable composer returns Unverifiable' ($unver -eq 'Unverifiable')
 Check "an unreadable composer polls until its timeout (${unverMs}ms of a 120ms budget)" `
     ($unverMs -ge 100)
-Check "a confirmed paste returns without waiting out the timeout (${quickMs}ms)" `
-    (($quick -eq 'Confirmed') -and ($quickMs -lt 60))
+# RELATIVE to the timeout case, not an absolute millisecond count. An absolute `< 60ms` failed at
+# 69ms purely because the machine was busy - four review agents and a mutation run at once - which
+# is a false alarm about the product, and the third time a timing assertion in this file has been
+# either vacuous or flaky. Both numbers are now measured INSIDE the probe process, so they share
+# whatever slowdown is going on and their ratio still means something: the confirmed path must
+# return well before the poll would have timed out.
+Check "a confirmed paste returns well inside the timeout (${quickMs}ms vs ${unverMs}ms)" `
+    (($quick -eq 'Confirmed') -and ($quickMs -lt ($unverMs * 0.75)))
 
 # F6: the user's own flagship button is a 12,752-character, 482-line prompt. Every other probe
 # case is a single short line, so multi-line round-tripping through the UIA read-back was
@@ -548,6 +567,24 @@ $r = Invoke-CbCli '{"label":"Dup","text":"/x"}' '-RemoveButton' $dupes
 Check 'an ambiguous remove is REFUSED (exit 3) and deletes nothing' `
     (($r.Out -match 'AMBIGUOUS') -and ($r.Code -eq 3) -and ($r.Labels -eq 'Dup,Dup,Keep'))
 
+# --- The suite must never take the user's PRODUCTION config lock (data-loss guard) ---
+# Holding 'Local\ClaudeButtonsConfig' during a run makes the live panel's Update-Config time out
+# after 2000ms and DISCARD the user's edit with only a log line. These four checks are the ones
+# that stay red if anyone reintroduces the hardcoded name on either side.
+Check 'the suite runs under a non-production config lock name' `
+    (($env:CB_CONFIG_LOCK) -and ($env:CB_CONFIG_LOCK -ne $cbProdLock))
+$panelSrc = Get-Content $panel -Raw -Encoding UTF8
+# The panel must build its mutex from the overridable NAME, never from a literal.
+Check 'the panel builds its config mutex from an overridable name, not a literal' `
+    ($panelSrc -match [regex]::Escape('New-Object System.Threading.Mutex($false, $script:cfgLockName)'))
+Check 'the panel honours CB_CONFIG_LOCK' ($panelSrc -match [regex]::Escape('$env:CB_CONFIG_LOCK'))
+# ...and no test file may construct a mutex on the production name. `-eq` is case-insensitive in
+# PS 5.1 and so is this match, which is what we want: a case variant names the same kernel object.
+$testSrcAll = (Get-ChildItem (Join-Path $repo 'tests') -Filter *.ps1 |
+               ForEach-Object { Get-Content $_.FullName -Raw -Encoding UTF8 }) -join "`n"
+Check 'no test constructs a mutex on the production config lock name' `
+    (-not ($testSrcAll -match ('Mutex\([^)]*' + [regex]::Escape($cbProdLock))))
+
 # --- Does the lock actually LOCK? (QA-2/QA-3) ---
 # The battery above proves add/remove works with a single writer. It does NOT prove the mutex
 # does anything: with the lock removed entirely, every one of those assertions still passed.
@@ -565,9 +602,12 @@ $cfgFile = Join-Path $dir 'buttons.json'
                         (New-Object System.Text.UTF8Encoding($false)))
 
 $readyFile = Join-Path $dir 'holder-ready.flag'
-$holder = Start-Job -ArgumentList $cfgFile, $readyFile -ScriptBlock {
-    param($cfg, $ready)
-    $m = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
+# $cbLockName is passed EXPLICITLY. Start-Job does not inherit the parent's environment, so a
+# holder that read $env:CB_CONFIG_LOCK itself would find it empty, fall back to the production
+# name, and contend with the user's live panel again - while this file looked fixed.
+$holder = Start-Job -ArgumentList $cfgFile, $readyFile, $cbLockName -ScriptBlock {
+    param($cfg, $ready, $lockName)
+    $m = New-Object System.Threading.Mutex($false, $lockName)
     [void]$m.WaitOne(5000)
     try {
         # READ, then think, then write - the classic lost-update shape, and exactly what the
@@ -575,7 +615,19 @@ $holder = Start-Job -ArgumentList $cfgFile, $readyFile -ScriptBlock {
         # and is overwritten by the stale copy read before it.
         $o = Get-Content $cfg -Raw | ConvertFrom-Json
         [IO.File]::WriteAllText($ready, 'held')   # signal AFTER the read, while still holding
-        Start-Sleep -Milliseconds 1200
+        # The hold MUST stay under the panel's own 2000ms lock timeout. Raising it to 5s to make
+        # the race deterministic was tried and is wrong: the CLI then legitimately gives up,
+        # prints "Could not write buttons.json (locked or unreadable)" and exits 1 - which is
+        # finding A's data-loss mechanism itself, not a passing test.
+        # So this integration check stays timing-sensitive by nature, and the DETERMINISTIC proof
+        # that contention is really observed lives in the in-process contention test below.
+        # 800ms rather than 1200ms: under heavy parallel load (six suites at once during mutation
+        # testing) a 1200ms hold plus child-process startup pushed the CLI past its 2000ms budget,
+        # so it failed closed and this test went red for a mutation that had not broken anything -
+        # a FALSE CAUGHT, the one outcome that makes a mutation table lie. 800ms leaves 1200ms of
+        # headroom. Detection of a wrongly-named holder does not rest on this timing anyway: it is
+        # the structural "no mutex from a string literal" check that catches that, deterministically.
+        Start-Sleep -Milliseconds 800
         $b = [pscustomobject]@{ label = 'FromPanel'; text = '/panel' }
         $o.buttons = @($o.buttons) + $b
         [IO.File]::WriteAllText($cfg, ($o | ConvertTo-Json -Depth 100),
@@ -591,17 +643,29 @@ $deadline = (Get-Date).AddSeconds(30)
 while (-not (Test-Path $readyFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
 Check 'the concurrent holder acquired the lock before the CLI started' (Test-Path $readyFile)
 $prevHome = $env:USERPROFILE
+$lockSw = [Diagnostics.Stopwatch]::StartNew()
 try {
     $env:USERPROFILE = Join-Path $dir 'home'
     $lockOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') `
                    -AddButton (Join-Path $dir 'pay.json') 2>&1
 } finally { $env:USERPROFILE = $prevHome }
+$lockSw.Stop()
 Wait-Job $holder -Timeout 20 | Out-Null
 Remove-Job $holder -Force
 $finalLabels = ((Get-Content $cfgFile -Raw | ConvertFrom-Json).buttons | ForEach-Object { $_.label }) -join ','
 Remove-Item $dir -Recurse -Force
 
 Check 'the CLI waits for the lock and reports success' ("$lockOut" -match 'ADDED')
+# (No "elapsed > 0" assertion here: the CLI must finish INSIDE the panel's 2000ms lock timeout,
+# so there is no elapsed threshold that separates a blocked run from an unblocked one. A check
+# that cannot fail is worse than no check - the deterministic contention proof is further down.)
+# A mutex name in a test must NEVER be a string literal - it has to come from $cbLockName, which
+# is per-run and non-production. A literal is how this file took the user's live config lock for
+# ~1.2s every run, and Update-Config discards the user's edit after 2000ms with only a log line.
+# This also catches the specific trap that Start-Job does not inherit $env:CB_CONFIG_LOCK, so a
+# holder job that was never passed the name would fall back to a hardcoded one.
+$literalMutex = [regex]::Matches($testSrcAll, "New-Object\s+System\.Threading\.Mutex\(\s*\`$false\s*,\s*['`"]")
+Check "no test builds a mutex from a string literal (found $($literalMutex.Count))" ($literalMutex.Count -eq 0)
 # Assert MEMBERSHIP, not order. Which writer wins the mutex is a legitimate race; losing a
 # button is not. Asserting the exact sequence would fail on a correctly-merged run that simply
 # interleaved the other way - a flaky test that punishes the behaviour it is meant to protect.
@@ -650,10 +714,11 @@ function Rebuild-Buttons { $script:rebuilt++ }
 function Set-DissolveLabel([string]$key) { $script:dissolveLabel = $key }
 $script:ckLog = @(); $script:rebuilt = 0; $script:flyForm = $null; $script:menuSource = $null
 $script:dissolveLabel = ''; $script:dissolveArmedFor = $null; $script:dissolveArmedAt = Get-Date '2000-01-01'
-# A test-private mutex name. Taking the panel's real 'Local\ClaudeButtonsConfig' here would
-# contend with the user's running panel for no benefit - the lock's own behaviour is covered
-# by the concurrent-writer test above.
-$script:cfgLock = New-Object System.Threading.Mutex($false, "Local\CbTests-$PID")
+# A test-private mutex name. Taking the panel's real production lock here would contend with the
+# user's running panel for no benefit - the lock's own behaviour is covered by the concurrent-
+# writer test above. This now reuses the SAME per-run name the panel picks up from
+# $env:CB_CONFIG_LOCK, so the in-process transforms and the child CLI agree on one lock.
+$script:cfgLock = New-Object System.Threading.Mutex($false, $cbLockName)
 
 # Load, and FAIL LOUDLY if a name has moved. A silent `if ($node)` skip is how a test file
 # ends up asserting nothing: rename the function and every test below would pass vacuously
@@ -661,7 +726,8 @@ $script:cfgLock = New-Object System.Threading.Mutex($false, "Local\CbTests-$PID"
 $panelFns = @('Get-ButtonBlocks', 'Get-ButtonBar', 'Same-Button', 'Get-ColorKind', 'Get-KindColor',
               'Read-FreshConfig', 'Write-ConfigAtomic', 'Update-Buttons', 'Update-Config',
               'Set-ButtonBar', 'Set-ButtonGroup', 'Set-KindColor', 'Move-GroupMember', 'Move-PinButton',
-              'Get-GroupNames', 'Resolve-GroupName', 'Set-GroupProp', 'Get-GroupDef')
+              'Get-GroupNames', 'Resolve-GroupName', 'Set-GroupProp', 'Get-GroupDef',
+              'Clear-FlyoutForForm')
 $missingFns = @()
 foreach ($fn in $panelFns) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
@@ -681,6 +747,78 @@ foreach ($vn in @('$script:ckBars', '$script:ckPalette')) {
 }
 Check ("the bar list and colour palette were extracted from source" + $(if ($missingVars) { ": MISSING $($missingVars -join ', ')" } else { '' })) `
     ($missingVars.Count -eq 0)
+
+# =====================================================================================
+# Clear-FlyoutForForm: a pinned flyout must not outlive the strip that owns it
+# =====================================================================================
+# This is the whole round-1 disposal fix and it had NO tests at all - `grep Clear-FlyoutForForm
+# tests/` returned nothing, so every one of the branches below could have been deleted silently.
+# The flyout records its owning strip in $flyForm.Tag. When the pane count shrinks, the owning
+# strip form is hard-disposed in the tick; if the flyout is not torn down with it, it stays on
+# screen with Tag pointing at a dead form and clicking a member resolves to no pane at all.
+# Hide-GroupFlyout is the stub above, so $script:rebuilt counts "the flyout was torn down".
+$ownerA = [pscustomobject]@{ Name = 'stripA' }
+$ownerB = [pscustomobject]@{ Name = 'stripB' }
+
+# 1. Owner MATCHES -> tear down: Tag cleared AND Hide-GroupFlyout called.
+$script:flyForm = [pscustomobject]@{ Tag = $ownerA }
+$script:rebuilt = 0
+Clear-FlyoutForForm $ownerA
+Check 'Clear-FlyoutForForm tears the flyout down when the owner matches' ($script:rebuilt -eq 1)
+Check '...and clears the Tag so nothing can resolve through the dead form' ($null -eq $script:flyForm.Tag)
+
+# 2. Owner does NOT match -> leave a flyout belonging to a DIFFERENT, still-live strip alone.
+# Without this branch, disposing any one strip would close a flyout the user has open elsewhere.
+$script:flyForm = [pscustomobject]@{ Tag = $ownerA }
+$script:rebuilt = 0
+Clear-FlyoutForForm $ownerB
+Check 'a flyout owned by a DIFFERENT strip is left alone' ($script:rebuilt -eq 0)
+Check '...and that flyout keeps its Tag' ($script:flyForm.Tag -eq $ownerA)
+
+# 3. Owner already DISPOSED - the REAL shipped sequence. The tick disposes the strip form and
+# then calls this with it, so the argument is routinely a dead object. Reference identity still
+# holds after Dispose(), so the flyout must still be recognised as belonging to it and torn down.
+# If it were not, the flyout would survive its owner - which is the entire bug this function
+# exists to prevent.
+# A real Form is used, not a mock. It is never Show()n, never parented and never focused;
+# constructing and disposing one creates no visible window.
+Add-Type -AssemblyName System.Windows.Forms
+$deadOwner = New-Object System.Windows.Forms.Form
+$deadOwner.Dispose()
+$script:flyForm = [pscustomobject]@{ Tag = $deadOwner }
+$script:rebuilt = 0
+$disposedThrew = $false
+try { Clear-FlyoutForForm $deadOwner } catch { $disposedThrew = $true }
+Check 'a DISPOSED owner still tears its flyout down (identity survives Dispose)' `
+    ((-not $disposedThrew) -and ($script:rebuilt -eq 1))
+Check '...and the Tag pointing at the dead form is cleared' ($null -eq $script:flyForm.Tag)
+# NOTE, measured: the `try { $same = ... } catch {}` around the Tag comparison in
+# Clear-FlyoutForForm is NOT reachable from a test. PowerShell 5.1 turns a failing property GET
+# into $null instead of a propagating exception - verified against a disposed Form, a disposed
+# MemoryStream and a ScriptProperty that throws outright, all under $ErrorActionPreference=Stop;
+# none of them threw. So no test here can make that catch fire, and a mutant deleting it
+# correctly SURVIVES. It is left in place as cheap insurance on a disposal path, not because
+# it is covered - saying otherwise would be the kind of claim this round exists to remove.
+
+# 4. $null in, and no flyout open at all. Both are ordinary states - the tick calls this for
+# every strip it disposes, whether or not a flyout is up.
+$script:flyForm = [pscustomobject]@{ Tag = $ownerA }
+$script:rebuilt = 0
+$nullThrew = $false
+try { Clear-FlyoutForForm $null } catch { $nullThrew = $true }
+Check 'a $null form is ignored without throwing' ((-not $nullThrew) -and ($script:rebuilt -eq 0))
+Check '...and the open flyout is untouched' ($script:flyForm.Tag -eq $ownerA)
+$script:flyForm = $null
+$script:rebuilt = 0
+$noFlyThrew = $false
+try { Clear-FlyoutForForm $ownerA } catch { $noFlyThrew = $true }
+Check 'no flyout open is a no-op, not an error' ((-not $noFlyThrew) -and ($script:rebuilt -eq 0))
+$script:flyForm = $null
+
+# The two shipped callsites must actually route through it, or the function is dead code that
+# passes its own tests. Both strip-disposal paths (pinned strip, side bar) have to call it.
+$clearCalls = [regex]::Matches($srcText, 'Clear-FlyoutForForm\s+\$\w+\.Form').Count
+Check "both strip-disposal paths call Clear-FlyoutForForm (found $clearCalls)" ($clearCalls -eq 2)
 
 # =====================================================================================
 # F1: the colour picker must actually SHOW its colours, and they must be readable
@@ -788,6 +926,95 @@ Check 'the ring fields default to Color.Empty so the bar is unchanged' `
     ($srcText -match 'public Color HoverRing = Color\.Empty' -and
      $srcText -match 'public Color DownRing = Color\.Empty' -and
      $srcText -match 'public Color ToggleRing = Color\.Empty')
+
+# --- The state ring must not OVERDRAW the per-chat accent (measured in PIXELS) ---
+# Accent and ring both drew on rcEdge at 2f with the ring second, so on a flyout member that
+# belongs to a chat, any hover/press/toggle painted the ring straight over the accent and the
+# per-chat cue disappeared - at exactly the moment the user was about to click it.
+# This is asserted by RENDERING, not by reading the source: a source-text check would pass
+# against any expression that merely mentions Inflate. The button is composited onto an
+# offscreen Bitmap - no window is created, shown, focused, or given input.
+# MUTATION: drop the `if (Accent != Color.Empty)` inset line from RenderTo and this goes red
+# (measured pre-fix: the outer edge pixel is the RING 236,200,130 and accent-ish pixels fall
+# from 274 to 76, those 76 being corner anti-aliasing only).
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$csBlock = [regex]::Match($srcText,
+    '(?s)Add-Type -ReferencedAssemblies System\.Windows\.Forms, System\.Drawing -TypeDefinition @"\r?\n(.*?)\r?\n"@')
+Check 'the panel C# block was located for offscreen rendering' ($csBlock.Success)
+if ($csBlock.Success) {
+    if (-not ('PillButton' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csBlock.Groups[1].Value
+    }
+    # The real shipped colours, parsed out of source rather than retyped.
+    $accentCol = [System.Drawing.Color]::FromArgb(198, 146, 78)
+    $tRingCol  = [System.Drawing.Color]::FromArgb(236, 200, 130)
+    $tFillCol  = [System.Drawing.Color]::FromArgb(144, 102, 36)
+    $pb = New-Object PillButton
+    $pb.Width = 27; $pb.Height = 27
+    $pb.Accent = $accentCol
+    $pb.ToggleRing = $tRingCol
+    $pb.ToggleFill = $tFillCol
+    # Toggled is a plain public property - no synthetic mouse input is involved anywhere here.
+    $pb.Toggled = $true
+    $bmp = New-Object System.Drawing.Bitmap 27, 27, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $pb.RenderTo($gfx, 0, 0)
+    $gfx.Dispose()
+    function Near-Color($p, $c, $tol) {
+        ([Math]::Abs($p.R - $c.R) -le $tol) -and ([Math]::Abs($p.G - $c.G) -le $tol) -and ([Math]::Abs($p.B - $c.B) -le $tol)
+    }
+    # Mid-height on the left edge: straight vertical run, no corner rounding, no anti-aliasing.
+    $edgePx = $bmp.GetPixel(0, 13)
+    Check ("the accent survives on the OUTER edge under a toggle ring (got $($edgePx.R),$($edgePx.G),$($edgePx.B))") `
+        (Near-Color $edgePx $accentCol 12)
+    # ...and the ring is still drawn, just inset - both cues visible at once, which is the point.
+    $ringSeen = $false
+    foreach ($x in 2..5) { if (Near-Color ($bmp.GetPixel($x, 13)) $tRingCol 12) { $ringSeen = $true } }
+    Check 'the state ring is still drawn, inset just inside the accent' $ringSeen
+    # The two bands must not be ADJACENT. Ring and accent are only 1.73:1 apart, so a 1px inset
+    # would read as a single thick band. There is no pure-FILL pixel between them - a 2f
+    # antialiased pen bleeds into its neighbours, so x1/x2 are blends, measured, not assumed -
+    # but the pure ring pixel must sit at least 3px in from the pure accent pixel.
+    Check 'the ring does not touch the accent (no ring pixel in the outer 2px)' `
+        (-not ((Near-Color ($bmp.GetPixel(0, 13)) $tRingCol 12) -or (Near-Color ($bmp.GetPixel(1, 13)) $tRingCol 12)))
+    # Control: with NO accent the ring must still sit on the OUTER edge, so the bar and every
+    # non-chat flyout member are unchanged by this fix.
+    $pb2 = New-Object PillButton
+    $pb2.Width = 27; $pb2.Height = 27
+    $pb2.ToggleRing = $tRingCol; $pb2.ToggleFill = $tFillCol; $pb2.Toggled = $true
+    $bmp2 = New-Object System.Drawing.Bitmap 27, 27, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $gfx2 = [System.Drawing.Graphics]::FromImage($bmp2)
+    $pb2.RenderTo($gfx2, 0, 0)
+    $gfx2.Dispose()
+    $edge2 = $bmp2.GetPixel(0, 13)
+    Check ("with no accent the ring stays on the outer edge (got $($edge2.R),$($edge2.G),$($edge2.B))") `
+        (Near-Color $edge2 $tRingCol 12)
+    # The SAME assertion against the OTHER paint path. RenderTo composites the flyout; OnPaint
+    # paints the bar. Only RenderTo can show a ring today (the bar leaves every ring Color.Empty),
+    # but the ring block exists in both - see "the state ring is drawn in BOTH paint paths" above
+    # - so the inset has to exist in both too, or the next control that sets a ring on the bar
+    # silently loses its accent. Mutation proved this is not theoretical: with only the RenderTo
+    # test, deleting the OnPaint inset left the suite fully green.
+    # DrawToBitmap renders through OnPaint into a bitmap. No window is shown, focused or given
+    # input; the control is never parented and never made visible.
+    $pb3 = New-Object PillButton
+    $pb3.Width = 27; $pb3.Height = 27
+    $pb3.BackColor = [System.Drawing.Color]::FromArgb(46, 45, 43)
+    $pb3.Accent = $accentCol; $pb3.ToggleRing = $tRingCol; $pb3.ToggleFill = $tFillCol
+    $pb3.Toggled = $true
+    $bmp3 = New-Object System.Drawing.Bitmap 27, 27
+    $pb3.DrawToBitmap($bmp3, (New-Object System.Drawing.Rectangle 0, 0, 27, 27))
+    $edge3 = $bmp3.GetPixel(0, 13)
+    Check ("OnPaint keeps the accent on the outer edge too (got $($edge3.R),$($edge3.G),$($edge3.B))") `
+        (Near-Color $edge3 $accentCol 12)
+    $ring3 = $false
+    foreach ($x in 2..5) { if (Near-Color ($bmp3.GetPixel($x, 13)) $tRingCol 12) { $ring3 = $true } }
+    Check 'OnPaint still draws the ring, inset' $ring3
+    $bmp3.Dispose(); $pb3.Dispose()
+
+    $bmp.Dispose(); $bmp2.Dispose(); $pb.Dispose(); $pb2.Dispose()
+}
 
 # =====================================================================================
 # F8: no unbounded debug line in a hover path
@@ -1373,6 +1600,42 @@ $r = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) $c | Add-Me
 Check 'Update-Config persists a whole-config change' (($r.Ret -eq $true) -and ($r.Cfg.marker -eq 'set'))
 Check 'Update-Config preserves the fields the transform did not touch' `
     (($r.Cfg.targetTitle -eq 'Claude') -and ((Labels $r.Cfg) -eq 'A'))
+# --- Contention is really OBSERVED, proven deterministically (no race) ---
+# The concurrent-writer test above is an integration check and is timing-sensitive by nature:
+# the holder must release inside the panel's own 2000ms lock timeout, so whether an UNLOCKED
+# CLI reads before or after the holder's write depends on child-process startup. Mutation proved
+# that is not good enough - pointing the holder at a different mutex name (i.e. no shared lock at
+# all) left it green.
+# This check has no race in it. A second PROCESS holds the lock for longer than the panel is
+# willing to wait, and the write is made in-process, so the outcome is fixed: Update-Buttons must
+# fail closed, take the full timeout, and say so. (It has to be a second process - a Windows mutex
+# is REENTRANT for the thread that owns it, so a same-thread probe would assert nothing.)
+$contendReady = Join-Path ([IO.Path]::GetTempPath()) ("cb-cont-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+$contendName = $cbLockName
+$contender = Start-Job -ArgumentList $contendName, $contendReady -ScriptBlock {
+    param($ln, $ready)
+    $mx = New-Object System.Threading.Mutex($false, $ln)
+    [void]$mx.WaitOne(15000)
+    try { [IO.File]::WriteAllText($ready, 'held'); Start-Sleep -Milliseconds 3500 } finally { $mx.ReleaseMutex() }
+}
+$cDeadline = (Get-Date).AddSeconds(30)
+while (-not (Test-Path $contendReady) -and (Get-Date) -lt $cDeadline) { Start-Sleep -Milliseconds 50 }
+Check 'the contending process holds the config lock' (Test-Path $contendReady)
+$script:ckLog = @()
+$cSw = [Diagnostics.Stopwatch]::StartNew()
+$rCont = Invoke-PanelEdit $cfgOnlyJson $null {
+    Update-Buttons { param($b) @($b) + [pscustomobject]@{ label = 'Blocked'; text = '/blocked' } }
+}
+$cSw.Stop()
+Wait-Job $contender -Timeout 20 | Out-Null
+Remove-Job $contender -Force
+Remove-Item $contendReady -Force -ErrorAction SilentlyContinue
+Check 'a write blocked by another process is REFUSED, not forced' ($rCont.Ret -eq $false)
+Check ("...after waiting out the 2000ms lock timeout (waited $([int]$cSw.Elapsed.TotalMilliseconds)ms)") `
+    ($cSw.Elapsed.TotalMilliseconds -ge 1800)
+Check '...leaving the config exactly as it was' ((Labels $rCont.Cfg) -eq 'A')
+Check '...and it is logged rather than failing silently' ((@($script:ckLog) -join '|') -match 'lock busy')
+
 # THE ONE THAT MATTERS: a transform returning $null must be REFUSED, not written. Without the
 # guard the file becomes "null" (or empty) and the user loses every button they ever pinned,
 # with no backup - and the panel then falls back to the shipped defaults, so the loss looks
@@ -1384,14 +1647,35 @@ Check 'a transform returning $null is refused, not written' ($r.Ret -eq $false)
 # that returns a string writes `"totally not a config"` over buttons.json and the user loses
 # every button they ever pinned - and because the panel then falls back to the shipped
 # defaults, the loss reads as a spontaneous reset rather than a bug.
-#
-# *** THIS CHECK IS CURRENTLY RED. It is a real, reproducible defect in Update-Config, not a
-# broken test. The fix is one line in claude-buttons.ps1 - tighten the existing guard to
-#     if (-not $fresh -or -not $fresh.PSObject.Properties['buttons']) { return $false }
-# - which this file cannot make, because it does not own the panel script. ***
 $rShape = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) 'totally not a config' } }
-Check 'a transform returning a WRONG-SHAPED object is refused, not written' `
-    (($rShape.Ret -eq $false) -or ($null -ne $rShape.Cfg.PSObject.Properties['buttons']))
+# Asserted on Ret ALONE. This used to be `($rShape.Ret -eq $false) -or (...has buttons...)`, and
+# the second arm made it unfalsifiable: the file on disk still has a `buttons` property whenever
+# the write was refused, so the -or was true either way.
+Check 'a transform returning a WRONG-SHAPED object is refused, not written' ($rShape.Ret -eq $false)
+Check 'a refused wrong-shape write leaves the file intact' `
+    (((Labels $rShape.Cfg) -eq 'A') -and ($rShape.Cfg.targetTitle -eq 'Claude'))
+# Presence of `buttons` is not enough - the VALUE has to be a collection. Each of these serialises
+# straight over buttons.json and loses every pinned button if only presence is checked.
+foreach ($bad in @(
+        @{ n = '$null';    v = $null },
+        @{ n = "a string"; v = 'hello' },
+        @{ n = 'a number'; v = 42 },
+        @{ n = 'a bool';   v = $true })) {
+    # Invoke-PanelEdit runs the action with `& $Action` and passes no arguments, so the value
+    # travels through script scope rather than through $args.
+    $script:badButtons = $bad.v
+    $rb = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) [pscustomobject]@{ buttons = $script:badButtons } } }
+    Check "a transform whose buttons is $($bad.n) is refused, not written" ($rb.Ret -eq $false)
+    Check "...and the one-button config survives it ($($bad.n))" ((Labels $rb.Cfg) -eq 'A')
+}
+# THE TRAP: PS 5.1 unrolls a single-element array out of a scriptblock, so a legitimate ONE-button
+# config arrives with `buttons` as a bare PSCustomObject. A guard demanding [array] would refuse
+# it and destroy the config. This check is what stops anyone "tightening" the guard that way.
+$rOne = Invoke-PanelEdit '{"buttons":[{"label":"A","text":"/a"},{"label":"B","text":"/b"}],"targetTitle":"Claude"}' $null {
+    Update-Config { param($c) $c.buttons = ($c.buttons | Where-Object { $_.label -eq 'A' }); $c }
+}
+Check 'a transform filtering down to ONE button is ACCEPTED (single-element unroll)' ($rOne.Ret -eq $true)
+Check 'the surviving single button is written' ((Labels $rOne.Cfg) -eq 'A')
 Check 'a refused Update-Config leaves the file byte-intact' `
     (($r.Cfg.buttons.Count -eq 1) -and ((Labels $r.Cfg) -eq 'A') -and ($r.Cfg.targetTitle -eq 'Claude'))
 # A transform that throws must not half-write. Asserted on the FILE, because that is the part

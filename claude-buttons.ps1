@@ -254,7 +254,14 @@ public class PillButton : Control {
     }
     // Which ring the current state asks for. Press outranks hover; a toggled button that is
     // ALSO being hovered/pressed shows the interaction ring, because that is the transient
-    // state the user is asking about - the toggle keeps its fill and its dot either way.
+    // state the user is asking about.
+    // What the toggle keeps while it is pressed, measured rather than assumed: the amber DOT,
+    // which is drawn under `if (toggled)` with no interaction test and so survives hover and
+    // press alike. It does NOT keep its fill - the fill expression is
+    // `down ? DownFill : (toggled ? ToggleFill : HoverFill)`, so DownFill outranks ToggleFill
+    // and a pressed toggle is filled as a plain press. That is acceptable because the dot is
+    // the non-colour cue the ON state actually relies on (WCAG 1.4.1), and it is still there;
+    // the fill was never the load-bearing signal.
     Color StateRing() {
         if (down) return DownRing;
         if (hover) return HoverRing;
@@ -280,10 +287,14 @@ public class PillButton : Control {
             using (var path = RoundRect(rc, rad))
             using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
         }
-        // State ring LAST, so a live state still reads on a per-chat button.
+        // State ring LAST, so a live state still reads on a per-chat button - but INSET when an
+        // accent is present, or it would land on the same rect at the same width and simply
+        // erase it. See RenderTo for the geometry and the measured contrast ratios.
         Color ring = StateRing();
         if (ring != Color.Empty) {
-            using (var path = RoundRect(rc, rad))
+            Rectangle rcRing = rc; int radRing = rad;
+            if (Accent != Color.Empty) { rcRing = Rectangle.Inflate(rc, -3, -3); radRing = Math.Max(2, rad - 3); }
+            using (var path = RoundRect(rcRing, radRing))
             using (var pen = new Pen(ring, 2f)) g.DrawPath(pen, path);
         }
         // Toggle-on gets a NON-COLOR cue (a bright left dot) so state isn't conveyed by fill alone.
@@ -325,9 +336,31 @@ public class PillButton : Control {
         }
         // The flyout composites through THIS path, not OnPaint, so the ring has to be drawn
         // here too or the whole fix is invisible exactly where it was needed.
+        //
+        // INSET by 3px whenever an accent is drawn. Both used to draw on rcEdge at 2f with the
+        // ring second, so on a flyout member belonging to a chat, ANY hover/press/toggle painted
+        // the ring straight over the accent and the per-chat cue vanished - at precisely the
+        // moment the user was about to click it. Rendered offscreen and sampled pre-fix, the
+        // outer edge pixel was the RING (236,200,130): the accent was simply not there.
+        //
+        // 3px, not 1px, because ring and accent are near-indistinguishable from EACH OTHER -
+        // ring vs accent 198,146,78 measures 1.37:1 hover, 1.50:1 press, 1.73:1 toggle, all far
+        // under 3:1 - so touching bands would read as one thick border. At 3px the pure accent
+        // pixel sits at x=0 and the pure ring pixel at x=3. There is NO pure-fill pixel between
+        // them: a 2f antialiased pen bleeds into its neighbours, so the two intervening pixels
+        // are blends (measured, at every inset from 2 to 5 - do not claim a gap here).
+        //
+        // What carries WCAG 1.4.11 is that each band still meets 3:1 against the surface it
+        // reads against. The ring's inner neighbour is the fill:
+        //   hover  ring 134,131,124 on hover  fill 56,55,52   3.15:1
+        //   press  ring 196,191,181 on press  fill 62,61,58   5.93:1
+        //   toggle ring 236,200,130 on toggle fill 144,102,36 3.20:1
+        // and the accent keeps its own 4.99:1 against the flyout surface 46,45,43, unchanged.
         Color ring2 = StateRing();
         if (ring2 != Color.Empty) {
-            using (var path = RoundRect(rcEdge, rad))
+            Rectangle rcRing = rcEdge; int radRing = rad;
+            if (Accent != Color.Empty) { rcRing = Rectangle.Inflate(rcEdge, -3, -3); radRing = Math.Max(2, rad - 3); }
+            using (var path = RoundRect(rcRing, radRing))
             using (var pen = new Pen(Color.FromArgb(255, ring2), 2f)) g.DrawPath(pen, path);
         }
         int textLeft = 0;
@@ -817,8 +850,18 @@ function Write-InstallMarker {
     } catch {}
 }
 
-# Cross-process lock so panel writes and /pin edits never clobber each other
-$script:cfgLock = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
+# Cross-process lock so panel writes and /pin edits never clobber each other.
+#
+# The name is overridable ONLY so the test suite can run without touching the live panel's lock.
+# Hardcoded, the suite's concurrent-writer test took this exact mutex and held it ~1.2s per run;
+# Update-Config waits 2000ms and then DROPS the user's edit with nothing but a log line, so
+# running the tests on a machine with the panel open could silently discard a pin, a colour
+# choice or a group dissolve. Two suite runs also collided with each other, and the loser exited
+# non-zero without printing a FAIL line - which manufactures false CAUGHT verdicts in mutation
+# testing. Child powershell.exe CLI invocations inherit this variable; Start-Job does NOT, so a
+# job-based holder must be passed the name explicitly (see tests/panel.tests.ps1).
+$script:cfgLockName = if ($env:CB_CONFIG_LOCK) { $env:CB_CONFIG_LOCK } else { 'Local\ClaudeButtonsConfig' }
+$script:cfgLock = New-Object System.Threading.Mutex($false, $script:cfgLockName)
 
 function Read-FreshConfig {
     $lastErr = ''
@@ -1076,8 +1119,45 @@ function Update-Config([scriptblock]$transform) {
         # defaults, so it reads to the user as a spontaneous reset rather than as a failure.
         # A transform emitting one stray object also makes this an Object[], which serialises as
         # a top-level JSON array that Read-FreshConfig accepts as truthy and every later write
-        # then throws on. Demand a single object that still has a buttons collection.
-        if (-not $fresh -or $fresh -is [array] -or -not $fresh.PSObject.Properties['buttons']) {
+        # then throws on.
+        #
+        # The `buttons` VALUE is checked too, not just its presence. Presence alone measurably
+        # let PSCO{buttons=$null}, PSCO{buttons='hello'} and PSCO{buttons=42} through, each of
+        # which serialises over buttons.json and loses every pinned button just as surely as the
+        # string case above.
+        #
+        # NOT `-is [array]`, deliberately: PS 5.1 unrolls a single-element array on return from a
+        # scriptblock, so a transform that filters two buttons down to one hands back a BARE
+        # PSCustomObject (measured: `{"buttons":{"label":"A"}}`). Demanding an array here would
+        # refuse - and thereby destroy - every legitimate one-button config. Reject only the
+        # things a buttons collection can never be: a string, a number, a bool, or $null.
+        #
+        # A hashtable @{buttons=@()} is also refused, even though ConvertTo-Json handles it. That
+        # is intentional, not an oversight in the check: $fresh becomes $script:config, and the
+        # config code reaches into it with .PSObject.Properties['...'], which is measurably BLIND
+        # to dictionary keys - on a hashtable carrying a real `groups` map, Set-GroupProp's
+        # existence test reports false and takes the "create it" branch, overwriting the user's
+        # groups. $fresh always originates from ConvertFrom-Json as a PSCustomObject anyway, so
+        # nothing shipped produces one; accepting it would only admit an untested shape.
+        # No separate "is it a single object?" test, deliberately. The obvious one -
+        #   $fresh -is [array] / -is [string] / -is [ValueType]
+        # - is unreachable dead code, proven by mutation: deleting it entirely leaves the suite
+        # green, because .PSObject.Properties['buttons'] already returns nothing for a string, a
+        # number, an array of configs OR a hashtable, so all four are refused one line further
+        # down anyway. (The ORIGINAL guard's `-is [array]` arm was redundant for the same reason.)
+        # An untestable branch that looks like a safety net is how this file grew checks that
+        # could not fail, so it is gone rather than kept for reassurance.
+        # The $null test stays: it is the one that is NOT redundant, because dereferencing
+        # .PSObject on $null is an error rather than a miss.
+        $shapeOk = $false
+        if ($null -ne $fresh) {
+            $bp = $fresh.PSObject.Properties['buttons']
+            if ($bp) {
+                $bv = $bp.Value
+                $shapeOk = ($null -ne $bv) -and -not ($bv -is [string]) -and -not ($bv -is [ValueType])
+            }
+        }
+        if (-not $shapeOk) {
             Write-CkLog 'Config transform returned an unusable shape - change not saved'
             return $false
         }
@@ -1095,10 +1175,19 @@ function Set-GroupProp([string]$name, [string]$prop, $value) {
             $cfg | Add-Member -NotePropertyName groups -NotePropertyValue ([pscustomobject]@{}) -Force
         }
         # Resolve against the FRESH file, not the in-memory config: this is the one place that
-        # can mint a new key under config.groups, and adding "deploy" beside an existing
-        # "Deploy" writes a JSON object that PS 5.1's ConvertFrom-Json refuses to parse - after
-        # which buttons.json is unreadable and the panel runs on defaults. Reuse the existing
-        # casing instead, which is also what the user sees on the bar.
+        # can mint a new key under config.groups.
+        #
+        # The failure this prevents, measured rather than assumed: Add-Member -Force matches
+        # property names CASE-INSENSITIVELY, so adding "deploy" beside an existing "Deploy" does
+        # not produce two keys at all - it RENAMES the existing one and overwrites its value.
+        #   @{Deploy=@{icon='rocket';label='Deploy It'}}  ->  {"deploy":{}}
+        # That result round-trips through ConvertFrom-Json perfectly well, so nothing ever
+        # errors; the group's icon and label are simply gone, and the group silently reverts to
+        # an unstyled default. (An earlier version of this comment claimed the write produced
+        # JSON that PS 5.1 could not parse. It cannot - that is a different bug, noted at
+        # Read-FreshConfig, where a HAND-EDITED file really does carry both keys and really does
+        # throw 'duplicated keys'. Only the hand-edited case is unreadable.)
+        # Reuse the existing casing instead, which is also what the user sees on the bar.
         $key = $null
         foreach ($p in $cfg.groups.PSObject.Properties) { if ($p.Name -eq $name) { $key = $p.Name; break } }
         if (-not $key) {
@@ -2773,9 +2862,17 @@ $btnMenu.add_Opening({
     if ($script:menuSource -and $script:menuSource.Tag) { $miToggle.Checked = [bool]$script:menuSource.Tag.toggle } else { $miToggle.Checked = $false }
 })
 # Keep the menu OPEN after the arming click, or the "Confirm?" caption the user is supposed to
-# click would be painted onto a menu that is already closing. Cancel is honoured for the
-# ItemClicked close reason specifically; every other reason (clicking away, Escape) is a real
-# dismissal and disarms, so an armed dissolve can never survive into a later menu session.
+# click would be painted onto a menu that is already closing.
+#
+# What this actually does, as opposed to what it looks like it does: the handler cannot see WHICH
+# item was clicked, so $dissolveHoldOpen is consumed by the next ItemClicked close attempt
+# whatever caused it. Arm dissolve, then click Rename instead, and the Rename handler runs AND
+# the close is cancelled - the menu stays open on a click that was meant to dismiss it. It is
+# cosmetic rather than dangerous: nothing is destroyed, the flag is spent either way, and every
+# non-ItemClicked reason (clicking away, Escape) still disarms, so an armed dissolve can never
+# survive into a LATER menu session. Left as-is deliberately: narrowing it means threading the
+# clicked item into the Closing handler, and that is a live GUI interaction path that cannot be
+# exercised by this repo's headless tests, so the change would ship unverified to fix a wart.
 $btnMenu.add_Closing({
     if ($script:dissolveHoldOpen -and
         $_.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked) {
