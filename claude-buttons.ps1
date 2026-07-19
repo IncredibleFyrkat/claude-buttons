@@ -3035,10 +3035,16 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
         # is the user's prompt and has no business in a log file.
         $k = 0
         while ($k -lt $want.Length -and $k -lt $last.Length -and $want[$k] -eq $last[$k]) { $k++ }
-        $wc = if ($k -lt $want.Length) { [int][char]$want[$k] } else { -1 }
-        $nc = if ($k -lt $last.Length) { [int][char]$last[$k] } else { -1 }
-        Write-CkLog ("PASTEDIFF wantLen={0} gotLen={1} baseLen={2} firstDiff={3} wantChr={4} gotChr={5}" -f `
-            $want.Length, $last.Length, $base.Length, $k, $wc, $nc)
+        # Owner asked for the raw text. Control characters are escaped and each side capped at
+        # 160 chars so one failure cannot write a novel into the log.
+        $esc = {
+            param($t)
+            $t = [string]$t
+            if ($t.Length -gt 160) { $t = $t.Substring(0, 160) + '...' }
+            ($t -replace "`r", '\\r' -replace "`n", '\\n' -replace "`t", '\\t')
+        }
+        Write-CkLog ("PASTEDIFF firstDiff={0} wantLen={1} gotLen={2}`n  WANT=[{3}]`n  GOT =[{4}]" -f `
+            $k, $want.Length, $last.Length, (& $esc $want), (& $esc $last))
         return 'Mismatch'
     }
     return 'Unverifiable'
