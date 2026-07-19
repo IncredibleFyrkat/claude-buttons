@@ -888,6 +888,7 @@ $script:strings = @{
         groupNew = 'New group...'; groupNone = 'No group'
         moveBar = 'Move to bar'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
         moveUp = 'Move up'; moveDown = 'Move down'
+        dissolve = 'Dissolve group'
         colours = 'Colours'; colDefault = 'Default'
         kind_text = 'Prompts'; kind_command = 'Commands'; kind_group = 'Groups'
         kind_toggle = 'Toggles'
@@ -922,6 +923,7 @@ $script:strings = @{
         groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
         moveBar = 'Flyt til bjælke'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
         moveUp = 'Flyt op'; moveDown = 'Flyt ned'
+        dissolve = 'Opløs gruppe'
         colours = 'Farver'; colDefault = 'Standard'
         kind_text = 'Prompts'; kind_command = 'Kommandoer'; kind_group = 'Grupper'
         kind_toggle = 'Kontakter'
@@ -2554,6 +2556,8 @@ $btnMenu.add_Opening({
     $isGrp = [bool]($script:menuSource -and $script:menuSource.Tag -and $script:menuSource.Tag.__isGroup)
     # Move stays live for a group: it reorders the whole group as one block on the bar.
     foreach ($mi in @($miEdit, $miToggle, $miGroup, $miRemove)) { $mi.Enabled = -not $isGrp }
+    $miDissolve.Text = L 'dissolve'
+    $miDissolve.Visible = $isGrp
     if (-not $isGrp) { Fill-GroupMenu } else { $miGroup.DropDownItems.Clear() }
     $miBar.Text = L 'moveBar'
     Fill-BarMenu
@@ -2584,6 +2588,7 @@ $miRight  = $btnMenu.Items.Add('Move right')
 [void]$btnMenu.Items.Add('-')
 $miGroup = $btnMenu.Items.Add('Move to group...')
 $miBar   = $btnMenu.Items.Add('Move to bar')
+$miDissolve = $btnMenu.Items.Add('Dissolve group')
 $miRemove = $btnMenu.Items.Add('Remove this button')
 
 # Assign a button to a named group (or clear it). Grouped buttons collapse behind one group
@@ -2672,6 +2677,24 @@ function Fill-GroupMenu {
         [void]$miGroup.DropDownItems.Add($miNone)
     }
 }
+
+# Dissolve: the members become plain buttons again, in place. They already carry the group's
+# bar (moving a group sets it on every member), and they already sit where the group face did,
+# so dropping the group field alone leaves them on the same bar in the same position. The
+# orphaned group definition is pruned by Update-Buttons.
+$miDissolve.add_Click({
+    try {
+        $src = $script:menuSource
+        if (-not ($src -and $src.Tag -and $src.Tag.__isGroup)) { return }
+        $g = [string]$src.Tag.group
+        $ok = Update-Buttons {
+            param($btns)
+            foreach ($b in $btns) { if ([string]$b.group -eq $g) { $b.PSObject.Properties.Remove('group') } }
+            $btns
+        }
+        if ($ok) { Hide-GroupFlyout; Rebuild-Buttons }
+    } catch { Write-CkLog "Dissolve group error: $($_.Exception.Message)" }
+})
 
 $miIcon.add_Click({
     try {

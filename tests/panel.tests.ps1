@@ -701,6 +701,27 @@ Check 'nothing is lost in the move' ($moved.Count -eq 4)
 $first = @(Move-ToBar $cfg2 $cfg2[3] 'right')
 Check 'the first button on an empty bar still lands there' ((@($first | Where-Object { $_.bar -eq 'right' }).Count) -eq 1)
 
+# --- Dissolving a group leaves its members where they were ---
+# Members already carry the group's bar and already occupy the group face's slot in the array,
+# so dropping the group field must be enough. If it were not, dissolving would scatter the
+# buttons back to the control row.
+function Dissolve($btns, [string]$g) {
+    $btns = @($btns)
+    foreach ($b in $btns) { if ([string]$b.group -eq $g) { $b.PSObject.Properties.Remove('group') } }
+    $btns
+}
+$grp = @(
+    [pscustomobject]@{ label = 'A'; text = '/a' },
+    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'g'; bar = 'right' },
+    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'g'; bar = 'right' },
+    [pscustomobject]@{ label = 'B'; text = '/b' }
+)
+$d = @(Dissolve $grp 'g')
+Check 'dissolving keeps the members on their bar' ((@($d | Where-Object { $_.bar -eq 'right' }).Count) -eq 2)
+Check 'dissolving keeps them in the group face position' ((($d | ForEach-Object { $_.label }) -join ',') -eq 'A,G1,G2,B')
+Check 'no member is left claiming the group' ((@($d | Where-Object { $_.group }).Count) -eq 0)
+Check 'they are now separate blocks, not one' ((@(Get-ButtonBlocks $d).Count) -eq 4)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
