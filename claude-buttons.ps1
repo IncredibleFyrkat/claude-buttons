@@ -980,6 +980,10 @@ function Set-ButtonBar($t, [string]$bar) {
                     else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
                 }
             } elseif (Same-Button $b $t) {
+                # Moving ONE button out of a group takes it out of the group. Keeping the group
+                # field would collapse it straight back behind the group face on the new bar,
+                # so the move would look like it silently did nothing.
+                $b.PSObject.Properties.Remove('group')
                 if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
                 else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
             }
@@ -3520,10 +3524,19 @@ $timer.add_Tick({
             if (-not $pn.Cx) { if ($sForm.Visible) { $sForm.Hide() }; continue }
             $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
             if ($room -lt ((S $script:sideMinBtn) + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
-            $sx = if ($st.Side -eq 'left') { [int]($pn.Cx - (S 3) - $sForm.Width) }
-                  else { [int]($pn.Cx + $pn.Cw + (S 3)) }
-            # Bottom edge level with the top of the control row, so the stack never covers it.
-            $sy = [int]($pn.DockY - [int]($pillH / 2) - (S 4) - $sForm.Height)
+            # Hug the pane's OUTER edge rather than the composer's, so each bar uses the margin
+            # it actually has. Anchoring both to the composer put the right bar tight against it
+            # while leaving the room past it empty. Clamped so a wide margin can never let a bar
+            # drift back over the composer.
+            $edgeGap = S 6
+            $sx = if ($st.Side -eq 'left') {
+                      [Math]::Min([int]($pn.PaneL + $edgeGap), [int]($pn.Cx - $sForm.Width - 2))
+                  } else {
+                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($pn.Cx + $pn.Cw + 2))
+                  }
+            # Bottom edge level with the control row's buttons, so the lowest side button lines up
+            # with the row instead of floating above it.
+            $sy = [int]($pn.DockY + [int]($pillH / 2) + (SW $script:vNudge) - $sForm.Height)
             $sx = [Math]::Max($r.Left + 2, [Math]::Min($sx, $r.Right - $sForm.Width - 2))
             $sy = [Math]::Max($r.Top + 2, [Math]::Min($sy, $r.Bottom - $sForm.Height - 2))
             $sVis = [bool]$pn.Anchored
