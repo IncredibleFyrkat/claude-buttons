@@ -1448,29 +1448,32 @@ $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRect
 # through to the window edges, which is the same answer.
 function Set-PaneSideRooms($panes, $wr) {
     if (-not $panes -or $panes.Count -eq 0) { return }
-    $rows = @{}
+    # Group by COLUMN, across every row. Grouping by row band handed a pane that happened to be
+    # alone in its row the entire window as its margin, so its bars flew out to the window edge
+    # while the pane directly below it - same column - got sane bounds. Columns are stable
+    # regardless of how many rows happen to be populated.
+    $cols = @()
     foreach ($p in $panes) {
         if (-not $p.Cx) { continue }
-        $band = [int]([Math]::Round($p.Cy / 100))
-        if (-not $rows.ContainsKey($band)) { $rows[$band] = @() }
-        $rows[$band] += $p
+        $hit = $null
+        foreach ($c in $cols) { if ([Math]::Abs($c.X - $p.Cx) -le 40) { $hit = $c; break } }
+        if ($hit) { $hit.Panes += $p; if ($p.Cx -lt $hit.X) { $hit.X = $p.Cx } }
+        else { $cols += , @{ X = [double]$p.Cx; W = [double]$p.Cw; Panes = @($p) } }
     }
-    foreach ($band in $rows.Keys) {
-        $row = @($rows[$band] | Sort-Object { $_.Cx })
-        for ($i = 0; $i -lt $row.Count; $i++) {
-            $p = $row[$i]
-            $left = if ($i -eq 0) { [double]$wr.Left }
-                    else { $prev = $row[$i - 1]; (($prev.Cx + $prev.Cw) + $p.Cx) / 2 }
-            $right = if ($i -eq ($row.Count - 1)) { [double]$wr.Right }
-                     else { $nx = $row[$i + 1]; (($p.Cx + $p.Cw) + $nx.Cx) / 2 }
+    $cols = @($cols | Sort-Object { $_.X })
+    for ($i = 0; $i -lt $cols.Count; $i++) {
+        $c = $cols[$i]
+        $left = if ($i -eq 0) { [double]$wr.Left }
+                else { $pv = $cols[$i - 1]; (($pv.X + $pv.W) + $c.X) / 2 }
+        $right = if ($i -eq ($cols.Count - 1)) { [double]$wr.Right }
+                 else { $nx = $cols[$i + 1]; (($c.X + $c.W) + $nx.X) / 2 }
+        foreach ($p in $c.Panes) {
             $p.PaneL = [int]$left
             $p.PaneR = [int]$right
             $p.LeftRoom = [int]($p.Cx - $left)
             $p.RightRoom = [int]($right - ($p.Cx + $p.Cw))
         }
     }
-    Write-CkLog ("MARGIN panes={0} leftRoom={1} rightRoom={2} pillH={3}" -f `
-        $panes.Count, $panes[0].LeftRoom, $panes[0].RightRoom, $pillH)
 }
 
 # Measure one chat pane: geometry, displayed chat title, bottom button row.
@@ -3222,7 +3225,7 @@ function Rebuild-Buttons {
     # buttons rather than a bar that overlaps the chat.
     for ($i = 0; $i -lt $script:sideStrips.Count; $i++) {
         $st = $script:sideStrips[$i]
-        $pIdx = [int]($i / 2)
+        $pIdx = [int][Math]::Floor($i / 2)   # [int] ROUNDS in PowerShell: [int](3/2) is 2
         if ($pIdx -ge $script:panes.Count) { if ($st.Form.Visible) { $st.Form.Hide() }; continue }
         $pn = $script:panes[$pIdx]
         $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
@@ -3515,7 +3518,9 @@ $timer.add_Tick({
         for ($si = 0; $si -lt $script:sideStrips.Count; $si++) {
             $st = $script:sideStrips[$si]
             $sForm = $st.Form
-            $pIdx = [int]($si / 2)
+            # [int] ROUNDS in PowerShell ([int](3/2) -> 2), which paired strip 3 with the wrong
+            # pane: one pane lost its right bar and its neighbour drew two on top of each other.
+            $pIdx = [int][Math]::Floor($si / 2)
             if ($pIdx -ge $script:panes.Count -or $sForm.Controls[0].Controls.Count -eq 0) {
                 if ($sForm.Visible) { $sForm.Hide() }
                 continue
@@ -3529,9 +3534,16 @@ $timer.add_Tick({
             # answer: a pane edge is not measured, it is the midpoint between neighbouring
             # composers, so the leftmost pane threw its bar out to the window edge and the
             # middle panes dropped theirs in the gap between two chats.
-            $edgeGap = S 4   # its own gap: stripGap tunes the row's distance from the mic
-            $sx = if ($st.Side -eq 'left') { [int]($pn.Cx - $edgeGap - $sForm.Width) }
-                  else { [int]($pn.Cx + $pn.Cw + $edgeGap) }
+            # Sit OUT in the margin, against the column boundary, not tucked beside the chat.
+            # The composer element ends well before the column does (~100px on a wide pane), so
+            # anchoring to the chat edge left most of the margin empty. Clamped to stay off the
+            # chat when the margin is only just wide enough for the bar.
+            $edgeGap = S 6
+            $sx = if ($st.Side -eq 'left') {
+                      [Math]::Min([int]($pn.PaneL + $edgeGap), [int]($pn.Cx - $sForm.Width - (S 4)))
+                  } else {
+                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($pn.Cx + $pn.Cw + (S 4)))
+                  }
             # Bottom edge level with the control row's buttons, so the lowest side button lines up
             # with the row instead of floating above it.
             $sy = [int]($pn.DockY + [int]($pillH / 2) + (SW $script:vNudge) - $sForm.Height)
@@ -3540,8 +3552,6 @@ $timer.add_Tick({
             $sVis = [bool]$pn.Anchored
             if ($sVis) { $sVis = Test-PaneVisible ([int]($sx + $sForm.Width / 2)) ([int]($sy + $sForm.Height - 4)) }
             if (-not $sVis) { if ($sForm.Visible) { $sForm.Hide() }; continue }
-            Write-CkLog ("SIDE i={0} pane={1} side={2} paneL={3} paneR={4} cX={5} cW={6} w={7} sx={8} sy={9} n={10}" -f `
-                $si, $pIdx, $st.Side, $pn.PaneL, $pn.PaneR, $pn.Cx, $pn.Cw, $sForm.Width, $sx, $sy, $sForm.Controls[0].Controls.Count)
             $sDesired = New-Object System.Drawing.Point($sx, $sy)
             if ($sForm.Location -ne $sDesired) { $sForm.Location = $sDesired }
             if (-not $sForm.Visible) { $sForm.Show(); Update-LayeredStrip $sForm $st.Panel }

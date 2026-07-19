@@ -608,6 +608,21 @@ Check 'an unknown bar value falls back to the row, not nowhere' ((Buttons $r.Out
 $r = Run-Smoke '{ "buttons": [ {"label":"A","text":"/a"}, {"label":"B","text":"/b"} ] }'
 Check 'no bar field = every button stays in the row (back-compat)' ((Buttons $r.Out) -eq 2)
 
+# --- Strip index -> pane index must TRUNCATE, not round ---
+# Two side strips per pane, so strip i belongs to pane i/2. PowerShell's [int] rounds half away
+# to even, so [int](3/2) is 2, not 1 - strip 3 was paired with the wrong pane, leaving one pane
+# with no right bar while its neighbour drew two in the same place. Pure integer logic, and the
+# symptom (a bar missing in SOME chats) looks nothing like an arithmetic bug, so pin it.
+$mapOk = $true
+$roundBroke = $false
+for ($i = 0; $i -lt 12; $i++) {
+    if ([int][Math]::Floor($i / 2) -ne [Math]::Truncate($i / 2)) { $mapOk = $false }
+    if ([int]($i / 2) -ne [Math]::Truncate($i / 2)) { $roundBroke = $true }
+}
+Check 'floor maps every strip index to its own pane' $mapOk
+Check '[int] does NOT (guards the fix from being reverted to it)' $roundBroke
+Check 'the source uses Floor for the strip->pane map' (((Get-Content $panel -Raw) -split "`n" | Where-Object { $_ -match '\$pIdx = ' } | Where-Object { $_ -notmatch 'Floor' }).Count -eq 0)
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
