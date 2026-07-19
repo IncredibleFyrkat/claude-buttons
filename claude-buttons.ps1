@@ -807,6 +807,8 @@ if ($null -ne $script:config.relX) { $script:relX = [double]$script:config.relX 
 $script:vNudge = [int]$script:config.vNudge   # vertical nudge in px (+ = down, - = up); 0 if unset
 $script:tipCtrl = $null    # control the hover tip is currently showing for
 $script:tipsOff = [bool]$script:config.tipsOff   # hover-tooltip off switch (grip menu; persisted)
+$script:kebabBar = 'row'                         # which bar the kebab itself lives on
+if ($script:config.kebabBar) { $script:kebabBar = [string]$script:config.kebabBar }
 
 # ---------- Language (default: English; switch in the grip menu) ----------
 $script:lang = 'en'
@@ -2245,6 +2247,29 @@ $subDa.add_Click({ Set-CkLang 'da' })
 # behaves the way every other Windows menu does.
 $miColors = New-Object System.Windows.Forms.ToolStripMenuItem 'Colours'
 [void]$gripMenu.Items.Add($miColors)
+$miKebabBar = New-Object System.Windows.Forms.ToolStripMenuItem 'Move to bar'
+[void]$gripMenu.Items.Add($miKebabBar)
+
+function Set-KebabBar([string]$bar) {
+    $ok = Update-Config {
+        param($cfg)
+        if ($bar -eq 'row') { $cfg.PSObject.Properties.Remove('kebabBar') }
+        else { $cfg | Add-Member -NotePropertyName kebabBar -NotePropertyValue $bar -Force }
+        $cfg
+    }
+    if ($ok) { $script:kebabBar = $bar; Hide-GroupFlyout; Rebuild-Buttons }
+}
+
+function Fill-KebabBarMenu {
+    $miKebabBar.DropDownItems.Clear()
+    foreach ($bar in $script:ckBars) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem (L "bar_$bar")
+        $mi.Tag = $bar
+        $mi.Checked = ($bar -eq $script:kebabBar)
+        $mi.add_Click({ Set-KebabBar ([string]$this.Tag) })
+        [void]$miKebabBar.DropDownItems.Add($mi)
+    }
+}
 $script:ckKinds = @('text', 'command', 'group', 'toggle')
 $script:miKind = @{}
 foreach ($k in $script:ckKinds) {
@@ -2347,6 +2372,8 @@ $gripMenu.add_Opening({
     $subEn.Checked = ($script:lang -eq 'en')
     $subDa.Checked = ($script:lang -eq 'da')
     $miColors.Text = L 'colours'
+    $miKebabBar.Text = L 'moveBar'
+    Fill-KebabBarMenu
     foreach ($k in $script:ckKinds) {
         $script:miKind[$k].Text = L "kind_$k"
         Fill-ColorMenu $script:miKind[$k] $k
@@ -3095,6 +3122,21 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
     $panel.SuspendLayout()
     $old = @($panel.Controls)
     $panel.Controls.Clear()
+    if ($script:kebabBar -eq $strip.Side) {
+        $sg = New-Object GripHandle
+        $sg.BackColor = $script:barColor
+        $sg.DotColor = $colIcon
+        $sg.HoverFill = $colHover
+        $sg.DownFill = $colDown
+        $sg.Width = $btnSize; $sg.Height = $btnSize
+        $sg.Margin = New-Object System.Windows.Forms.Padding(0, (S(2)), 0, (S(2)))
+        $sg.ContextMenuStrip = $gripMenu
+        $sg.add_MouseUp({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $gripMenu.Show($this, $_.Location) } })
+        $sg.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+        $sg.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+        $sg.add_Repaint({ Render-StripFor $this })
+        $panel.Controls.Add($sg)
+    }
     $vis = @(Get-VisibleButtons $paneTitle $isPrimary)
     $seenGroup = @{}
     foreach ($src in $vis) {
@@ -3212,7 +3254,7 @@ function Build-StripPanel($destPanel, $destGrip, [string]$paneTitle, [bool]$isPr
     $destPanel.SuspendLayout()
     $old = @($destPanel.Controls | Where-Object { $_ -ne $destGrip })
     $destPanel.Controls.Clear()
-    $destPanel.Controls.Add($destGrip)
+    if ($script:kebabBar -eq 'row') { $destPanel.Controls.Add($destGrip) }
     # Resolve visibility first, so buttons sharing a "group" can collapse behind ONE group
     # button that opens a flyout. The group takes the row position of its first member.
     # Only the buttons that live on THIS bar; the rest are drawn by the side strips.
@@ -3569,7 +3611,8 @@ $timer.add_Tick({
                 $form.Location = $desired
                 $script:autoMove = $false
             }
-            if (-not $form.Visible) { $form.Show(); Update-LayeredStrip $form $panel }
+            if ($panel.Controls.Count -eq 0) { if ($form.Visible) { $form.Hide() } }
+            elseif (-not $form.Visible) { $form.Show(); Update-LayeredStrip $form $panel }
         }
 
         # Side strips: in the margin beside each pane's composer, bottom aligned to the control
@@ -3663,7 +3706,8 @@ $timer.add_Tick({
             } else {
                 $mDesired = New-Object System.Drawing.Point($mx, $my)
                 if ($mForm.Location -ne $mDesired) { $mForm.Location = $mDesired }
-                if (-not $mForm.Visible) { $mForm.Show(); Update-LayeredStrip $mForm $script:mirrors[$i].Panel }
+                if ($script:mirrors[$i].Panel.Controls.Count -eq 0) { if ($mForm.Visible) { $mForm.Hide() } }
+            elseif (-not $mForm.Visible) { $mForm.Show(); Update-LayeredStrip $mForm $script:mirrors[$i].Panel }
             }
         }
 
@@ -3731,7 +3775,7 @@ $timer.add_Tick({
 $form.add_FormClosing({ Save-PanelState })
 
 if ($SmokeTest) {
-    Write-Output "SMOKE-OK v$CB_VERSION`: $($panel.Controls.Count - 1) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
+    Write-Output "SMOKE-OK v$CB_VERSION`: $(@($panel.Controls | Where-Object { $_ -is [PillButton] }).Count) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
     exit 0
 }
 
