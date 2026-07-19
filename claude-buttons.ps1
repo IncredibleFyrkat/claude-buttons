@@ -875,6 +875,7 @@ $script:strings = @{
         sendNoClipboard = 'Not sent: the clipboard was unavailable, so nothing was pasted. The message box was not changed.'
         sendMismatch = 'Not sent: the paste did not land as expected. Check the message box before sending - something else may be in it.'
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
+        sendNoPane = 'Not sent: the panel could not tell which chat this button belongs to, so it did not risk sending to the wrong one. Click the chat, then try again.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
@@ -910,6 +911,7 @@ $script:strings = @{
         sendNoClipboard = 'Ikke sendt: udklipsholderen var utilgængelig, så intet blev indsat. Beskedfeltet blev ikke ændret.'
         sendMismatch = 'Ikke sendt: indsættelsen landede ikke som forventet. Tjek beskedfeltet før du sender - der kan stå noget andet i det.'
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
+        sendNoPane = 'Ikke sendt: panelet kunne ikke afgøre hvilken chat denne knap hører til, så det undlod at sende til den forkerte. Klik på chatten, og prøv igen.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
@@ -1001,7 +1003,17 @@ function Update-Config([scriptblock]$transform) {
         $fresh = Read-FreshConfig
         if (-not $fresh) { return $false }
         $fresh = & $transform $fresh
-        if (-not $fresh) { return $false }
+        # Check the SHAPE, not just truthiness. `-not $fresh` rejects only $null/''/0, so a
+        # transform that returned a string wrote "totally not a config" straight over
+        # buttons.json and destroyed every pinned button - after which the panel falls back to
+        # defaults, so it reads to the user as a spontaneous reset rather than as a failure.
+        # A transform emitting one stray object also makes this an Object[], which serialises as
+        # a top-level JSON array that Read-FreshConfig accepts as truthy and every later write
+        # then throws on. Demand a single object that still has a buttons collection.
+        if (-not $fresh -or $fresh -is [array] -or -not $fresh.PSObject.Properties['buttons']) {
+            Write-CkLog 'Config transform returned an unusable shape - change not saved'
+            return $false
+        }
         if (Write-ConfigAtomic $fresh) { $script:config = $fresh; return $true }
         return $false
     } finally { [void]$script:cfgLock.ReleaseMutex() }
@@ -1449,16 +1461,35 @@ function Get-PillWidth([string]$label) {
     ([System.Windows.Forms.TextRenderer]::MeasureText($label, $script:btnFont)).Width + 2 * $script:padX
 }
 
-# Same formula Rebuild-Buttons uses, so the compact switch triggers precisely
+# Same formula Rebuild-Buttons uses, so the compact switch triggers precisely.
+# It must measure what Build-StripPanel actually PUTS on the row, and nothing else. It used to
+# sum every visible button regardless of bar and count each group member separately, so moving
+# buttons to a side bar or collapsing them into one group did not shrink the measurement at
+# all: the row still measured as if nothing had moved, compact mode latched on, and the labels
+# that were still on the row shrank for no reason.
 function Get-StripWidth([bool]$useShort) {
-    $total = (S 14) + 4 * (S 2) + (S 8)  # grip + panel padding + safety margin
+    $total = 4 * (S 2) + (S 8)   # panel padding + safety margin
+    if ($script:kebabBar -eq 'row') { $total += (S 14) }   # the grip, only when it is on the row
+    $seenGroup = @{}
     foreach ($b in $script:config.buttons) {
         if (-not (Test-ChatButtonVisible $b)) { continue }
-        if ($b.icon -and (Get-IconGlyph ([string]$b.icon))) {
+        if ((Get-ButtonBar $b) -ne 'row') { continue }   # drawn by a side strip, not this row
+        # A group occupies ONE face on the row, taking the position of its first member; the
+        # rest collapse behind it. Measure the group button (Get-GroupDef is what Build-
+        # StripPanel resolves its face from), then skip every later member of that group.
+        $face = $b
+        $gname = [string]$b.group
+        if ($gname) {
+            if ($seenGroup.ContainsKey($gname)) { continue }
+            $seenGroup[$gname] = $true
+            $def = Get-GroupDef $gname
+            $face = [pscustomobject]@{ label = $def.label; short = $def.short; icon = $def.icon }
+        }
+        if ($face.icon -and (Get-IconGlyph ([string]$face.icon))) {
             $total += $pillH + 2 * (S 2)   # icon buttons are circular: width = height
             continue
         }
-        $label = if ($useShort) { Get-ShortLabel $b } else { [string]$b.label }
+        $label = if ($useShort) { Get-ShortLabel $face } else { [string]$face.label }
         $total += (Get-PillWidth $label) + 2 * (S 2)
     }
     return $total
@@ -1930,6 +1961,41 @@ function Hide-GroupFlyout {
     if ($script:flyForm -and $script:flyForm.Visible) { $script:flyForm.Hide() }
     $script:flyOwner = $null
     $script:flyPinned = $false
+    # NOTE: $flyForm.Tag is deliberately NOT cleared here. A member click runs
+    # Hide-GroupFlyout BEFORE Invoke-PillClick, and the Tag is what tells that click which
+    # strip - and therefore which pane - it belongs to. Clearing it here would drop that
+    # binding on every single send. Tag is cleared only when its owner is destroyed, below.
+}
+
+# A pinned flyout outlives the strip that opened it. When the pane count shrinks the owning
+# strip form is hard-disposed (Close + Dispose in the tick), but nothing used to touch
+# $flyForm.Tag or $flyPinned: the flyout stayed on screen with Tag pointing at a dead form,
+# and clicking a member resolved to no pane at all. Tear the flyout down with its owner.
+function Clear-FlyoutForForm($frm) {
+    if (-not $frm -or -not $script:flyForm) { return }
+    $same = $false
+    try { $same = ($script:flyForm.Tag -eq $frm) } catch {}
+    if (-not $same) { return }
+    try { $script:flyForm.Tag = $null } catch {}
+    Hide-GroupFlyout
+}
+
+# The strip form a click really belongs to. A button inside the group flyout lives in the
+# flyout window, which is bound to no pane; $flyForm.Tag records the strip that opened it.
+# BOTH the pane lookup and the geometric fallback must resolve through this - the redirect
+# used to live inside Get-PaneForForm only, so on the fallback path the caller still measured
+# the FLYOUT's rectangle and guessed a composer from the wrong coordinates.
+# A missing or disposed Tag resolves to $null, so the caller fails closed rather than
+# dereferencing a dead form or guessing.
+function Resolve-StripForm($frm) {
+    if (-not $frm) { return $null }
+    if ($script:flyForm -and $frm -eq $script:flyForm) {
+        $owner = $frm.Tag
+        if (-not $owner) { return $null }
+        try { if ($owner.IsDisposed) { return $null } } catch { return $null }
+        return $owner
+    }
+    return $frm
 }
 
 # Compose the flyout the same way the strips are drawn: one ARGB bitmap pushed to a layered
@@ -2888,12 +2954,28 @@ function Get-PaneForForm($frm) {
     # A button inside the group flyout belongs to the pane of the strip that opened it - the
     # flyout is its own window and maps to no pane, which would fall back to geometric guessing
     # and send to a neighbouring chat.
-    if ($script:flyForm -and $frm -eq $script:flyForm -and $frm.Tag) { $frm = $frm.Tag }
+    $frm = Resolve-StripForm $frm
+    if (-not $frm) { return $null }
     if ($frm -eq $form) { if ($script:panes.Count -gt 0) { return $script:panes[0] }; return $null }
     for ($i = 0; $i -lt $script:mirrors.Count; $i++) {
         if ($script:mirrors[$i].Form -eq $frm) {
             $idx = $i + 1
             if ($idx -lt $script:panes.Count) { return $script:panes[$idx] }
+            return $null
+        }
+    }
+    # Side strips are their own array and are NEVER in $script:mirrors, so every left/right-bar
+    # button used to resolve to $null and fall through to the geometric guess. That guess cannot
+    # work for a side bar at all: it only accepts composers ABOVE the strip, and a side strip is
+    # anchored well above its own composer - so this pane's composer is rejected, and in a
+    # stacked layout a NEIGHBOURING pane's composer can pass instead and take the prompt.
+    # Two strips per pane, in pane order: strip si belongs to pane floor(si/2). Derived
+    # positionally, the same way Rebuild-Buttons and the tick derive it, so there is no second
+    # copy of the mapping to drift. [Math]::Floor, not [int] - [int] ROUNDS in PowerShell.
+    for ($i = 0; $i -lt $script:sideStrips.Count; $i++) {
+        if ($script:sideStrips[$i].Form -eq $frm) {
+            $sIdx = [int][Math]::Floor($i / 2)
+            if ($sIdx -lt $script:panes.Count) { return $script:panes[$sIdx] }
             return $null
         }
     }
@@ -3189,7 +3271,13 @@ function Get-ToggleState($item) {
 # before the actual send so an aborted click never flips state (H7 - no residual desync window).
 function Set-ToggleFace($item, [bool]$on) {
     $script:toggleState[(Get-ButtonKey $item)] = $on
-    foreach ($pnl in (@($panel) + @($script:mirrors | ForEach-Object { $_.Panel }))) {
+    # "Every clone across all strips" must actually mean every strip: side bars and the open
+    # flyout carry clones too, and a toggle clicked there did not repaint until the per-second
+    # stateGlob sweep happened to catch it (and never, for a toggle with no stateGlob).
+    # Same set the tick's hover sweep walks, so the two stay in step.
+    $sweep = @($panel) + @($script:mirrors | ForEach-Object { $_.Panel }) + @($script:sideStrips | ForEach-Object { $_.Panel })
+    if ($script:flyForm -and $script:flyForm.Visible) { $sweep += $script:flyForm }
+    foreach ($pnl in $sweep) {
         foreach ($c in $pnl.Controls) {
             if ($c -is [PillButton] -and $c.Tag -and (Same-Button $c.Tag $item)) {
                 $c.Toggled = $on
@@ -3247,7 +3335,11 @@ function Invoke-PillClick($btn) {
             # composer: a foreground check alone is not enough, because when Claude is already
             # foreground with another chat focused it passes instantly and the first characters
             # go to the wrong chat. Abort if focus never lands rather than type into the wrong box.
-            $sf = $btn.FindForm()
+            # Resolve through the flyout redirect: a member button's own FindForm() is the
+            # flyout window, which is bound to no pane and sits at coordinates that describe
+            # no strip. $sf is used for the geometric fallback below, so it has to be the
+            # owning STRIP, not the flyout.
+            $sf = Resolve-StripForm $btn.FindForm()
             # Target the composer this strip is BOUND to. Geometric re-discovery is only a
             # fallback for a dead element - picking by nearest-rect can select the neighbouring
             # pane's composer in a tight grid and send the text to the wrong chat.
@@ -3257,9 +3349,28 @@ function Invoke-PillClick($btn) {
                 try { $pane.Composer.SetFocus(); $composerEl = $pane.Composer }
                 catch { $composerEl = $null }   # element died (pane closed/re-mounted)
             }
-            if (-not $composerEl -and $sf) {
-                Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
-                $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
+            if (-not $composerEl) {
+                # The geometric fallback models ONE shape: a horizontal row strip docked just
+                # below its own composer. It scores composers that sit ABOVE the strip. A
+                # vertical side strip is anchored well above its composer, so that filter
+                # rejects this pane's own composer and can instead match a NEIGHBOURING pane's
+                # - i.e. the prompt would go to the wrong chat. Never guess from a side strip:
+                # if its bound composer is gone, abandon the send and say so.
+                $canGuess = $false
+                if ($sf) {
+                    $canGuess = ($sf -eq $form)
+                    if (-not $canGuess) {
+                        foreach ($m in $script:mirrors) { if ($m.Form -eq $sf) { $canGuess = $true; break } }
+                    }
+                }
+                if ($canGuess) {
+                    Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
+                    $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
+                } else {
+                    Write-CkLog 'Send abandoned: no composer bound to this strip and geometry cannot identify one safely'
+                    Show-SendWarning (L 'sendNoPane')
+                    return
+                }
             }
             if (-not (Wait-ComposerFocus $composerEl)) {
                 Write-CkLog 'Send aborted: focus never landed in this pane composer'
@@ -3826,6 +3937,7 @@ $timer.add_Tick({
         while ($script:mirrors.Count -gt $wantMirrors) {
             $m = $script:mirrors[$script:mirrors.Count - 1]
             $script:mirrors = @($script:mirrors | Select-Object -First ($script:mirrors.Count - 1))
+            Clear-FlyoutForForm $m.Form   # a pinned flyout must not outlive the strip that owns it
             try { $m.Form.Close(); $m.Form.Dispose() } catch {}
             $dirty = $true
         }
@@ -3839,6 +3951,7 @@ $timer.add_Tick({
         while ($script:sideStrips.Count -gt $wantSides) {
             $sx = $script:sideStrips[$script:sideStrips.Count - 1]
             $script:sideStrips = @($script:sideStrips | Select-Object -First ($script:sideStrips.Count - 1))
+            Clear-FlyoutForForm $sx.Form   # same for a flyout opened from a side bar
             try { $sx.Form.Close(); $sx.Form.Dispose() } catch {}
             $dirty = $true
         }

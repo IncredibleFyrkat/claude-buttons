@@ -360,7 +360,10 @@ Check 'a payload of only newlines is refused, not confirmed by collapsing' `
 $stringsOk = $true
 foreach ($lang in @('en', 'da')) {
     $block = [regex]::Match($srcText, "(?s)\b$lang\s*=\s*@\{(.*?)\r?\n\s*\}").Groups[1].Value
-    foreach ($k in @('sendMismatch', 'sendUnverified')) {
+    # sendNoPane joined these when the wrong-chat hazard was fixed: it is the string the user
+    # sees when a side-bar send is abandoned because no composer could be identified safely.
+    # Without it in this list the feature ships with a blank tooltip in one or both languages.
+    foreach ($k in @('sendMismatch', 'sendUnverified', 'sendNoPane')) {
         if ($block -notmatch "$k\s*=\s*'[^']{10,}'") { $stringsOk = $false }
     }
 }
@@ -612,50 +615,187 @@ foreach ($s in @('pin', 'unpin')) {
     Check "the /$s skill uses the locked CLI entry point" ($sk -match '-(Add|Remove)Button')
     Check "the /$s skill is told not to write buttons.json itself" ($sk -match '(?i)do NOT (read, edit or )?write buttons\.json')
 }
-# --- Ordering: groups move as ONE block ---
-# Left/right used to swap two adjacent array entries. Once a group could span several entries
-# that was wrong twice over: moving a group dragged a single member out of it, and moving a
-# plain button past a group landed it in the group's middle. Both silently lose a button from
-# the bar, so the block algebra is checked directly.
+# =====================================================================================
+# --- The REAL ordering / bar / group transforms, loaded out of the panel source ---
+# =====================================================================================
+# THIS BLOCK EXISTS BECAUSE THE TESTS BELOW USED TO RE-IMPLEMENT THE PRODUCT. The file
+# defined its own Swap-Blocks / Reorder-InBar / Move-ToBar / Dissolve / Same-Button /
+# Get-ButtonBar - hand-copies of the bodies of Move-PinButton, Set-ButtonBar and the
+# dissolve handler. Reference counts against the real source were: Move-PinButton 0,
+# Set-ButtonBar 0, Move-GroupMember 0, Update-Config 0. Consequently twelve of sixteen
+# mutations to the shipped code left the suite fully green, including:
+#   - Move-PinButton reduced to `$out += $blk.items[0]`, which loses every group member
+#     but the first - missed by the test literally named "never loses a button";
+#   - the move direction reversed ($bi + $dir -> $bi - $dir);
+#   - the out-of-range guard turned from a no-op into a clamp - missed by the test named
+#     "an out-of-range move is a no-op rather than a truncation";
+#   - an early `return` making Set-ButtonBar, Move-PinButton and Move-GroupMember
+#     unconditional no-ops: three whole features dead, 119 green;
+#   - the orphan-group prune gutted;
+#   - dissolve additionally stripping `bar`, scattering the members.
+# Every one of those is now caught, because the tests call the shipped functions.
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($panel, [ref]$null, [ref]$null)
-foreach ($fn in @('Get-ButtonBlocks')) {
+
+# Stubs for the GUI/logging edges the transforms touch. NOT stubs for any transform: the
+# rule is that nothing which decides the SHAPE of the buttons array may be re-implemented
+# here. Update-Buttons and Update-Config are loaded for real (they carry the orphan-group
+# prune and the null-transform guard), and so are Read-FreshConfig / Write-ConfigAtomic, so
+# every assertion below is made against what actually landed on disk.
+function Write-CkLog([string]$m) { $script:ckLog += , $m }
+function Hide-GroupFlyout { $script:rebuilt++ }
+function Rebuild-Buttons { $script:rebuilt++ }
+$script:ckLog = @(); $script:rebuilt = 0; $script:flyForm = $null; $script:menuSource = $null
+# A test-private mutex name. Taking the panel's real 'Local\ClaudeButtonsConfig' here would
+# contend with the user's running panel for no benefit - the lock's own behaviour is covered
+# by the concurrent-writer test above.
+$script:cfgLock = New-Object System.Threading.Mutex($false, "Local\CbTests-$PID")
+
+# Load, and FAIL LOUDLY if a name has moved. A silent `if ($node)` skip is how a test file
+# ends up asserting nothing: rename the function and every test below would pass vacuously
+# against whatever definition happened to be left over.
+$panelFns = @('Get-ButtonBlocks', 'Get-ButtonBar', 'Same-Button', 'Get-ColorKind', 'Get-KindColor',
+              'Read-FreshConfig', 'Write-ConfigAtomic', 'Update-Buttons', 'Update-Config',
+              'Set-ButtonBar', 'Set-ButtonGroup', 'Set-KindColor', 'Move-GroupMember', 'Move-PinButton')
+$missingFns = @()
+foreach ($fn in $panelFns) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
-    if ($node) { Invoke-Expression $node.Extent.Text }
+    if ($node) { Invoke-Expression $node.Extent.Text } else { $missingFns += $fn }
 }
-function Same-Button($a, $b) { ($a.label -eq $b.label) -and ($a.text -eq $b.text) -and ([string]$a.chat -eq [string]$b.chat) }
+Check ("every transform under test was found in the panel source" + $(if ($missingFns) { ": MISSING $($missingFns -join ', ')" } else { '' })) `
+    ($missingFns.Count -eq 0)
+# Script-scope tables the loaded functions read. Extracted, not retyped: $script:ckBars is
+# what Get-ButtonBar validates against and $script:ckPalette is the colour table, so copying
+# either here would reintroduce exactly the "fixture asserts the fixture" defect.
+Add-Type -AssemblyName System.Drawing   # $script:ckPalette is a table of [System.Drawing.Color]
+$missingVars = @()
+foreach ($vn in @('$script:ckBars', '$script:ckPalette')) {
+    $asn = $ast.Find({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $vn }, $true)
+    if ($asn) { Invoke-Expression $asn.Extent.Text } else { $missingVars += $vn }
+}
+Check ("the bar list and colour palette were extracted from source" + $(if ($missingVars) { ": MISSING $($missingVars -join ', ')" } else { '' })) `
+    ($missingVars.Count -eq 0)
+# The dissolve action is a click handler, not a function, so it is extracted as the
+# scriptblock argument of $miDissolve.add_Click({...}) and invoked as-is.
+$dissolveNode = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+    $n.Expression.Extent.Text -eq '$miDissolve' -and $n.Member.Extent.Text -eq 'add_Click' }, $true)
+Check 'the dissolve click handler was located in the source' ($null -ne $dissolveNode -and $dissolveNode.Arguments.Count -eq 1)
+$dissolveAction = if ($dissolveNode) { [scriptblock]::Create($dissolveNode.Arguments[0].ScriptBlock.EndBlock.Extent.Text) } else { $null }
 
-function Swap-Blocks($btns, $key, [int]$dir) {
-    $blocks = @(Get-ButtonBlocks $btns)
-    $bi = -1
-    for ($i = 0; $i -lt $blocks.Count; $i++) {
-        if ($blocks[$i].key -eq $key) { $bi = $i; break }
-        if (-not $key -and -not $blocks[$i].key) { }
+# Drive a real transform against a throwaway buttons.json and return the config AS WRITTEN
+# TO DISK. Reading back the file rather than the in-memory return value is deliberate: a
+# transform that corrupts what gets persisted is the damaging failure, and the previous
+# fixtures could not see the file at all.
+# LOCALAPPDATA/USERPROFILE are redirected like every other harness here - tests once appended
+# to the developer's real log and once overwrote their install marker.
+function Invoke-PanelEdit {
+    param([string]$Json, $Target, [scriptblock]$Action)
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("cb-tf-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $prevLocal = $env:LOCALAPPDATA; $prevHome = $env:USERPROFILE
+    $script:configPath = Join-Path $dir 'buttons.json'
+    [IO.File]::WriteAllText($script:configPath, $Json, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        $env:LOCALAPPDATA = $dir; $env:USERPROFILE = $dir
+        $script:config = Read-FreshConfig
+        $script:menuSource = [pscustomobject]@{ Tag = $Target }
+        $script:rebuilt = 0
+        $ret = & $Action
+        $raw = Get-Content $script:configPath -Raw
+        [pscustomobject]@{ Cfg = ($raw | ConvertFrom-Json); Raw = $raw; Ret = $ret; Rebuilt = $script:rebuilt }
+    } finally {
+        $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome
+        $script:menuSource = $null
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    $nb = $bi + $dir
-    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
-    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
-    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
-    $out
 }
+function Labels($cfg) { (@($cfg.buttons) | ForEach-Object { $_.label }) -join ',' }
+# The standard four-button fixture: a plain button, a two-member group, a plain button.
+$fixJson = '{"schemaVersion":1,"buttons":[
+    {"label":"A","text":"/a"},
+    {"label":"G1","text":"/g1","group":"grp"},
+    {"label":"G2","text":"/g2","group":"grp"},
+    {"label":"B","text":"/b"}],"groups":{"grp":{"icon":"note"}}}'
+$grpTarget = [pscustomobject]@{ __isGroup = $true; group = 'grp'; label = 'grp' }
 
-$cfg = @(
-    [pscustomobject]@{ label = 'A'; text = '/a' },
-    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' },
-    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'grp' },
-    [pscustomobject]@{ label = 'B'; text = '/b' }
-)
-$blocks = @(Get-ButtonBlocks $cfg)
+# --- Get-ButtonBlocks: a group is ONE block ---
+$cfgObj = (($fixJson | ConvertFrom-Json).buttons)
+$blocks = @(Get-ButtonBlocks $cfgObj)
 Check 'a group collapses to one block (A, grp, B)' ($blocks.Count -eq 3 -and $blocks[1].key -eq 'g:grp' -and $blocks[1].items.Count -eq 2)
 
-$moved = @(Swap-Blocks $cfg 'g:grp' -1)
-Check 'moving a group left keeps its members together' ((($moved | ForEach-Object { $_.label }) -join ',') -eq 'G1,G2,A,B')
-Check 'moving a group never loses a button' ($moved.Count -eq $cfg.Count)
+# --- Ordering: groups move as ONE block, through the REAL Move-PinButton ---
+# Left/right used to swap two adjacent array entries. Once a group could span several entries
+# that was wrong twice over: moving a group dragged a single member out of it, and moving a
+# plain button past a group landed it in the group's middle. Both silently lose a button.
+$r = Invoke-PanelEdit $fixJson $grpTarget { Move-PinButton -1 }
+Check 'moving a group left keeps its members together' ((Labels $r.Cfg) -eq 'G1,G2,A,B')
+# Catches: Move-PinButton emitting only $blk.items[0], which drops every member but the first.
+Check 'moving a group never loses a button' (@($r.Cfg.buttons).Count -eq 4)
+# Catches: an injected early `return` making the whole feature a silent no-op. Move-PinButton
+# returns nothing, so the observable proof of a real write is that it rebuilt the strips AND
+# that the order on disk differs from the order that was seeded.
+Check 'moving a group actually writes the new order to disk' `
+    (($r.Rebuilt -gt 0) -and ((Labels $r.Cfg) -ne 'A,G1,G2,B'))
 
-$moved2 = @(Swap-Blocks $cfg 'g:grp' 1)
-Check 'moving a group right jumps the whole block past B' ((($moved2 | ForEach-Object { $_.label }) -join ',') -eq 'A,B,G1,G2')
+$r = Invoke-PanelEdit $fixJson $grpTarget { Move-PinButton 1 }
+# Catches: the direction reversed ($bi + $dir -> $bi - $dir). Left and right must differ.
+Check 'moving a group right jumps the whole block past B' ((Labels $r.Cfg) -eq 'A,B,G1,G2')
 
-$edge = @(Swap-Blocks $cfg 'g:grp' -99)
-Check 'an out-of-range move is a no-op, not a truncation' ($edge.Count -eq $cfg.Count)
+# Catches: the out-of-range guard changed from a no-op into a clamp, which truncates the bar.
+$r = Invoke-PanelEdit $fixJson $grpTarget { Move-PinButton -99 }
+Check 'an out-of-range move is a no-op, not a truncation' `
+    ((@($r.Cfg.buttons).Count -eq 4) -and ((Labels $r.Cfg) -eq 'A,G1,G2,B'))
+$r = Invoke-PanelEdit $fixJson $grpTarget { Move-PinButton 99 }
+Check 'an out-of-range move the other way is a no-op too' ((Labels $r.Cfg) -eq 'A,G1,G2,B')
+
+# A plain button is identified by VALUE, a group by name - two different branches of the
+# block search, so the plain-button path needs its own case.
+$plain = [pscustomobject]@{ label = 'B'; text = '/b' }
+$r = Invoke-PanelEdit $fixJson $plain { Move-PinButton -1 }
+Check 'a plain button moved left jumps the whole group, not into it' ((Labels $r.Cfg) -eq 'A,B,G1,G2')
+
+# --- Move-GroupMember: reordering INSIDE a group ---
+# Same gesture, different neighbours. Nothing referenced this function at all, so an early
+# `return` killed reordering within every flyout with a green suite.
+$mem = [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' }
+$r = Invoke-PanelEdit $fixJson $mem { Move-GroupMember $script:menuSource.Tag 1 }
+Check 'a group member moves down within its group' ((Labels $r.Cfg) -eq 'A,G2,G1,B')
+Check 'reordering within a group is persisted (not a no-op)' ($r.Ret -eq $true)
+Check 'reordering within a group loses nobody' (@($r.Cfg.buttons).Count -eq 4)
+$r = Invoke-PanelEdit $fixJson $mem { Move-GroupMember $script:menuSource.Tag -1 }
+Check 'the first member of a group cannot move further up' ((Labels $r.Cfg) -eq 'A,G1,G2,B')
+# Members must move among THEMSELVES, never past the ungrouped neighbours.
+$r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'grp' }) { Move-GroupMember $script:menuSource.Tag 1 }
+Check 'the last member of a group does not swap with the button after it' ((Labels $r.Cfg) -eq 'A,G1,G2,B')
+
+# --- Same-Button identity is CASE-SENSITIVE ---
+# The old fixture here re-implemented Same-Button with -eq. The shipped function uses -ceq
+# DELIBERATELY: -eq once matched "Deploy"/"/deploy prod" against a genuinely different button
+# "deploy"/"/DEPLOY PROD" and deleted the wrong one, with no backup and no undo. So the
+# fixture asserted the exact OPPOSITE of shipped behaviour and would have gone green on the
+# revert. These call the real function.
+# NOTE: PowerShell variable names are themselves case-INSENSITIVE, so $bDeploy and $bdeploy
+# are ONE variable - the first draft of these checks compared a button with itself and the
+# case tests passed for the wrong reason. Hence the deliberately distinct names.
+$upperB = [pscustomobject]@{ label = 'Deploy'; text = '/deploy prod' }
+$lowerB = [pscustomobject]@{ label = 'deploy'; text = '/DEPLOY PROD' }
+Check 'Same-Button matches a button with itself' (Same-Button $upperB $upperB)
+Check 'Same-Button does NOT match on label case alone (-ceq, not -eq)' (-not (Same-Button $upperB $lowerB))
+Check 'Same-Button does not match on text case alone' `
+    (-not (Same-Button $upperB ([pscustomobject]@{ label = 'Deploy'; text = '/DEPLOY PROD' })))
+Check 'Same-Button does not match on label case alone with identical text' `
+    (-not (Same-Button $upperB ([pscustomobject]@{ label = 'deploy'; text = '/deploy prod' })))
+# chat scoping is part of identity: the same label+text pinned to two chats is two buttons.
+Check 'Same-Button separates two chat-scoped buttons that differ only by chat' `
+    (-not (Same-Button ([pscustomobject]@{ label = 'C'; text = '/c'; chat = 'one' }) ([pscustomobject]@{ label = 'C'; text = '/c'; chat = 'two' })))
+Check 'Same-Button treats chat case-sensitively too' `
+    (-not (Same-Button ([pscustomobject]@{ label = 'C'; text = '/c'; chat = 'Sess' }) ([pscustomobject]@{ label = 'C'; text = '/c'; chat = 'sess' })))
+# And end-to-end through a transform that DELETES: a wrong-case target must change nothing.
+$casedJson = '{"buttons":[{"label":"Deploy","text":"/deploy prod"},{"label":"deploy","text":"/DEPLOY PROD"}]}'
+$r = Invoke-PanelEdit $casedJson ([pscustomobject]@{ label = 'deploy'; text = '/DEPLOY PROD' }) { Set-ButtonBar $script:menuSource.Tag 'left' }
+Check 'a case-differing sibling is NOT dragged along by a bar move' `
+    ((@($r.Cfg.buttons | Where-Object { $_.bar -eq 'left' }).Count) -eq 1 -and (@($r.Cfg.buttons | Where-Object { $_.label -ceq 'deploy' })[0].bar -eq 'left'))
 
 # --- Bars: a button assigned to a side must LEAVE the control row ---
 # The row strip and the side strips share one visibility filter. If the row stopped filtering on
@@ -677,48 +817,91 @@ Check 'no bar field = every button stays in the row (back-compat)' ((Buttons $r.
 # to even, so [int](3/2) is 2, not 1 - strip 3 was paired with the wrong pane, leaving one pane
 # with no right bar while its neighbour drew two in the same place. Pure integer logic, and the
 # symptom (a bar missing in SOME chats) looks nothing like an arithmetic bug, so pin it.
-$mapOk = $true
-$roundBroke = $false
-for ($i = 0; $i -lt 12; $i++) {
-    if ([int][Math]::Floor($i / 2) -ne [Math]::Truncate($i / 2)) { $mapOk = $false }
-    if ([int]($i / 2) -ne [Math]::Truncate($i / 2)) { $roundBroke = $true }
+#
+# DELETED HERE: two loops that compared [Math]::Floor against [Math]::Truncate and [int]
+# against [Math]::Truncate. They never referenced the panel in any way - they asserted that
+# .NET is .NET, and would have stayed green with the whole side-strip feature deleted.
+#
+# ALSO DELETED: `the source uses Floor for the strip->pane map`, which selected lines matching
+# the literal '$pIdx = ' and required none of them to lack Floor. Rename the variable and ZERO
+# lines are selected, so the check passed VACUOUSLY - verified by reintroducing the rounding
+# bug together with a rename, which left the whole suite green.
+#
+# The map is computed inside a GUI tick that needs live Claude panes, so it cannot be called
+# from here. Instead the index sites are DISCOVERED from the AST - every place the code indexes
+# $script:panes - and the expression that produced each index is pulled out of the source and
+# EVALUATED. A rename cannot hide from this, because the name is read off the indexing site
+# rather than written down here; and zero sites is a FAILURE, not a pass.
+$paneIdxUses = @($ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.IndexExpressionAst] -and
+    $n.Target.Extent.Text -eq '$script:panes' }, $true))
+Check "the strip->pane index sites were found in the source (found $($paneIdxUses.Count))" ($paneIdxUses.Count -ge 1)
+# $script:panes is indexed by several unrelated loops too. The strip->pane map is the subset
+# whose index variable is computed by halving something - that is the arithmetic under test,
+# and it is identified by its SHAPE, so renaming the variable cannot hide it.
+$idxVarNames = @($paneIdxUses | ForEach-Object { $_.Index.Extent.Text } |
+                 Where-Object { $_ -match '^\$[A-Za-z_]\w*$' } | Sort-Object -Unique)
+$mapExprs = @()
+foreach ($vn in $idxVarNames) {
+    $mapExprs += @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq $vn -and $n.Right.Extent.Text -match '/\s*2\b' }, $true) |
+        ForEach-Object { $_.Right.Extent.Text })
 }
-Check 'floor maps every strip index to its own pane' $mapOk
-Check '[int] does NOT (guards the fix from being reverted to it)' $roundBroke
-Check 'the source uses Floor for the strip->pane map' (((Get-Content $panel -Raw) -split "`n" | Where-Object { $_ -match '\$pIdx = ' } | Where-Object { $_ -notmatch 'Floor' }).Count -eq 0)
+$mapExprs = @($mapExprs | Sort-Object -Unique)
+# Two side strips per pane means there must be at least one such halving. Zero is a FAILURE -
+# the whole point of replacing the old grep is that an empty selection can no longer pass.
+Check "the strip->pane halving expressions were found (found $($mapExprs.Count): $($mapExprs -join ' ; '))" `
+    ($mapExprs.Count -ge 1)
+# Evaluate the SHIPPED expression for strips 0..11. Two side strips per pane, so strip i must
+# map to pane i\2 - truncating. [int](3/2) is 2 in PowerShell (round-half-to-even), which
+# paired strip 3 with the wrong pane: one pane got no right bar while its neighbour drew two.
+$mapBad = @()
+foreach ($ex in $mapExprs) {
+    # Normalise whichever loop variable this site uses ($i, $si, ...) to one we control.
+    # '$$' escapes to a literal '$' in a .NET replacement - a bare '$_' means "the whole input"
+    # and spliced the entire expression back into itself.
+    $probe = [regex]::Replace($ex, '\$[A-Za-z_]\w*', '$$__k')
+    for ($k = 0; $k -lt 12; $k++) {
+        $__k = $k
+        $got = & ([scriptblock]::Create($probe))
+        if ($got -ne [Math]::Truncate($k / 2)) { $mapBad += "$ex : i=$k gave $got, want $([Math]::Truncate($k / 2))" }
+    }
+}
+Check ("the shipped strip->pane expression truncates for every strip 0..11" + $(if ($mapBad) { ": $($mapBad[0])" } else { '' })) `
+    ($mapBad.Count -eq 0)
 
 # --- Reordering is per-bar ---
 # The bars share one array. Ordering across the whole of it would let a move on the row
 # reshuffle the side bars, or land a row button in the middle of a side bar's run.
-function Get-ButtonBar($b) { $v = [string]$b.bar; if (@('row','left','right') -contains $v) { $v } else { 'row' } }
-function Reorder-InBar($btns, $t, [int]$dir) {
-    $btns = @($btns)
-    $bar = Get-ButtonBar $t
-    $idxs = @()
-    for ($i = 0; $i -lt $btns.Count; $i++) { if ((Get-ButtonBar $btns[$i]) -eq $bar) { $idxs += $i } }
-    $blocks = @(Get-ButtonBlocks @($idxs | ForEach-Object { $btns[$_] }))
-    $bi = -1
-    for ($i = 0; $i -lt $blocks.Count; $i++) { if (Same-Button $blocks[$i].items[0] $t) { $bi = $i; break } }
-    $nb = $bi + $dir
-    if ($bi -lt 0 -or $nb -lt 0 -or $nb -ge $blocks.Count) { return $btns }
-    $tmp = $blocks[$bi]; $blocks[$bi] = $blocks[$nb]; $blocks[$nb] = $tmp
-    $out = @(); foreach ($blk in $blocks) { $out += $blk.items }
-    for ($k = 0; $k -lt $idxs.Count; $k++) { $btns[$idxs[$k]] = $out[$k] }
-    $btns
-}
-$mix = @(
-    [pscustomobject]@{ label = 'R1'; text = '/r1' },
-    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
-    [pscustomobject]@{ label = 'R2'; text = '/r2' },
-    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' }
-)
-$m = @(Reorder-InBar $mix $mix[1] 1)
-Check 'moving a left-bar button reorders only the left bar' ((($m | ForEach-Object { $_.label }) -join ',') -eq 'R1,L2,R2,L1')
-Check 'the row buttons keep their own positions' ((($m | Where-Object { -not $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'R1,R2')
-$m2 = @(Reorder-InBar $mix $mix[0] 1)
-Check 'moving a row button does not disturb the side bar' ((($m2 | Where-Object { $_.bar } | ForEach-Object { $_.label }) -join ',') -eq 'L1,L2')
-$m3 = @(Reorder-InBar $mix $mix[1] -1)
-Check 'the first button on a bar cannot move further down' ((($m3 | ForEach-Object { $_.label }) -join ',') -eq 'R1,L1,R2,L2')
+# These used to run against a local Reorder-InBar / Get-ButtonBar copied out of the source.
+# They now drive the real Move-PinButton, so the per-bar restriction is genuinely covered.
+$mixJson = '{"buttons":[
+    {"label":"R1","text":"/r1"},
+    {"label":"L1","text":"/l1","bar":"left"},
+    {"label":"R2","text":"/r2"},
+    {"label":"L2","text":"/l2","bar":"left"}]}'
+$tL1 = [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' }
+$tR1 = [pscustomobject]@{ label = 'R1'; text = '/r1' }
+$r = Invoke-PanelEdit $mixJson $tL1 { Move-PinButton 1 }
+Check 'moving a left-bar button reorders only the left bar' ((Labels $r.Cfg) -eq 'R1,L2,R2,L1')
+Check 'the row buttons keep their own positions' `
+    (((@($r.Cfg.buttons | Where-Object { -not $_.bar }) | ForEach-Object { $_.label }) -join ',') -eq 'R1,R2')
+$r = Invoke-PanelEdit $mixJson $tR1 { Move-PinButton 1 }
+Check 'moving a row button does not disturb the side bar' `
+    (((@($r.Cfg.buttons | Where-Object { $_.bar }) | ForEach-Object { $_.label }) -join ',') -eq 'L1,L2')
+Check 'moving a row button does move it' ((Labels $r.Cfg) -eq 'R2,L1,R1,L2')
+$r = Invoke-PanelEdit $mixJson $tL1 { Move-PinButton -1 }
+Check 'the first button on a bar cannot move further down' ((Labels $r.Cfg) -eq 'R1,L1,R2,L2')
+# Get-ButtonBar itself, called directly: an unknown value must fall back to the row rather
+# than to nothing, or the button renders on no bar at all and looks deleted.
+Check 'Get-ButtonBar accepts the three real bars' `
+    (((Get-ButtonBar ([pscustomobject]@{ bar = 'left' })) -eq 'left') -and
+     ((Get-ButtonBar ([pscustomobject]@{ bar = 'right' })) -eq 'right') -and
+     ((Get-ButtonBar ([pscustomobject]@{ bar = 'row' })) -eq 'row'))
+Check 'Get-ButtonBar falls back to row for an unset or nonsense bar' `
+    (((Get-ButtonBar ([pscustomobject]@{ label = 'x' })) -eq 'row') -and
+     ((Get-ButtonBar ([pscustomobject]@{ bar = 'nonsense' })) -eq 'row'))
 
 # --- An empty group definition must not survive ---
 # Groups live in config.groups, keyed by name, but a group exists only through its members.
@@ -736,55 +919,372 @@ Check 'a group WITH a member collapses its member behind one face' ((Buttons $r.
 # Setting the bar field alone left the button wherever it already sat in the array. Bars render
 # in array order, so a button moved to a side bar arrived at the BOTTOM and shoved everything
 # already there upward, reading as an insert rather than an addition.
-function Move-ToBar($btns, $t, [string]$bar) {
-    $btns = @($btns); $moving = @(); $rest = @()
-    foreach ($b in $btns) {
-        if (Same-Button $b $t) {
-            if ($bar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
-            else { $b | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
-            $moving += $b
-        } else { $rest += $b }
-    }
-    $insertAt = -1
-    for ($i = 0; $i -lt $rest.Count; $i++) { if ((Get-ButtonBar $rest[$i]) -eq $bar) { $insertAt = $i } }
-    if ($insertAt -lt 0) { return @($rest) + @($moving) }
-    $out = @()
-    for ($i = 0; $i -lt $rest.Count; $i++) { $out += $rest[$i]; if ($i -eq $insertAt) { $out += $moving } }
-    $out
-}
-$cfg2 = @(
-    [pscustomobject]@{ label = 'X'; text = '/x' },
-    [pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' },
-    [pscustomobject]@{ label = 'L2'; text = '/l2'; bar = 'left' },
-    [pscustomobject]@{ label = 'Y'; text = '/y' }
-)
-$moved = @(Move-ToBar $cfg2 $cfg2[0] 'left')
-$onLeft = @($moved | Where-Object { $_.bar -eq 'left' } | ForEach-Object { $_.label })
+# Through the real Set-ButtonBar. The local Move-ToBar this replaces was a hand-copy that
+# omitted both of Set-ButtonBar's group rules, so neither was covered at all - and an early
+# `return` injected into Set-ButtonBar killed the whole feature with a green suite.
+$barJson = '{"buttons":[
+    {"label":"X","text":"/x"},
+    {"label":"L1","text":"/l1","bar":"left"},
+    {"label":"L2","text":"/l2","bar":"left"},
+    {"label":"Y","text":"/y"}]}'
+$tX = [pscustomobject]@{ label = 'X'; text = '/x' }
+$tY = [pscustomobject]@{ label = 'Y'; text = '/y' }
+$r = Invoke-PanelEdit $barJson $tX { Set-ButtonBar $script:menuSource.Tag 'left' }
+$onLeft = @($r.Cfg.buttons | Where-Object { $_.bar -eq 'left' } | ForEach-Object { $_.label })
 Check 'a button moved to a side bar lands last, not first' (($onLeft -join ',') -eq 'L1,L2,X')
-Check 'nothing is lost in the move' ($moved.Count -eq 4)
-$first = @(Move-ToBar $cfg2 $cfg2[3] 'right')
-Check 'the first button on an empty bar still lands there' ((@($first | Where-Object { $_.bar -eq 'right' }).Count) -eq 1)
+Check 'nothing is lost in the move' (@($r.Cfg.buttons).Count -eq 4)
+# Catches an injected early `return`: the move must reach disk, not just return quietly.
+Check 'the bar move is persisted to disk' ($r.Rebuilt -gt 0 -and (Labels $r.Cfg) -eq 'L1,L2,X,Y')
+$r = Invoke-PanelEdit $barJson $tY { Set-ButtonBar $script:menuSource.Tag 'right' }
+Check 'the first button on an empty bar still lands there' `
+    ((@($r.Cfg.buttons | Where-Object { $_.bar -eq 'right' }).Count) -eq 1)
+# Moving back to the row must REMOVE the field, not set it to the string 'row' - Get-ButtonBar
+# would still work, but the config grows a knob the user never chose.
+$r = Invoke-PanelEdit $barJson ([pscustomobject]@{ label = 'L1'; text = '/l1'; bar = 'left' }) { Set-ButtonBar $script:menuSource.Tag 'row' }
+Check 'moving back to the row drops the bar field entirely' `
+    ((@($r.Cfg.buttons | Where-Object { $_.label -ceq 'L1' })[0].PSObject.Properties['bar']) -eq $null)
+# A move that matches nothing must be a no-op, never an empty bar array.
+$r = Invoke-PanelEdit $barJson ([pscustomobject]@{ label = 'Ghost'; text = '/ghost' }) { Set-ButtonBar $script:menuSource.Tag 'right' }
+Check 'a bar move that matches no button changes nothing' ((Labels $r.Cfg) -eq 'X,L1,L2,Y')
+
+# Group rules on Set-ButtonBar - neither was covered by the hand-copy, which had no notion
+# of groups at all.
+# (a) Moving a GROUP takes every member, or the group splits across two bars.
+$r = Invoke-PanelEdit $fixJson $grpTarget { Set-ButtonBar $script:menuSource.Tag 'right' }
+Check 'moving a group to a bar takes ALL its members' `
+    ((@($r.Cfg.buttons | Where-Object { $_.bar -eq 'right' }).Count) -eq 2)
+Check 'the moved group members keep their group' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'grp' }).Count) -eq 2)
+# (b) Moving ONE member out of a group takes it OUT of the group. Keeping the field would
+# collapse it straight back behind the group face on the new bar, so the move would look
+# like it silently did nothing.
+$r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' }) { Set-ButtonBar $script:menuSource.Tag 'left' }
+$g1 = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'G1' })[0]
+Check 'a single member moved to a bar leaves its group' ($g1.bar -eq 'left' -and -not $g1.group)
+Check 'the other member stays behind, still grouped' `
+    (((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'grp' }) | ForEach-Object { $_.label }) -join ',') -eq 'G2')
 
 # --- Dissolving a group leaves its members where they were ---
 # Members already carry the group's bar and already occupy the group face's slot in the array,
 # so dropping the group field must be enough. If it were not, dissolving would scatter the
 # buttons back to the control row.
-function Dissolve($btns, [string]$g) {
-    $btns = @($btns)
-    foreach ($b in $btns) { if ([string]$b.group -eq $g) { $b.PSObject.Properties.Remove('group') } }
-    $btns
-}
-$grp = @(
-    [pscustomobject]@{ label = 'A'; text = '/a' },
-    [pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'g'; bar = 'right' },
-    [pscustomobject]@{ label = 'G2'; text = '/g2'; group = 'g'; bar = 'right' },
-    [pscustomobject]@{ label = 'B'; text = '/b' }
-)
-$d = @(Dissolve $grp 'g')
+# The local Dissolve this replaces was a hand-copy; the shipped handler additionally stripping
+# `bar` (which scatters every member back to the control row) passed the whole suite.
+$dissJson = '{"buttons":[
+    {"label":"A","text":"/a"},
+    {"label":"G1","text":"/g1","group":"g","bar":"right"},
+    {"label":"G2","text":"/g2","group":"g","bar":"right"},
+    {"label":"B","text":"/b"}],"groups":{"g":{"icon":"note","label":"G"}}}'
+$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ __isGroup = $true; group = 'g' }) $dissolveAction
+$d = @($r.Cfg.buttons)
 Check 'dissolving keeps the members on their bar' ((@($d | Where-Object { $_.bar -eq 'right' }).Count) -eq 2)
-Check 'dissolving keeps them in the group face position' ((($d | ForEach-Object { $_.label }) -join ',') -eq 'A,G1,G2,B')
+Check 'dissolving keeps them in the group face position' (((($d | ForEach-Object { $_.label }) -join ',')) -eq 'A,G1,G2,B')
 Check 'no member is left claiming the group' ((@($d | Where-Object { $_.group }).Count) -eq 0)
 Check 'they are now separate blocks, not one' ((@(Get-ButtonBlocks $d).Count) -eq 4)
+# Dissolve must be a real write, not a quiet no-op.
+Check 'the dissolve reached disk' ($r.Rebuilt -gt 0)
+# ...and the now-memberless group definition must be pruned by Update-Buttons, or it keeps
+# appearing in "Move to group" as a group that renders nowhere.
+Check 'dissolving prunes the orphaned group definition' `
+    (-not ($r.Cfg.PSObject.Properties['groups'] -and $r.Cfg.groups.PSObject.Properties['g']))
+# A dissolve aimed at a non-group target must do nothing at all (the handler guards on
+# __isGroup; without the guard a plain right-click would dissolve whatever it landed on).
+$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ label = 'A'; text = '/a' }) $dissolveAction
+Check 'dissolve on a non-group target changes nothing' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 2)
+
+# --- Update-Buttons prunes orphaned group definitions (whatever emptied them) ---
+# The prune lives in Update-Buttons so EVERY path that edits buttons is covered. Gutting it
+# left the suite green: the only test that touched orphans was a smoke run asserting a config
+# containing one still LOADS, which says nothing about whether it is removed.
+$orphanJson = '{"buttons":[{"label":"A","text":"/a","group":"g"},{"label":"B","text":"/b"}],
+                "groups":{"g":{"icon":"note"},"keep":{"icon":"star"}}}'
+# Move A out of group g by dropping its group field via the real Set-ButtonGroup.
+$r = Invoke-PanelEdit $orphanJson ([pscustomobject]@{ label = 'A'; text = '/a'; group = 'g' }) { Set-ButtonGroup '' }
+Check "the last member leaving a group prunes its definition" `
+    (-not ($r.Cfg.groups.PSObject.Properties['g']))
+# ...but the prune must be membership-driven, not "delete every group". 'keep' has no members
+# in this config either, so this pair also pins that an orphan is orphaned BY MEMBERSHIP:
+Check 'a group definition with no members anywhere is pruned too (both are orphans here)' `
+    (-not ($r.Cfg.groups.PSObject.Properties['keep']))
+# The complement: a group that still HAS a member must survive the prune.
+$r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'A'; text = '/a' }) { Set-ButtonGroup 'grp' }
+Check 'a group with live members is NOT pruned' ([bool]$r.Cfg.groups.PSObject.Properties['grp'])
+
+# --- Set-ButtonGroup: joining and leaving a group ---
+# Zero references from the tests before this. An early `return` was a silent no-op.
+Check 'joining a group is written to disk' `
+    (((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'grp' }) | ForEach-Object { $_.label }) -join ',') -eq 'A,G1,G2')
+$r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' }) { Set-ButtonGroup '' }
+$g1 = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'G1' })[0]
+Check 'leaving a group removes the field rather than blanking it' `
+    (($null -eq $g1.PSObject.Properties['group']) -and (@($r.Cfg.buttons).Count -eq 4))
+# A group face is not itself groupable: the guard must hold, or a group could be nested into
+# a group and neither would render.
+$r = Invoke-PanelEdit $fixJson $grpTarget { Set-ButtonGroup 'other' }
+Check 'a group face cannot be put into a group' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'other' }).Count) -eq 0)
+# Case-sensitivity again, end to end: grouping "Deploy" must not also group "deploy".
+$r = Invoke-PanelEdit $casedJson ([pscustomobject]@{ label = 'Deploy'; text = '/deploy prod' }) { Set-ButtonGroup 'g' }
+Check 'grouping is case-sensitive (only the exact button joins)' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 1)
+
+# --- Update-Config: it writes the WHOLE config under the lock ---
+# Zero references before this. Update-Config is the most damaging thing here that had no
+# coverage at all: a bad transform does not just misdraw a button, it persists a corrupt
+# config file over the user's real one.
+$cfgOnlyJson = '{"schemaVersion":1,"buttons":[{"label":"A","text":"/a"}],"targetTitle":"Claude"}'
+$r = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) $c | Add-Member -NotePropertyName marker -NotePropertyValue 'set' -Force; $c } }
+Check 'Update-Config persists a whole-config change' (($r.Ret -eq $true) -and ($r.Cfg.marker -eq 'set'))
+Check 'Update-Config preserves the fields the transform did not touch' `
+    (($r.Cfg.targetTitle -eq 'Claude') -and ((Labels $r.Cfg) -eq 'A'))
+# THE ONE THAT MATTERS: a transform returning $null must be REFUSED, not written. Without the
+# guard the file becomes "null" (or empty) and the user loses every button they ever pinned,
+# with no backup - and the panel then falls back to the shipped defaults, so the loss looks
+# like a reset rather than a bug.
+$r = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) $null } }
+Check 'a transform returning $null is refused, not written' ($r.Ret -eq $false)
+# ...and so must a WRONG-SHAPED result. `if (-not $fresh)` only rejects $null/''/0: any other
+# truthy value sails through to Write-ConfigAtomic, which happily serialises it. A transform
+# that returns a string writes `"totally not a config"` over buttons.json and the user loses
+# every button they ever pinned - and because the panel then falls back to the shipped
+# defaults, the loss reads as a spontaneous reset rather than a bug.
+#
+# *** THIS CHECK IS CURRENTLY RED. It is a real, reproducible defect in Update-Config, not a
+# broken test. The fix is one line in claude-buttons.ps1 - tighten the existing guard to
+#     if (-not $fresh -or -not $fresh.PSObject.Properties['buttons']) { return $false }
+# - which this file cannot make, because it does not own the panel script. ***
+$rShape = Invoke-PanelEdit $cfgOnlyJson $null { Update-Config { param($c) 'totally not a config' } }
+Check 'a transform returning a WRONG-SHAPED object is refused, not written' `
+    (($rShape.Ret -eq $false) -or ($null -ne $rShape.Cfg.PSObject.Properties['buttons']))
+Check 'a refused Update-Config leaves the file byte-intact' `
+    (($r.Cfg.buttons.Count -eq 1) -and ((Labels $r.Cfg) -eq 'A') -and ($r.Cfg.targetTitle -eq 'Claude'))
+# A transform that throws must not half-write. Asserted on the FILE, because that is the part
+# that can actually fail here: a Windows mutex is REENTRANT for the thread that owns it, so a
+# same-process "does a later write still succeed?" probe would pass even with ReleaseMutex
+# deleted outright - it would assert nothing. Proving the release needs a second thread, which
+# the concurrent-writer test above already does for the write path.
+$threwDir = Join-Path ([IO.Path]::GetTempPath()) ("cb-throw-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force -Path $threwDir | Out-Null
+$prevLocal = $env:LOCALAPPDATA; $prevHome = $env:USERPROFILE
+$script:configPath = Join-Path $threwDir 'buttons.json'
+[IO.File]::WriteAllText($script:configPath, $cfgOnlyJson, (New-Object System.Text.UTF8Encoding($false)))
+$threw = $false
+try {
+    $env:LOCALAPPDATA = $threwDir; $env:USERPROFILE = $threwDir
+    try { Update-Config { param($c) throw 'boom' } } catch { $threw = $true }
+} finally { $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome }
+$afterThrow = Get-Content $script:configPath -Raw | ConvertFrom-Json
+Remove-Item $threwDir -Recurse -Force -ErrorAction SilentlyContinue
+Check 'a throwing transform propagates rather than being swallowed as success' $threw
+Check 'a throwing transform leaves the config file untouched' `
+    (((Labels $afterThrow) -eq 'A') -and ($afterThrow.targetTitle -eq 'Claude'))
+# Set-KindColor is the shipped caller of Update-Config, and it is how a group/toggle/prompt
+# colour is saved. Nothing exercised it, so an Update-Config that silently dropped its result
+# would have shown up only as "my colour choice never sticks".
+$r = Invoke-PanelEdit $cfgOnlyJson $null { Set-KindColor 'command' 'blue' }
+Check 'Set-KindColor persists a per-kind colour through Update-Config' ($r.Cfg.colors.command -eq 'blue')
+Check 'saving a colour does not disturb the buttons array' ((Labels $r.Cfg) -eq 'A')
+$r = Invoke-PanelEdit '{"buttons":[{"label":"A","text":"/a"}],"colors":{"command":"blue","text":"red"}}' $null { Set-KindColor 'command' '' }
+Check 'clearing a kind colour removes only that kind' `
+    (($null -eq $r.Cfg.colors.PSObject.Properties['command']) -and ($r.Cfg.colors.text -eq 'red'))
+
+# --- Per-kind colour derivation ---
+# Which slot a button draws from is decided by what it DOES. Getting Get-ColorKind wrong
+# recolours whole categories at once, and none of it was covered.
+Check 'a group face is the group kind' ((Get-ColorKind ([pscustomobject]@{ __isGroup = $true })) -eq 'group')
+Check 'a toggle is the toggle kind even when its text is a slash command' `
+    ((Get-ColorKind ([pscustomobject]@{ toggle = $true; text = '/x' })) -eq 'toggle')
+Check 'a slash command is the command kind' ((Get-ColorKind ([pscustomobject]@{ text = '/review' })) -eq 'command')
+Check 'leading whitespace does not hide a slash command' ((Get-ColorKind ([pscustomobject]@{ text = "  /review" })) -eq 'command')
+Check 'a plain prompt is the text kind' ((Get-ColorKind ([pscustomobject]@{ text = 'gennemgaa min kode' })) -eq 'text')
+# A slash that is not the FIRST thing is a prompt, not a command.
+Check 'a prompt merely containing a slash is not a command' ((Get-ColorKind ([pscustomobject]@{ text = 'see a/b' })) -eq 'text')
+# Get-KindColor resolves the saved name against the palette. $null means "no override", which
+# is why prompts and commands look unchanged until someone picks a colour - so a mutant that
+# returned a colour unconditionally would recolour every button in the bar.
+$script:config = [pscustomobject]@{ colors = [pscustomobject]@{ command = 'blue'; text = 'nosuchcolour' } }
+$cmdCol = Get-KindColor ([pscustomobject]@{ text = '/x' }) $false
+Check 'a saved kind colour resolves to its palette entry' ($cmdCol -eq $script:ckPalette['blue'])
+Check 'an unsaved kind stays null (no override, historic default kept)' `
+    ($null -eq (Get-KindColor ([pscustomobject]@{ toggle = $true }) $false))
+Check 'a colour name that is not in the palette falls back to null, not to a wrong colour' `
+    ($null -eq (Get-KindColor ([pscustomobject]@{ text = 'plain prompt' }) $false))
+# The ON state is deliberately NOT colourable: white-on-amber measures 4.67:1 and every
+# palette entry measures 1.8-2.2:1 on that fill, so any pick there is a contrast regression.
+Check 'the toggle ON state is never recoloured (every palette pick regresses its contrast)' `
+    ($null -eq (Get-KindColor ([pscustomobject]@{ text = '/x' }) $true))
+
+# =====================================================================================
+# --- Which chat does a button belong to? (the wrong-chat send hazard) ---
+# =====================================================================================
+# Side strips live in their own array and are NEVER in $script:mirrors, so every left/right-bar
+# button used to resolve to no pane and fall through to the GEOMETRIC guess. That guess models
+# one shape only - a horizontal row strip docked just below its own composer - and scores
+# composers sitting ABOVE the strip. A vertical side strip is anchored well above its own
+# composer, so this pane's composer is rejected; in a vertically-staggered layout a
+# NEIGHBOURING pane's composer can pass instead and take the prompt. The everyday symptom was
+# that side-bar buttons silently did nothing; sending to the wrong chat was the tail case.
+foreach ($fn in @('Resolve-StripForm', 'Get-PaneForForm', 'Get-StripWidth', 'Get-PillWidth',
+                  'Get-ShortLabel', 'Get-GroupDef', 'Get-IconGlyph', 'Test-ChatButtonVisible', 'S')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text } else { $missingFns += $fn }
+}
+Check ("the pane-resolution and width functions were found in the source" + $(if ($missingFns) { ": MISSING $($missingFns -join ', ')" } else { '' })) `
+    ($missingFns.Count -eq 0)
+
+# --- Get-PaneForForm maps a side strip to ITS OWN pane ---
+# Two strips per pane in pane order, so strip si belongs to pane floor(si/2). [Math]::Floor,
+# not [int]: [int](3/2) is 2 in PowerShell, which pairs strip 3 with the wrong pane - i.e.
+# points a button at the neighbouring chat, which is precisely the hazard being fixed.
+$script:flyForm = $null
+$form = [pscustomobject]@{ Name = 'main' }
+$script:panes  = @(0..2 | ForEach-Object { [pscustomobject]@{ Title = "pane$_" } })
+$script:mirrors = @()
+$script:sideStrips = @(0..5 | ForEach-Object { [pscustomobject]@{ Form = [pscustomobject]@{ Name = "strip$_" } } })
+$stripMap = @(0..5 | ForEach-Object { $p = Get-PaneForForm $script:sideStrips[$_].Form; if ($p) { $p.Title } else { 'NULL' } })
+Check "strips 0..5 map to panes 0,0,1,1,2,2 (got: $($stripMap -join ','))" `
+    (($stripMap -join ',') -eq 'pane0,pane0,pane1,pane1,pane2,pane2')
+# A strip whose pane has closed must resolve to nothing rather than to the last pane - falling
+# back to "some pane" is how the prompt reaches a chat the user was not looking at.
+$script:sideStrips = @(0..7 | ForEach-Object { [pscustomobject]@{ Form = [pscustomobject]@{ Name = "strip$_" } } })
+Check 'a strip beyond the last pane resolves to no pane at all' `
+    ($null -eq (Get-PaneForForm $script:sideStrips[6].Form))
+Check 'the main window still resolves to the primary pane' ((Get-PaneForForm $form).Title -eq 'pane0')
+$script:mirrors = @([pscustomobject]@{ Form = [pscustomobject]@{ Name = 'mirror1' } })
+Check 'a mirror window resolves to its own pane, offset past the primary' `
+    ((Get-PaneForForm $script:mirrors[0].Form).Title -eq 'pane1')
+Check 'an unknown window resolves to no pane' ($null -eq (Get-PaneForForm ([pscustomobject]@{ Name = 'stranger' })))
+Check 'a null form resolves to no pane' ($null -eq (Get-PaneForForm $null))
+
+# --- Resolve-StripForm: a flyout stands in for the strip that opened it ---
+# A button inside the group flyout belongs to the pane of the strip that opened it. The flyout
+# is its own window and maps to no pane, so without this it fell straight through to the
+# geometric guess - the same wrong-chat path, reached from every grouped button.
+Add-Type -AssemblyName System.Windows.Forms
+$ownerStrip = [pscustomobject]@{ Name = 'owner'; IsDisposed = $false }
+$script:flyForm = [pscustomobject]@{ Name = 'fly'; Tag = $ownerStrip }
+Check 'the flyout resolves to the strip that owns it' ((Resolve-StripForm $script:flyForm).Name -eq 'owner')
+# A DISPOSED owner must resolve to $null, not to a dead window: the caller treats a resolved
+# form as "this is the strip", and a dead one puts it back on the geometric guess unnoticed.
+$deadForm = New-Object System.Windows.Forms.Form
+$deadForm.Dispose()
+$script:flyForm = [pscustomobject]@{ Name = 'fly'; Tag = $deadForm }
+Check 'a flyout whose owning strip has been disposed resolves to null' ($null -eq (Resolve-StripForm $script:flyForm))
+$script:flyForm = [pscustomobject]@{ Name = 'fly'; Tag = $null }
+Check 'a flyout with no owner at all resolves to null' ($null -eq (Resolve-StripForm $script:flyForm))
+Check 'a plain strip form is returned unchanged' `
+    ((Resolve-StripForm ([pscustomobject]@{ Name = 'plain' })).Name -eq 'plain')
+Check 'Resolve-StripForm passes null through' ($null -eq (Resolve-StripForm $null))
+$script:flyForm = $null
+
+# --- The geometric fallback must stay GUARDED (the actual wrong-chat invariant) ---
+# Invoke-PillClick runs a live UIA/window pipeline, so it cannot be called from here. What CAN
+# be asserted is the shape that makes the hazard impossible: Focus-ChatInput must not be
+# reachable unconditionally, and the condition that gates it must be derived from "is this a
+# ROW strip?" - i.e. from $form / $script:mirrors. A guard that is merely SOME if-statement, or
+# a constant $true, would let the geometric guess run for a side strip again.
+$pillFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-PillClick' }, $true)
+Check 'Invoke-PillClick was found in the source' ($null -ne $pillFn)
+$focusCalls = @()
+if ($pillFn) {
+    $focusCalls = @($pillFn.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'Focus-ChatInput' }, $true))
+}
+# Zero call sites must FAIL, not pass: an empty selection is exactly how the old source-grep
+# checks in this file went vacuously green.
+Check "the geometric fallback call site was found inside Invoke-PillClick (found $($focusCalls.Count))" ($focusCalls.Count -ge 1)
+$unguarded = @(); $guardVars = @()
+foreach ($fc in $focusCalls) {
+    $p = $fc.Parent; $guarded = $false
+    while ($p -and $p -ne $pillFn) {
+        if ($p -is [System.Management.Automation.Language.IfStatementAst]) {
+            $guarded = $true
+            $guardVars += @($p.Clauses[0].Item1.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+                ForEach-Object { $_.Extent.Text })
+        }
+        $p = $p.Parent
+    }
+    if (-not $guarded) { $unguarded += $fc.Extent.Text }
+}
+Check 'the geometric fallback is not reachable unconditionally from Invoke-PillClick' ($unguarded.Count -eq 0)
+# ...and the guard must be computed from the row-strip identity, not hardcoded. Every guard
+# variable is traced back to its assignment inside Invoke-PillClick; at least one must be
+# derived from $form or $script:mirrors, which is what "this is a row strip" means here.
+$guardVars = @($guardVars | Sort-Object -Unique)
+$rowDerived = $false
+foreach ($gv in $guardVars) {
+    $asns = @($pillFn.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $gv }, $true))
+    foreach ($a in $asns) {
+        if ($a.Right.Extent.Text -match '\$script:mirrors|\$form\b') { $rowDerived = $true }
+    }
+}
+Check "the fallback guard is derived from the row-strip identity (vars: $($guardVars -join ', '))" $rowDerived
+# And the refusal must be VISIBLE. A silent return is indistinguishable from a successful
+# send - which is how this whole class of bug stayed invisible: "I clicked and nothing
+# happened" reads as a flaky panel, not as a refusal that protected the user.
+Check 'the abandoned side-bar send warns the user (sendNoPane)' ($srcText -match "Show-SendWarning \(L 'sendNoPane'\)")
+
+# --- Get-StripWidth measures what is actually ON the row ---
+# It used to sum every visible button regardless of bar and count each group member separately.
+# Moving buttons to a side bar or collapsing them into a group therefore did not shrink the
+# measurement at all: the row still measured as if nothing had moved, compact mode latched on,
+# and the labels still on the row shrank for no reason. The fixture below measured 887px under
+# the old code and 263px under the fixed one.
+# Asserted as EQUALITIES between configs rather than against those pixel numbers, which depend
+# on DPI, font and theme - a hardcoded 263 would be a fixture asserting the fixture again.
+$script:scale = 1.0
+$script:kebabBar = 'row'
+$script:iconFont = $null          # forces the text-label path, so widths are comparable
+$script:uiaTitle = $null; $script:activeSession = $null; $script:activeExpired = $false
+foreach ($vn in @('$script:btnFont', '$script:padX', '$pillH')) {
+    $asn = $ast.Find({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $vn }, $true)
+    if ($asn) { Invoke-Expression $asn.Extent.Text } else { $missingVars += $vn }
+}
+Check ("the width-measurement constants were extracted from source" + $(if ($missingVars) { ": MISSING $($missingVars -join ', ')" } else { '' })) `
+    ($missingVars.Count -eq 0)
+function Set-WidthFixture($json) { $script:config = ($json | ConvertFrom-Json) }
+# Their fixture: two plain row buttons, a three-member group, two side-bar buttons.
+Set-WidthFixture '{"buttons":[
+    {"label":"Review","text":"/review"},{"label":"Commit","text":"/commit"},
+    {"label":"GroupOne","text":"/g1","group":"tools"},
+    {"label":"GroupTwo","text":"/g2","group":"tools"},
+    {"label":"GroupThree","text":"/g3","group":"tools"},
+    {"label":"SideOne","text":"/s1","bar":"left"},
+    {"label":"SideTwo","text":"/s2","bar":"right"}],"groups":{"tools":{"label":"Tools"}}}'
+$wFull = Get-StripWidth $false
+# The same row, written out as what it SHOULD measure: the two plain buttons plus ONE group
+# face. If side-bar buttons or extra group members are being counted, these differ.
+Set-WidthFixture '{"buttons":[
+    {"label":"Review","text":"/review"},{"label":"Commit","text":"/commit"},
+    {"label":"GroupOne","text":"/g1","group":"tools"}],"groups":{"tools":{"label":"Tools"}}}'
+$wExpected = Get-StripWidth $false
+Check "the row measures exactly its row buttons plus ONE group face ($wFull vs $wExpected)" ($wFull -eq $wExpected)
+# The same seven buttons with no group and no bars - the shape the old code effectively
+# measured. It must be MUCH wider, and by more than the 60px compact-mode hysteresis band, or
+# collapsing a group into a face could not switch compact mode off again.
+Set-WidthFixture '{"buttons":[
+    {"label":"Review","text":"/review"},{"label":"Commit","text":"/commit"},
+    {"label":"GroupOne","text":"/g1"},{"label":"GroupTwo","text":"/g2"},
+    {"label":"GroupThree","text":"/g3"},{"label":"SideOne","text":"/s1"},
+    {"label":"SideTwo","text":"/s2"}]}'
+$wFlat = Get-StripWidth $false
+Check "grouping and side-bars shrink the row by more than the 60px hysteresis band ($wFlat -> $wFull)" `
+    (($wFlat - $wFull) -gt (S 60))
+# A row with nothing on it must still measure only its padding, never a negative or a
+# stale total.
+Set-WidthFixture '{"buttons":[{"label":"SideOne","text":"/s1","bar":"left"}]}'
+$wEmpty = Get-StripWidth $false
+Check "a row containing only side-bar buttons measures just its chrome ($wEmpty)" `
+    (($wEmpty -gt 0) -and ($wEmpty -lt $wFull))
+# The short-label switch is what compact mode actually does, so it has to make things smaller.
+Set-WidthFixture '{"buttons":[{"label":"A very long button label indeed","text":"/x"}]}'
+Check 'the compact (short-label) measurement is narrower than the full one' `
+    ((Get-StripWidth $true) -lt (Get-StripWidth $false))
 
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
