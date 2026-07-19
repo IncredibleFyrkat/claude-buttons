@@ -16,8 +16,14 @@ function Run-Smoke([string]$json) {
     Copy-Item $panel  (Join-Path $dir 'claude-buttons.ps1') -Force
     Copy-Item $defCfg (Join-Path $dir 'buttons.default.json') -Force
     [IO.File]::WriteAllText((Join-Path $dir 'buttons.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') -SmokeTest 2>&1
-    $code = $LASTEXITCODE
+    # Redirect LOCALAPPDATA/USERPROFILE too: the panel logs to %LOCALAPPDATA%\claude-buttons.log,
+    # so every test run was appending to the developer's real log file.
+    $prevLocal = $env:LOCALAPPDATA; $prevHome = $env:USERPROFILE
+    try {
+        $env:LOCALAPPDATA = $dir; $env:USERPROFILE = $dir
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') -SmokeTest 2>&1
+        $code = $LASTEXITCODE
+    } finally { $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome }
     $left = (Get-Content (Join-Path $dir 'buttons.json') -Raw)  # to assert bad file untouched
     Remove-Item $dir -Recurse -Force
     [pscustomobject]@{ Out = "$out"; Code = $code; FileAfter = $left }
@@ -114,10 +120,26 @@ $srcText = $src -join "`n"   # defined here too: these checks run before the doc
 # i18n "tests" whose regex was satisfied by the CALL SITES rather than the string table, so
 # deleting every string still passed.
 function PasteState([string]$json) {
-    $f = Join-Path ([IO.Path]::GetTempPath()) ("cb-pp-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".json")
+    # Run from a throwaway dir with its own config and LOCALAPPDATA. Running the panel out of
+    # the repo made every test run append "buttons.json unreadable at startup" to the
+    # developer's real %LOCALAPPDATA%\claude-buttons.log.
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("cb-pp-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Copy-Item $panel  (Join-Path $dir 'claude-buttons.ps1') -Force
+    Copy-Item $defCfg (Join-Path $dir 'buttons.default.json') -Force
+    Copy-Item $defCfg (Join-Path $dir 'buttons.json') -Force
+    $f = Join-Path $dir 'probe.json'
     [IO.File]::WriteAllText($f, $json, (New-Object System.Text.UTF8Encoding($false)))
-    try { (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $panel -PasteProbe $f 2>$null) -join '' }
-    finally { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    $prevLocal = $env:LOCALAPPDATA
+    $prevHome  = $env:USERPROFILE
+    try {
+        $env:LOCALAPPDATA = $dir
+        $env:USERPROFILE  = $dir
+        (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'claude-buttons.ps1') -PasteProbe $f 2>$null) -join ''
+    } finally {
+        $env:LOCALAPPDATA = $prevLocal; $env:USERPROFILE = $prevHome
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 Check 'a clean paste into an EMPTY composer is Confirmed' `
     ((PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
@@ -140,24 +162,56 @@ Check 'an unreadable composer is Unverifiable, never Confirmed' `
     ((PasteState '{"baseline":"\n","payload":"/review","observed":null}') -eq 'Unverifiable')
 
 # Source invariants that cannot be probed: what the caller DOES with the state.
-Check 'the send path no longer types a fallback payload' `
-    (-not ($srcText -match 'Escape-SendKeys \$textToSend'))
 Check 'nothing is submitted unless the paste was Confirmed' `
     ($srcText -match "\`$pasted = \(\`$pasteState -eq 'Confirmed'\)")
-Check 'an unconfirmed paste returns before the Enter key' `
-    ([regex]::Match($srcText, "(?s)if \(-not \`$pasted\).{0,900}?return.{0,900}?SendWait\('\{ENTER\}'\)").Success)
+# Assert the fail-closed block sends NOTHING - no keystrokes of any kind. Grepping for the
+# literal `Escape-SendKeys $textToSend` was defeated by binding to a variable first
+# (`$esc = Escape-SendKeys $textToSend; SendWait $esc`), and a regex requiring "some return
+# before some ENTER" cannot express "no Enter BEFORE the return" - the reinstated leak passed
+# all 64 tests. A block that contains no send at all cannot leak, however it is spelled.
+$failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
+Check 'the fail-closed block was located' ($failBlock.Length -gt 40)
+Check 'the fail-closed block sends NO keystrokes at all (typing or Enter)' `
+    (-not ($failBlock -match 'SendKeys|SendWait|Escape-SendKeys'))
+Check 'the fail-closed block ends by returning' ($failBlock -match '(?m)^\s*return\s*$')
 Check 'no undo/select-all recovery was introduced (it would eat a user draft)' `
     (-not ($srcText -match "SendWait\('\^z'\)|SendWait\('\^a'\)"))
 # Both abandoned-send branches must TELL the user. Without this the failure is silent except
 # for a log line nobody reads, and "I clicked and nothing happened" is indistinguishable from
 # a successful send - which is how this class of bug stayed invisible in the first place.
-$failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
 Check 'the Mismatch branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendMismatch'\)")
 Check 'the Unverifiable branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendUnverified'\)")
 $blankLine = ($src | Select-String -Pattern 'IsNullOrWhiteSpace\(\$textToSend\)' | Select-Object -First 1).LineNumber
 $clipLine  = ($src | Select-String -Pattern 'Clipboard\]::GetDataObject' | Select-Object -First 1).LineNumber
 Check 'a blank payload is refused BEFORE the clipboard is touched' `
     (($blankLine -gt 0) -and ($clipLine -gt 0) -and ($blankLine -lt $clipLine))
+
+# F7: the call site, not just the function. The original defect was short-circuiting to
+# 'Unverifiable' when the baseline was unreadable, which skipped the wait entirely and let the
+# clipboard be restored with no delay at all. The probe drives Wait-PasteLanded directly, so it
+# cannot see that - this asserts the caller always goes through the wait.
+$callLine = ($src | Select-String -Pattern '\$pasteState = Wait-PasteLanded' | Select-Object -First 1)
+Check 'the caller ALWAYS waits (no short-circuit around Wait-PasteLanded)' `
+    (($null -ne $callLine) -and ($srcText -notmatch "if \(\`$null -eq \`$baseline\) \{ 'Unverifiable' \}"))
+
+# F8: the wait must actually wait. The probe passes an explicit short timeout, so neither the
+# default nor the delay's existence was covered - setting the default to 0 passed everything.
+$toMatch = [regex]::Match($srcText, '\[int\]\$timeoutMs = (\d+)')
+Check 'Wait-PasteLanded has a non-trivial default timeout' `
+    ($toMatch.Success -and ([int]$toMatch.Groups[1].Value -ge 300))
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$unver = PasteState '{"baseline":"\n","payload":"/review","observed":null}'
+$sw.Stop()
+Check "an unreadable composer is polled for the full timeout, not skipped ($($sw.ElapsedMilliseconds)ms)" `
+    (($unver -eq 'Unverifiable') -and ($sw.ElapsedMilliseconds -ge 100))
+
+# F6: the user's own flagship button is a 12,752-character, 482-line prompt. Every other probe
+# case is a single short line, so multi-line round-tripping through the UIA read-back was
+# entirely unexercised.
+Check 'a multi-line payload with blank lines confirms' `
+    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\n\nline three\n"}') -eq 'Confirmed')
+Check 'a multi-line payload missing its last line is a Mismatch' `
+    ((PasteState '{"baseline":"\n","payload":"line one\n\nline three","observed":"line one\n\n\n"}') -eq 'Mismatch')
 # Assert the STRING TABLE, not any mention of the key: the previous version matched the
 # Show-SendWarning call sites, so deleting every string still passed while the user would have
 # got a blank tooltip.

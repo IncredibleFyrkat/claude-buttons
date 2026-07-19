@@ -683,6 +683,8 @@ $script:strings = @{
         tipGlobal = 'Global'; tipChatOnly = 'Only in this chat'; tipChatIn = 'Only in chat: {0}'
         tipSends = 'types and sends'; tipInserts = 'inserts text only'; tipRemove = 'Right-click: rename / move / remove'
         tipShift = 'Shift-click: insert without sending'
+        sendBlank = 'Not sent: this button has no text to send. Check its text in buttons.json.'
+        sendNoClipboard = 'Not sent: the clipboard was unavailable, so nothing was pasted. The message box was not changed.'
         sendMismatch = 'Not sent: the paste did not land as expected. Check the message box before sending - something else may be in it.'
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
@@ -705,6 +707,8 @@ $script:strings = @{
         tipGlobal = 'Global'; tipChatOnly = 'Kun i denne chat'; tipChatIn = 'Kun i chatten: {0}'
         tipSends = 'skriver og sender'; tipInserts = 'indsætter kun tekst'; tipRemove = 'Højreklik: omdøb / flyt / fjern'
         tipShift = 'Shift-klik: indsæt uden at sende'
+        sendBlank = 'Ikke sendt: denne knap har ingen tekst at sende. Tjek dens tekst i buttons.json.'
+        sendNoClipboard = 'Ikke sendt: udklipsholderen var utilgængelig, så intet blev indsat. Beskedfeltet blev ikke ændret.'
         sendMismatch = 'Ikke sendt: indsættelsen landede ikke som forventet. Tjek beskedfeltet før du sender - der kan stå noget andet i det.'
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
@@ -1942,6 +1946,11 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     # terminator in the MIDDLE of the expected string ("draft\n/cmd") while the paste appends
     # before it ("draft/cmd"), so every click with a draft in the box compared unequal and
     # refused to send. The empty case only passed because Trim() happened to eat both newlines.
+    # KNOWN LIMITATION: this assumes the paste APPENDS at the end. If the caret sits mid-draft,
+    # or text is selected (paste replaces the selection), the result is not baseline+payload and
+    # this returns Mismatch - a refusal on a legitimate action. Refusing is the safe direction,
+    # but it is a real usability cost and it is not automatically testable here, because
+    # positioning a caret requires synthetic input.
     $base = Normalize-ComposerText ([string]$baseline)
     $want = Normalize-ComposerText ($base + $payload)
     # A payload that normalizes away entirely would make want == base, which the poll below
@@ -1977,8 +1986,11 @@ function Invoke-PasteProbe([string]$jsonPath) {
     exit 0
 }
 
-# Runs here, not at the top of the file: it needs Wait-PasteLanded to be defined. Exits before
-# any window is created, so it never touches the live install or takes focus.
+# Runs here, not at the top of the file: it needs Wait-PasteLanded to be defined. The form and
+# controls above have been CONSTRUCTED by this point but none has been shown, and this exits
+# before the message loop, so nothing appears on screen and nothing takes focus. (It is also
+# before Write-InstallMarker, which is why that guard does not need to list -PasteProbe - move
+# either one and that stops being true.)
 if (-not [string]::IsNullOrEmpty($PasteProbe)) { Invoke-PasteProbe $PasteProbe }
 
 function Focus-ChatInput($stripCenterX, $stripTopY) {
@@ -2128,11 +2140,20 @@ function Invoke-PillClick($btn) {
             if (-not (Test-TargetForeground)) { return }
             # A payload that is only whitespace can never be verified (it normalizes away),
             # and buttons.json is hand-editable, so this is reachable. Refuse it up front.
-            if ([string]::IsNullOrWhiteSpace($textToSend)) { Write-CkLog 'Refusing a blank payload'; return }
+            if ([string]::IsNullOrWhiteSpace($textToSend)) {
+                Write-CkLog 'Refusing a blank payload'
+                Show-SendWarning (L 'sendBlank')   # the one abandoned path that was still silent
+                return
+            }
             # Baseline BEFORE the clipboard is touched, so we can prove afterwards that exactly
             # our payload was added and nothing else. $null means the composer is unreadable,
             # which is not the same as empty - see the Unverifiable branch below.
             $baseline = Get-ComposerText $composerEl
+            # Initialised so an exception before the paste (e.g. another app holding the
+            # clipboard open) is distinguishable from a paste that went wrong. Left $null it
+            # fell to the Mismatch branch, which told the user to inspect a composer that
+            # nothing had been written to.
+            $pasteState = 'NotAttempted'
             $backup = $null; $snapOk = $false; $pasted = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
@@ -2198,7 +2219,12 @@ function Invoke-PillClick($btn) {
             # unsent, and the user decides. That is the only outcome that cannot lose their
             # data or say something on their behalf.
             if (-not $pasted) {
-                if ($pasteState -eq 'Unverifiable') {
+                if ($pasteState -eq 'NotAttempted') {
+                    # Nothing was ever pasted, so telling the user to inspect the box for
+                    # contamination would send them hunting for something that cannot be there.
+                    Write-CkLog 'Clipboard was unavailable; nothing was pasted or sent'
+                    Show-SendWarning (L 'sendNoClipboard')
+                } elseif ($pasteState -eq 'Unverifiable') {
                     Write-CkLog 'Paste could not be verified (composer text unreadable); not sending'
                     Show-SendWarning (L 'sendUnverified')
                 } else {
