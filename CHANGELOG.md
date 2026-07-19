@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.8.0 — 2026-07-19
+
+**A button can now refuse to send.** That is a deliberate, user-visible behaviour change, and
+it is why this is a minor bump rather than a patch.
+
+Reported by [@RasmusKD](https://github.com/RasmusKD) in #4, who also disclosed that his earlier
+PR made it substantially more likely by cutting a post-paste wait from 300ms to 90ms.
+
+- **A button could paste your clipboard instead of its own text.** `Ctrl+V` is asynchronous:
+  the keystroke is queued and the app reads the clipboard some time later. The panel set the
+  clipboard, sent `^v`, waited a fixed 90ms, then restored what you had copied — and if that
+  restore won the race, the app pasted **your** clipboard. Wrong message, and whatever you had
+  copied went into an AI conversation. A fixed delay cannot make this safe.
+- **The panel now reads the message box back** through the accessibility tree and only restores
+  your clipboard once it can see exactly its own text in there.
+- **If it cannot confirm that, it sends nothing.** It does not type, does not press Enter, does
+  not undo, does not clear. Whatever is in the box stays there, visible and unsent, and you
+  decide. The old code typed the correct text whenever the paste could not be confirmed and
+  then submitted — which is precisely what turned a detected problem into a sent one, because
+  the right text landed underneath the contamination and both went out together.
+- **Abandoned sends now say so in the panel** instead of only reaching the log, with a distinct
+  message for each cause: nothing pasted, could not verify, did not land as expected, or the
+  button has no text. Previously "I clicked and nothing happened" was indistinguishable from a
+  successful send.
+- **The keystroke encoder is gone.** It existed only to feed the typing fallback; with that
+  removed it was dead code, so it was deleted rather than left in place untested. The panel now
+  synthesises exactly two keystrokes, `^v` and `{ENTER}`, and a test asserts no third can appear.
+
+Known limitations, stated rather than buried:
+
+- Verification assumes the paste appends at the end of the box. If your caret is in the middle
+  of a draft, or text is selected, the result will not match and the send is refused.
+- Verification polls on the UI thread, so a failed send can freeze the strip for up to 1.2s.
+- The root cause is still open. The leading hypothesis is that a `Ctrl+V` from an *earlier*
+  click is still pending inside the app and consumes the restored clipboard — which the panel's
+  reentrancy guard does not prevent, because it only covers its own handler.
+
 ## 1.7.3 — 2026-07-19
 
 **Security release.** Found by an independent auditor reviewing the published v1.7.2 with no

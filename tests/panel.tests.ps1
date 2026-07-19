@@ -67,21 +67,12 @@ Check 'icon (name), unknown icon (fallback), raw-hex icon, toggle build' ((Butto
 $r = Run-Smoke '{ "buttons": [ {"label":"C","text":"/c","chat":"sess","chatTitle":"Some chat"} ] }'
 Check 'per-chat button builds (chat-scoped hidden until its chat shows)' ($r.Code -eq 0)
 
-# --- Escape-SendKeys: exactly what gets typed into Claude (security-relevant encoding) ---
-# The input goes through a temp FILE so newlines and metacharacters survive verbatim.
-function Esc([string]$in) {
-    $tmp = [IO.Path]::GetTempFileName()
-    [IO.File]::WriteAllText($tmp, $in, (New-Object System.Text.UTF8Encoding($false)))
-    try { $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $panel -EscapeProbe $tmp 2>$null }
-    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-    if ($null -eq $o) { '' } else { -join $o }
-}
-Check 'plain text passes through unchanged' ((Esc 'hello world') -eq 'hello world')
-Check 'SendKeys metachars are braced literal (+ ^ % ~ ( ) { } [ ])' ((Esc '+^%~(){}[]') -eq '{+}{^}{%}{~}{(}{)}{{}{}}{[}{]}')
-Check 'a newline becomes Shift+Enter (never a bare submit)' ((Esc "a`nb") -eq 'a+{ENTER}b')
-Check 'CRLF and CR both normalize to Shift+Enter' ((Esc "a`r`nb`rc") -eq 'a+{ENTER}b+{ENTER}c')
-Check 'a slash command is not mangled' ((Esc '/shutdown-on-done on') -eq '/shutdown-on-done on')
-Check 'empty text yields empty output' ((Esc '') -eq '')
+# (The Escape-SendKeys encoder tests lived here. The encoder existed to feed the typing
+# fallback, the fallback was the leak, and with it gone the function was dead code - so it and
+# its -EscapeProbe hook were deleted rather than left as an untested loaded gun. The
+# whole-file SendWait assertions below replace them: they prove the script can synthesise no
+# keystroke other than '^v' and '{ENTER}', which is a stronger claim than checking how a
+# now-nonexistent encoder escaped its input.)
 
 # --- Tick-ordering invariant: the modal-hide must never latch the strips off ---
 # Regression guard for the v1.7.0 deadlock. `composerLost` was part of the $show gate, and that
@@ -107,6 +98,7 @@ $clearsFlag = @($src | Select-String -Pattern '\$script:composerLost\s*=\s*\$fal
 Check 'composerLost is cleared somewhere (else it latches on forever)' ($clearsFlag -ge 1)
 
 # --- Fail-closed send path ---
+$srcText2 = (Get-Content $PSCommandPath) -join "`n"   # this test file, for self-checks
 $srcText = $src -join "`n"   # defined here too: these checks run before the doc-vs-code block
 # Ctrl+V is asynchronous. If the clipboard is restored before the app reads it, the app pastes
 # the USER'S clipboard: wrong message, and their copied data leaked into an AI conversation.
@@ -169,16 +161,41 @@ Check 'nothing is submitted unless the paste was Confirmed' `
 # (`$esc = Escape-SendKeys $textToSend; SendWait $esc`), and a regex requiring "some return
 # before some ENTER" cannot express "no Enter BEFORE the return" - the reinstated leak passed
 # all 64 tests. A block that contains no send at all cannot leak, however it is spelled.
+# WHOLE-FILE, brace-independent. Extracting the fail-closed block by brace matching and
+# grepping inside it was evaded three ways: moving the send into a helper whose name contains
+# none of the searched words; sending BEFORE the block under an equivalent condition; and
+# closing a brace early so the non-greedy regex truncated the extracted region. All three
+# reinstated type-then-Enter and passed the whole suite.
+#
+# There is no typing path any more, so the script should synthesise exactly two keystrokes.
+# Counting them file-wide cannot be dodged by where the code sits or what it is called.
+$sendSites = [regex]::Matches($srcText, 'SendKeys\]::SendWait\(([^)]*)\)')
+Check "exactly two SendWait sites exist in the whole file (found $($sendSites.Count))" ($sendSites.Count -eq 2)
+$sendArgs = @($sendSites | ForEach-Object { $_.Groups[1].Value.Trim() }) -join ' | '
+Check "the only keystrokes sent are '^v' and '{ENTER}' (found: $sendArgs)" `
+    (($sendArgs -eq "'^v' | '{ENTER}'") -or ($sendArgs -eq "'{ENTER}' | '^v'"))
+Check 'the SendKeys text encoder is gone (it existed only to feed the typing fallback)' `
+    (-not ($srcText -match 'function Escape-SendKeys'))
 $failBlock = [regex]::Match($srcText, "(?s)if \(-not \`$pasted\) \{(.*?)\r?\n            \}").Groups[1].Value
 Check 'the fail-closed block was located' ($failBlock.Length -gt 40)
-Check 'the fail-closed block sends NO keystrokes at all (typing or Enter)' `
-    (-not ($failBlock -match 'SendKeys|SendWait|Escape-SendKeys'))
 Check 'the fail-closed block ends by returning' ($failBlock -match '(?m)^\s*return\s*$')
 Check 'no undo/select-all recovery was introduced (it would eat a user draft)' `
     (-not ($srcText -match "SendWait\('\^z'\)|SendWait\('\^a'\)"))
 # Both abandoned-send branches must TELL the user. Without this the failure is silent except
 # for a log line nobody reads, and "I clicked and nothing happened" is indistinguishable from
 # a successful send - which is how this class of bug stayed invisible in the first place.
+# F17: these three fixes were real but unguarded - reverting each passed the whole suite.
+Check 'a clipboard failure is distinguishable from a bad paste (NotAttempted state)' `
+    (($srcText -match "\`$pasteState = 'NotAttempted'") -and ($failBlock -match "Show-SendWarning \(L 'sendNoClipboard'\)"))
+$blankBlock = [regex]::Match($srcText, "(?s)IsNullOrWhiteSpace\(\`$textToSend\)\) \{(.*?)\r?\n            \}").Groups[1].Value
+Check 'the blank-payload path warns the user too (it was the one silent abandon)' `
+    ($blankBlock -match "Show-SendWarning \(L 'sendBlank'\)")
+# F18: without the redirect every test run appended to the developer's real
+# %LOCALAPPDATA%\claude-buttons.log. Both harnesses must isolate it.
+foreach ($fn in @('Run-Smoke', 'PasteState')) {
+    $body = [regex]::Match($srcText2, "(?s)function $fn\(.*?\r?\n\}").Value
+    Check "$fn redirects LOCALAPPDATA so tests never write the real log" ($body -match '\$env:LOCALAPPDATA = \$dir')
+}
 Check 'the Mismatch branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendMismatch'\)")
 Check 'the Unverifiable branch warns the user' ($failBlock -match "Show-SendWarning \(L 'sendUnverified'\)")
 $blankLine = ($src | Select-String -Pattern 'IsNullOrWhiteSpace\(\$textToSend\)' | Select-Object -First 1).LineNumber
@@ -190,20 +207,39 @@ Check 'a blank payload is refused BEFORE the clipboard is touched' `
 # 'Unverifiable' when the baseline was unreadable, which skipped the wait entirely and let the
 # clipboard be restored with no delay at all. The probe drives Wait-PasteLanded directly, so it
 # cannot see that - this asserts the caller always goes through the wait.
-$callLine = ($src | Select-String -Pattern '\$pasteState = Wait-PasteLanded' | Select-Object -First 1)
-Check 'the caller ALWAYS waits (no short-circuit around Wait-PasteLanded)' `
-    (($null -ne $callLine) -and ($srcText -notmatch "if \(\`$null -eq \`$baseline\) \{ 'Unverifiable' \}"))
+# F15: a `notmatch` against ONE literal spelling was evaded twice - by rewording the
+# short-circuit at the call site, and by putting an early `return 'Unverifiable'` at the top of
+# Wait-PasteLanded itself, which is the actual defect (clipboard restored with no delay on the
+# one path where we cannot see what happened). Assert the STRUCTURE instead: the call must be
+# unconditional, and the function must reach its polling loop before it can return anything.
+$callLine = ($src | Select-String -Pattern '^\s*\$pasteState = Wait-PasteLanded \$composerEl \$baseline \$textToSend\s*$' | Select-Object -First 1)
+Check 'the caller invokes Wait-PasteLanded unconditionally (no inline short-circuit)' ($null -ne $callLine)
+$fnBody = [regex]::Match($srcText, '(?s)function Wait-PasteLanded.*?\r?\n\}').Value
+$loopIdx = $fnBody.IndexOf('while ((Get-Date) -lt $deadline)')
+Check 'Wait-PasteLanded contains its polling loop' ($loopIdx -gt 0)
+$beforeLoop = if ($loopIdx -gt 0) { $fnBody.Substring(0, $loopIdx) } else { $fnBody }
+Check 'Wait-PasteLanded cannot return Unverifiable before it has polled' `
+    (-not ($beforeLoop -match "return 'Unverifiable'"))
 
 # F8: the wait must actually wait. The probe passes an explicit short timeout, so neither the
 # default nor the delay's existence was covered - setting the default to 0 passed everything.
 $toMatch = [regex]::Match($srcText, '\[int\]\$timeoutMs = (\d+)')
 Check 'Wait-PasteLanded has a non-trivial default timeout' `
     ($toMatch.Success -and ([int]$toMatch.Groups[1].Value -ge 300))
-$sw = [Diagnostics.Stopwatch]::StartNew()
+# DIFFERENTIAL, not absolute. PasteState spawns a powershell.exe, so ~1.5s of process startup
+# swamped the poll: the no-wait case measured LONGER than the full-timeout case, and a
+# `>= 100ms` threshold could never fail. Compare the two runs against each other instead, so
+# only the poll's own duration is being measured.
+$swWait = [Diagnostics.Stopwatch]::StartNew()
 $unver = PasteState '{"baseline":"\n","payload":"/review","observed":null}'
-$sw.Stop()
-Check "an unreadable composer is polled for the full timeout, not skipped ($($sw.ElapsedMilliseconds)ms)" `
-    (($unver -eq 'Unverifiable') -and ($sw.ElapsedMilliseconds -ge 100))
+$swWait.Stop()
+$swFast = [Diagnostics.Stopwatch]::StartNew()
+$quick = PasteState '{"baseline":"\n","payload":"/review","observed":"/review\n"}'
+$swFast.Stop()
+$delta = $swWait.ElapsedMilliseconds - $swFast.ElapsedMilliseconds
+Check 'an unreadable composer returns Unverifiable' ($unver -eq 'Unverifiable')
+Check "the unreadable case waits measurably longer than an instant confirm (delta ${delta}ms)" `
+    (($quick -eq 'Confirmed') -and ($delta -ge 60))
 
 # F6: the user's own flagship button is a 12,752-character, 482-line prompt. Every other probe
 # case is a single short line, so multi-line round-tripping through the UIA read-back was

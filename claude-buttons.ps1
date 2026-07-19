@@ -1,36 +1,21 @@
-﻿# All non-switch parameters are named-only. $EscapeProbe used to be positional, so a stray
-# token from an unquoted path (-AddButton C:\My Temp\p.json) bound to it and the script exited
-# 0 having written nothing - a caller checking only the exit code reports success for a button
+﻿# All non-switch parameters are named-only: a stray token from an unquoted path
+# (-AddButton C:\My Temp\p.json) used to bind positionally and the script exited 0 having
+# written nothing - a caller checking only the exit code reports success for a button
 # that was never saved.
 param(
     [switch]$SmokeTest,
-    [Parameter(DontShow)][string]$EscapeProbe = $null,
     [Parameter(DontShow)][string]$PasteProbe = $null,
     [string]$AddButton,
     [string]$RemoveButton
 )
 
-# Encode text into a SendKeys string: newlines become Shift+Enter (a soft line break, not
-# a submit) and SendKeys metacharacters are escaped to their literal form. This decides
-# EXACTLY which keystrokes get injected into the Claude window, so it is defined first and
-# has a test hook: `-EscapeProbe <text>` prints the encoding and exits before the UI builds,
-# letting it be unit-tested without a window or message loop.
-function Escape-SendKeys([string]$s) {
-    $s = $s -replace "`r`n", "`n" -replace "`r", "`n"
-    $out = New-Object System.Text.StringBuilder
-    foreach ($ch in $s.ToCharArray()) {
-        if ($ch -eq "`n") { [void]$out.Append('+{ENTER}') }  # Shift+Enter = newline without sending
-        elseif ('+^%~(){}[]'.Contains([string]$ch)) { [void]$out.Append('{' + $ch + '}') }
-        else { [void]$out.Append($ch) }
-    }
-    $out.ToString()
-}
-# -EscapeProbe <path> reads the raw input from a FILE (a file preserves newlines and
-# metacharacters that command-line argument passing would mangle), prints the encoding,
-# and exits before anything else runs.
-# Test for EMPTINESS, not for $null: a [string]-typed parameter coerces an unbound $null to
-# '', so a $null check is always true and the probe fires on every ordinary launch.
-if (-not [string]::IsNullOrEmpty($EscapeProbe)) { [Console]::Out.Write((Escape-SendKeys ([IO.File]::ReadAllText($EscapeProbe)))); exit 0 }
+# THERE IS NO TYPING PATH. Escape-SendKeys and its -EscapeProbe hook lived here and encoded
+# text into synthetic keystrokes as a fallback for when the clipboard paste could not be
+# confirmed. That fallback was the leak: it typed the correct text underneath whatever had
+# actually landed in the box - often the user's own clipboard - and pressed Enter, sending
+# both. Removing the fallback made the function dead code, and deleting it removes the whole
+# class: this script now synthesises exactly two keystrokes, '^v' and '{ENTER}', and a test
+# asserts that no third one appears.
 # Claude Buttons - a slim button strip that docks onto the Claude desktop app's bottom bar.
 # - Visible only when the Claude window itself is in the foreground
 # - Click (or right-click) the vertical 3-dot kebab for the menu
@@ -43,7 +28,7 @@ if (-not [string]::IsNullOrEmpty($EscapeProbe)) { [Console]::Out.Write((Escape-S
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.7.3'
+$CB_VERSION = '1.8.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -790,7 +775,7 @@ if ($PSBoundParameters.ContainsKey('AddButton') -or $PSBoundParameters.ContainsK
     # The value is either a PATH to a UTF-8 JSON file or inline JSON. Prefer the file: a button's
     # text can be a multi-paragraph prompt containing quotes and newlines, and those do not
     # survive being passed as a command-line argument through PowerShell. Same reason
-    # -EscapeProbe takes a file.
+    # -PasteProbe takes a file for the same reason.
     $isAdd = $PSBoundParameters.ContainsKey('AddButton')
     $raw = if ($isAdd) { $AddButton } else { $RemoveButton }
     if ([string]::IsNullOrWhiteSpace($raw)) { [Console]::Error.Write('Empty payload argument.'); exit 2 }
@@ -1128,8 +1113,8 @@ function Show-IconPicker([string]$current) {
     return $out
 }
 
-# Escape-SendKeys is defined at the top of the script (it is pure and the -EscapeProbe
-# test hook needs it before any other top-level code runs).
+# (removed: the Escape-SendKeys note - there is no typing path any more, see the top)
+
 
 function Get-ShortLabel($b) {
     if ($b.short) { return [string]$b.short }
