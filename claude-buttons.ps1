@@ -340,6 +340,12 @@ public class FlyoutSurface : Control {
     public Color Surface = Color.FromArgb(46, 45, 43);
     public Color EdgeColor = Color.FromArgb(78, 75, 70);
     public int StemLeft, StemWidth, StemTop;   // where the group button sits, in flyout coords
+    // Vertical bars rotate the whole thing 90 degrees: the pill is a column beside the button
+    // and the stem runs horizontally back to it. Same T, laid on its side.
+    public bool Vertical = false;
+    public bool StemOnRight = false;   // the stem leaves the pill's RIGHT edge (bar is to the right)
+    public int PillWidth;              // width of the member column
+    public int StemY, StemHeight;      // the stem's vertical extent, in flyout coords
     // ONE corner radius for the whole silhouette, set to the button hover's radius. Deriving it
     // from each part's own height gave the pill, the stem and the hover highlight three
     // different roundings, so the member row read as blobbier than the button it hangs off.
@@ -368,6 +374,28 @@ public class FlyoutSurface : Control {
         p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
         p.CloseFigure();
     }
+    // Square on the edge that tucks under the pill, rounded on the outer edge. Rounding the
+    // tucked corners pinched the silhouette into a waist where the two shapes meet.
+    // Both traverse CLOCKWISE, like AddRound and AddRoundBottom. FillMode.Winding cancels
+    // overlapping regions that run in opposite directions, so a sub-path wound the other way
+    // punches a hole through the union exactly where the stem is supposed to fuse to the pill.
+    static void AddRoundRight(GraphicsPath p, RectangleF r, float rad) {
+        float d = rad * 2;
+        p.AddLine(r.X, r.Y, r.Right - rad, r.Y);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddLine(r.Right - rad, r.Bottom, r.X, r.Bottom);
+        p.CloseFigure();
+    }
+    static void AddRoundLeft(GraphicsPath p, RectangleF r, float rad) {
+        float d = rad * 2;
+        p.AddLine(r.X + rad, r.Y, r.Right, r.Y);
+        p.AddLine(r.Right, r.Y, r.Right, r.Bottom);
+        p.AddLine(r.Right, r.Bottom, r.X + rad, r.Bottom);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.CloseFigure();
+    }
     // Union of pill + stem. Drawn a half pixel in from the bitmap edge, or the antialiased
     // outer edge falls outside the bitmap and the border looks shaved off on one side.
     public GraphicsPath BuildShape(float inset) {
@@ -375,6 +403,25 @@ public class FlyoutSurface : Control {
         float o = inset + 0.5f;
         float rad = Rad;
         float bottom = Height - BottomPad;
+        if (Vertical) {
+            // One member: a plain rounded rectangle, no junction to pinch.
+            if (Math.Abs(StemHeight - Height) <= 1) {
+                AddRound(path, new RectangleF(o, o, Width - 2 * o, Height - 2 * o), rad);
+                return path;
+            }
+            float pw = PillWidth;
+            float px = StemOnRight ? o : (Width - pw + o);
+            AddRound(path, new RectangleF(px, o, pw - 2 * o, Height - 2 * o), rad);
+            float stemRad = Math.Max(4, rad);
+            if (StemOnRight) {
+                float sxr = pw - rad;                       // overlap into the pill so they fuse
+                AddRoundRight(path, new RectangleF(sxr, StemY + o, (Width - o) - sxr, StemHeight - 2 * o), stemRad);
+            } else {
+                float sxl = Width - pw + rad;
+                AddRoundLeft(path, new RectangleF(o, StemY + o, sxl - o, StemHeight - 2 * o), stemRad);
+            }
+            return path;
+        }
         // Same width (a single member) is one plain rounded rectangle - there is no junction to
         // pinch, and building it as a union produced a visible seam.
         if (Math.Abs(StemWidth - Width) <= 1) {
@@ -1934,6 +1981,74 @@ function Show-GroupFlyout($btn, [bool]$pin) {
             $frm.Controls.Add($mb)
             $mbs += $mb
         }
+        # A group on a vertical bar opens SIDEWAYS with its members stacked, mirroring the bar's
+        # own orientation. Same T, rotated: the stem still points back at the group button, which
+        # is what says which button the flyout belongs to when several sit stacked together.
+        $vBar = Get-ButtonBar $tag
+        if ($vBar -ne 'row') {
+            $onRight = ($vBar -eq 'left')      # a LEFT bar opens to the right, and vice versa
+            $stemH = $btn.Height + 2 * (S 3)
+            $runH = 0
+            foreach ($mb in $mbs) { $runH += $mb.Height }
+            if ($mbs.Count -gt 1) { $runH += $gap * ($mbs.Count - 1) }
+            $colW = 0
+            foreach ($mb in $mbs) { if ($mb.Width -gt $colW) { $colW = $mb.Width } }
+            $pillW2 = $colW + 2 * $pad
+            $pillH3 = [Math]::Max($runH + 2 * $pad, $stemH)
+            if ($pillH3 -le $stemH + (S 8)) { $pillH3 = $stemH }
+            $stemLen = $btn.Width + (S 2)
+            $totalW = $pillW2 + $stemLen
+            $y = [int](($pillH3 - $runH) / 2)
+            $colX = 0
+            if (-not $onRight) { $colX = $stemLen }   # pill sits past the stem when it opens left
+            foreach ($mb in $mbs) {
+                $mb.Left = [int]($colX + ($pillW2 - $mb.Width) / 2)
+                $mb.Top = $y
+                $y += $mb.Height + $gap
+            }
+            $bScreen = $btn.PointToScreen([System.Drawing.Point]::new(0, 0))
+            $stemY = [int](($pillH3 - $stemH) / 2)
+            $top = [int]($bScreen.Y + $btn.Height / 2 - $pillH3 / 2)
+            $left = if ($onRight) { [int]($bScreen.X - $totalW + $btn.Width + (S 1)) } else { [int]($bScreen.X - (S 1)) }
+            # Keep the stem exactly centred on its button even if the column is clamped, the
+            # same rule the horizontal flyout follows.
+            $stemY = [Math]::Max(0, [Math]::Min($stemY, $pillH3 - $stemH))
+            $script:flySurface.Vertical = $true
+            $script:flySurface.StemOnRight = $onRight
+            $script:flySurface.PillWidth = $pillW2
+            $script:flySurface.StemY = $stemY
+            $script:flySurface.StemHeight = $stemH
+            $script:flySurface.Rad = [Math]::Max(4, [Math]::Floor($mh / 4))
+            $script:flySurface.BottomPad = 0
+            $script:flySurface.Width = $totalW
+            $script:flySurface.Height = $pillH3
+            $ob = New-Object PillButton
+            $ob.Tag = $tag
+            $ob.Width = $btn.Width; $ob.Height = $btn.Height
+            Set-PillFace $ob
+            $ob.Width = $btn.Width; $ob.Height = $btn.Height
+            $ob.ForeColor = $btn.ForeColor; $ob.Fill = $btn.Fill; $ob.Bold = $btn.Bold; $ob.Glyph = $btn.Glyph
+            $ob.HoverFill = $colHover; $ob.DownFill = $colDown
+            $ob.AccessibleName = $btn.AccessibleName
+            $ob.Left = $bScreen.X - $left
+            $ob.Top = $bScreen.Y - $top
+            $ob.ContextMenuStrip = $btnMenu
+            $ob.add_MouseDown({ if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:menuSource = $this } })
+            $ob.add_Click({ Hide-GroupFlyout })
+            $ob.add_MouseEnter({ $script:hoverCtrl = $this; $script:hoverAt = Get-Date })
+            $ob.add_MouseLeave({ if ($script:hoverCtrl -eq $this) { $script:hoverCtrl = $null } })
+            $ob.add_Repaint({ Update-FlyoutSurface })
+            $frm.Controls.Add($ob)
+            $frm.Size = New-Object System.Drawing.Size($totalW, $pillH3)
+            $frm.Location = New-Object System.Drawing.Point($left, $top)
+            $frm.Tag = $btn.FindForm()
+            $script:flyOwner = $btn
+            $script:flyPinned = $pin
+            if (-not $frm.Visible) { $frm.Show() }
+            Update-FlyoutSurface
+            return
+        }
+        $script:flySurface.Vertical = $false
         $stemW = $btn.Width + 2 * (S 3)
         $runW = 0
         foreach ($mb in $mbs) { $runW += $mb.Width }
