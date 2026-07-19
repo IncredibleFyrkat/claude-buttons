@@ -198,6 +198,22 @@ public class PillButton : Control {
     // off". Darkening the fill alone breaks the state cue, so the foreground brightens too.
     public Color ToggleFill = Color.FromArgb(144, 102, 36);  // 3.30:1 vs the bar
     public Color ToggleFore = Color.FromArgb(255, 255, 255); // 5.11:1 on ToggleFill
+    // State RINGS. A button sitting on the group flyout sits on a LIGHTER surface (46,45,43)
+    // than the bar (29,29,28), which swallows every fill-based cue: the hover fill measures
+    // 1.04:1 there and the toggle fill 2.69:1, and a flyout member is a 27px icon with no
+    // label, so the fill is the only thing saying "this one is live".
+    //
+    // The fix is NOT a brighter fill. A fill that clears 3:1 against the flyout surface has to
+    // reach about (120,117,112), and the icon glyph on top of it (168,168,168) then measures
+    // 1.93:1 - the same trap the ToggleFill comment above describes, moved one control over.
+    // A ring instead puts the required 3:1 on the component BOUNDARY, where WCAG 1.4.11 asks
+    // for it, and leaves the fill dark enough for the glyph to stay readable.
+    //
+    // Color.Empty means "no ring", which is what every button on the bar uses - so the bar is
+    // pixel-identical to before and only the flyout opts in.
+    public Color HoverRing = Color.Empty;
+    public Color DownRing = Color.Empty;
+    public Color ToggleRing = Color.Empty;
     public Color Accent = Color.Empty; // border on per-chat buttons
     public bool Bold = false;          // draw the glyph with extra stroke weight (icons)
     public bool Glyph = false;         // the Text is an icon glyph, so centre its INK, not its metrics box
@@ -236,6 +252,15 @@ public class PillButton : Control {
         p.CloseFigure();
         return p;
     }
+    // Which ring the current state asks for. Press outranks hover; a toggled button that is
+    // ALSO being hovered/pressed shows the interaction ring, because that is the transient
+    // state the user is asking about - the toggle keeps its fill and its dot either way.
+    Color StateRing() {
+        if (down) return DownRing;
+        if (hover) return HoverRing;
+        if (toggled) return ToggleRing;
+        return Color.Empty;
+    }
     protected override void OnPaint(PaintEventArgs e) {
         var g = e.Graphics;
         g.Clear(BackColor);
@@ -254,6 +279,12 @@ public class PillButton : Control {
         if (Accent != Color.Empty) {
             using (var path = RoundRect(rc, rad))
             using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
+        }
+        // State ring LAST, so a live state still reads on a per-chat button.
+        Color ring = StateRing();
+        if (ring != Color.Empty) {
+            using (var path = RoundRect(rc, rad))
+            using (var pen = new Pen(ring, 2f)) g.DrawPath(pen, path);
         }
         // Toggle-on gets a NON-COLOR cue (a bright left dot) so state isn't conveyed by fill alone.
         int textLeft = 0;
@@ -291,6 +322,13 @@ public class PillButton : Control {
         if (Accent != Color.Empty) {
             using (var path = RoundRect(rcEdge, rad))
             using (var pen = new Pen(Accent, 2f)) g.DrawPath(pen, path);
+        }
+        // The flyout composites through THIS path, not OnPaint, so the ring has to be drawn
+        // here too or the whole fix is invisible exactly where it was needed.
+        Color ring2 = StateRing();
+        if (ring2 != Color.Empty) {
+            using (var path = RoundRect(rcEdge, rad))
+            using (var pen = new Pen(Color.FromArgb(255, ring2), 2f)) g.DrawPath(pen, path);
         }
         int textLeft = 0;
         if (toggled) {
@@ -560,7 +598,23 @@ public class CkRenderer : ToolStripProfessionalRenderer {
             e.Graphics.FillRectangle(b, new Rectangle(Point.Empty, e.Item.Size));
     }
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
-        e.TextColor = e.Item.Enabled ? Color.FromArgb(214, 210, 202) : Color.FromArgb(130, 127, 120);
+        // Honour a ForeColor the ITEM set on itself. This renderer is installed globally via
+        // ToolStripManager.Renderer and a ContextMenuStrip defaults to ManagerRenderMode, so
+        // overwriting unconditionally repainted every colour-picker swatch in the same grey:
+        // the picker that exists to show you the colour showed none of them, and the only way
+        // to see what you had chosen was to apply it and reopen the menu.
+        //
+        // "Set on itself" is the test, not "non-empty": ToolStripItem.ForeColor inherits from
+        // its owner and comes back as the ambient default rather than Color.Empty, so a plain
+        // check for Empty would never fire. Anything still on the ambient default keeps the
+        // theme colour; a disabled item is always greyed, since an unusable item must not
+        // advertise itself in full colour.
+        Color own = e.Item.ForeColor;
+        bool custom = own != Color.Empty
+                   && own != Control.DefaultForeColor
+                   && own != SystemColors.ControlText;
+        if (custom && e.Item.Enabled) e.TextColor = own;
+        else e.TextColor = e.Item.Enabled ? Color.FromArgb(214, 210, 202) : Color.FromArgb(130, 127, 120);
         base.OnRenderItemText(e);
     }
     protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) {
@@ -767,6 +821,7 @@ function Write-InstallMarker {
 $script:cfgLock = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsConfig')
 
 function Read-FreshConfig {
+    $lastErr = ''
     for ($i = 0; $i -lt 3; $i++) {
         try {
             $c = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -774,9 +829,21 @@ function Read-FreshConfig {
             if ($null -eq $c.buttons) { $c | Add-Member -NotePropertyName buttons -NotePropertyValue @() -Force }
             return $c
         }
-        catch { Start-Sleep -Milliseconds 120 }
+        catch { $lastErr = [string]$_.Exception.Message; Start-Sleep -Milliseconds 120 }
     }
-    Write-CkLog 'Could not read buttons.json (locked/invalid after 3 attempts)'
+    # Name the one unreadable-config cause a user can create by hand and could never diagnose
+    # from a generic message: PS 5.1's ConvertFrom-Json THROWS on an object carrying two keys
+    # that differ only in case ("Deploy" and "deploy"). The panel then falls back to defaults,
+    # which reads on screen as a spontaneous reset - buttons apparently gone, with nothing said.
+    # This is also the reason group names are matched case-INSENSITIVELY (see Resolve-GroupName):
+    # the panel must never be able to WRITE a file it cannot read back.
+    if ($lastErr -match 'duplicated keys') {
+        Write-CkLog ("buttons.json contains two keys that differ only in CASE, which PowerShell 5.1 cannot parse. " +
+                     "The panel is running on DEFAULTS - your buttons are still in the file and it has not been " +
+                     "changed, but the duplicate must be renamed by hand before they come back. Details: $lastErr")
+    } else {
+        Write-CkLog ("Could not read buttons.json (locked/invalid after 3 attempts)" + $(if ($lastErr) { ": $lastErr" } else { '' }))
+    }
     return $null
 }
 
@@ -1027,11 +1094,19 @@ function Set-GroupProp([string]$name, [string]$prop, $value) {
         if (-not $cfg.PSObject.Properties['groups'] -or -not $cfg.groups) {
             $cfg | Add-Member -NotePropertyName groups -NotePropertyValue ([pscustomobject]@{}) -Force
         }
-        if (-not $cfg.groups.PSObject.Properties[$name]) {
-            $cfg.groups | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{}) -Force
+        # Resolve against the FRESH file, not the in-memory config: this is the one place that
+        # can mint a new key under config.groups, and adding "deploy" beside an existing
+        # "Deploy" writes a JSON object that PS 5.1's ConvertFrom-Json refuses to parse - after
+        # which buttons.json is unreadable and the panel runs on defaults. Reuse the existing
+        # casing instead, which is also what the user sees on the bar.
+        $key = $null
+        foreach ($p in $cfg.groups.PSObject.Properties) { if ($p.Name -eq $name) { $key = $p.Name; break } }
+        if (-not $key) {
+            $key = $name
+            $cfg.groups | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) -Force
         }
-        if ($null -eq $value -or $value -eq '') { $cfg.groups.$name.PSObject.Properties.Remove($prop) }
-        else { $cfg.groups.$name | Add-Member -NotePropertyName $prop -NotePropertyValue $value -Force }
+        if ($null -eq $value -or $value -eq '') { $cfg.groups.$key.PSObject.Properties.Remove($prop) }
+        else { $cfg.groups.$key | Add-Member -NotePropertyName $prop -NotePropertyValue $value -Force }
         $cfg
     }
 }
@@ -1085,6 +1160,28 @@ function Same-Button($a, $b) {
     # a genuinely different button "deploy"/"/DEPLOY PROD". Two buttons whose text differs only
     # by case are two different prompts, and treating them as one deleted the wrong one.
     ($a.label -ceq $b.label) -and ($a.text -ceq $b.text) -and ([string]$a.chat -ceq [string]$b.chat)
+}
+
+# GROUP names go the OTHER way: they are matched case-INSENSITIVELY, on purpose, and the
+# difference from Same-Button above is not an oversight.
+#
+# Same-Button is -ceq because a button's label+text IS the prompt that gets sent: "Deploy" and
+# "deploy" are two different payloads and treating them as one deleted the wrong one. A group
+# name is not a payload. It is a folder label, and it is also a JSON KEY under config.groups -
+# and PowerShell 5.1's ConvertFrom-Json THROWS on an object with two keys differing only in
+# case. So a case-SENSITIVE group would let the panel write a buttons.json that the panel can
+# never read again: every button gone, silently, recoverable only by hand-editing a file the
+# user has no reason to suspect. That failure is unrecoverable in the UI; a merge is not.
+#
+# The cost of case-insensitivity is silent merging, so it is made NOT silent: every entry point
+# snaps a typed name onto the casing that already exists, so joining "deploy" to an existing
+# "Deploy" visibly files the button under "Deploy" (that is the row that ticks in the menu, and
+# that is the face that appears on the bar) instead of quietly creating an invisible rival.
+# -eq here is deliberate and load-bearing; do not "fix" it to -ceq without reading the above.
+function Resolve-GroupName([string]$name) {
+    if (-not $name) { return '' }
+    foreach ($n in (Get-GroupNames)) { if ($n -eq $name) { return $n } }
+    return $name
 }
 
 # ---------- Locked CLI entry points for the /pin and /unpin skills ----------
@@ -1881,17 +1978,46 @@ $colDown  = [System.Drawing.Color]::FromArgb(58, 58, 56)   # a touch brighter fo
 $colText  = [System.Drawing.Color]::FromArgb(214, 210, 202)
 $colIcon  = [System.Drawing.Color]::FromArgb(168, 168, 168)   # a8a8a8 - icon glyphs + kebab dots (soft grey, like Claude's own)
 $colAccent = [System.Drawing.Color]::FromArgb(198, 146, 78)   # border on per-chat buttons (brightened for WCAG 1.4.11)
+# ---- Group-flyout state cues ----
+# The flyout surface is 46,45,43 (see FlyoutSurface.Surface), lighter than the bar, and the bar's
+# hover fill measured 1.04:1 on it - invisible. These are computed against the FLYOUT's own
+# surface instead. The ring carries the 3:1 (WCAG 1.4.11); the fill stays dark so the icon glyph
+# (a8a8a8) on top of it keeps its 4.5:1. Measured against the flyout surface / with the glyph on
+# the fill:
+#   hover fill 56,55,52    1.16:1 surface   glyph on it 5.01:1
+#   hover ring 134,131,124 3.64:1 surface
+#   press fill 62,61,58    1.27:1 surface   glyph on it 4.57:1
+#   press ring 196,191,181 7.51:1 surface
+#   toggle ring 236,200,130 8.62:1 surface, 3.20:1 against ToggleFill
+# The toggle ring reuses the on-state DOT colour deliberately: the toggled member then reads as
+# one amber object, and the ON state stays non-user-colourable exactly as ToggleFill requires.
+$colFlyHover = [System.Drawing.Color]::FromArgb(56, 55, 52)
+$colFlyDown  = [System.Drawing.Color]::FromArgb(62, 61, 58)
+$colFlyHoverRing = [System.Drawing.Color]::FromArgb(134, 131, 124)
+$colFlyDownRing  = [System.Drawing.Color]::FromArgb(196, 191, 181)
+$colFlyToggleRing = [System.Drawing.Color]::FromArgb(236, 200, 130)
 
 # ---------- Per-KIND colors ----------
 # Buttons are coloured by what they DO, not one at a time: prompts, slash commands, groups
 # and toggles each get their own colour, so the bar reads as categories instead of confetti.
 # Every swatch is light enough on the 1d1d1c bar to clear WCAG 1.4.11 (3:1 non-text).
+#
+# Each swatch is ALSO drawn as the text of its own menu row in the colour picker, which makes
+# it 1.4.3 text (4.5:1) against BOTH menu row colours: the resting row (40,39,37) and the
+# SELECTED row (62,60,56). The selected row is the binding one - you have to hover a row to
+# click it, so the highlighted state is exactly when the label is being read. That constraint
+# only became live when the renderer stopped overwriting these colours (see OnRenderItemText);
+# until then every row rendered in the same grey and nothing here was measured on screen.
+# red was 4.24:1 and blue 4.32:1 on the highlighted row and are brightened here to clear 4.5.
+# Measured (normal row / highlighted row):
+#   gray 6.28 / 4.63   blue 6.57 / 4.84   green 7.14 / 5.26
+#   amber 6.60 / 4.86  red  6.42 / 4.73   purple 6.24 / 4.60
 $script:ckPalette = [ordered]@{
     gray   = [System.Drawing.Color]::FromArgb(168, 168, 168)
-    blue   = [System.Drawing.Color]::FromArgb(107, 166, 232)
+    blue   = [System.Drawing.Color]::FromArgb(113, 176, 246)
     green  = [System.Drawing.Color]::FromArgb(123, 196, 127)
     amber  = [System.Drawing.Color]::FromArgb(217, 162,  95)
-    red    = [System.Drawing.Color]::FromArgb(224, 138, 123)
+    red    = [System.Drawing.Color]::FromArgb(237, 146, 130)
     purple = [System.Drawing.Color]::FromArgb(183, 155, 224)
 }
 # Which colour slot a button draws from. Toggles are asked twice - off and on - because the
@@ -2056,8 +2182,12 @@ function Show-GroupFlyout($btn, [bool]$pin) {
             $mb.Fill = if ($m.icon) { $script:barColor } else { $colFill }
             $mb.Bold = [bool]$m.icon
             $mb.Glyph = [bool]$m.icon
-            $mb.HoverFill = $colHover
-            $mb.DownFill = $colDown
+            # Flyout-specific state cues: the bar's hover fill is invisible on this surface.
+            $mb.HoverFill = $colFlyHover
+            $mb.DownFill = $colFlyDown
+            $mb.HoverRing = $colFlyHoverRing
+            $mb.DownRing = $colFlyDownRing
+            $mb.ToggleRing = $colFlyToggleRing
             if ($m.chat) { $mb.Accent = $colAccent }
             $mb.AccessibleName = [string]$m.label
             $mb.ContextMenuStrip = $btnMenu
@@ -2121,7 +2251,10 @@ function Show-GroupFlyout($btn, [bool]$pin) {
             Set-PillFace $ob
             $ob.Width = $btn.Width; $ob.Height = $btn.Height
             $ob.ForeColor = $btn.ForeColor; $ob.Fill = $btn.Fill; $ob.Bold = $btn.Bold; $ob.Glyph = $btn.Glyph
-            $ob.HoverFill = $colHover; $ob.DownFill = $colDown
+            # The group face sits INSIDE the flyout's stem, which is the same Surface colour as
+            # the pill, so it needs the flyout's cues too - not the bar's.
+            $ob.HoverFill = $colFlyHover; $ob.DownFill = $colFlyDown
+            $ob.HoverRing = $colFlyHoverRing; $ob.DownRing = $colFlyDownRing
             $ob.AccessibleName = $btn.AccessibleName
             $ob.Left = $bScreen.X - $left
             $ob.Top = $bScreen.Y - $top
@@ -2210,8 +2343,12 @@ function Show-GroupFlyout($btn, [bool]$pin) {
         $ob.Fill = $btn.Fill
         $ob.Bold = $btn.Bold
         $ob.Glyph = $btn.Glyph
-        $ob.HoverFill = $colHover
-        $ob.DownFill = $colDown
+        # Same surface as the members (the stem is filled with FlyoutSurface.Surface), so the
+        # same flyout-specific cues rather than the bar's.
+        $ob.HoverFill = $colFlyHover
+        $ob.DownFill = $colFlyDown
+        $ob.HoverRing = $colFlyHoverRing
+        $ob.DownRing = $colFlyDownRing
         $ob.AccessibleName = $btn.AccessibleName
         $ob.Left = $bScreen.X - $left
         $ob.Top  = $bScreen.Y - $top
@@ -2226,8 +2363,9 @@ function Show-GroupFlyout($btn, [bool]$pin) {
         $frm.Size = New-Object System.Drawing.Size($pillW, $height)
         $frm.Location = New-Object System.Drawing.Point($left, $top)
         $frm.Tag = $btn.FindForm()   # owning strip, so member clicks resolve to the right pane
-        Write-CkLog ("FLY btnW={0} btnScrX={1} pillW={2} stemW={3} stemLeft={4} wantLeft={5} setLeft={6} frmLeft={7} memX={8}" -f `
-            $btn.Width, $bScreen.X, $pillW, $stemW, $stemLeft, $desiredLeft, $left, $frm.Left, $(if ($mbs.Count) { $mbs[0].Left } else { -1 }))
+        # (A geometry trace used to be logged here. Show-GroupFlyout is bound to MouseEnter on
+        # every group button, and the line embedded changing screen coordinates, so Write-CkLog's
+        # identical-message dedupe never caught it: the log grew with mouse movement alone.)
         $script:flyOwner = $btn
         $script:flyPinned = $pin
         if (-not $frm.Visible) { $frm.Show() }
@@ -2622,12 +2760,31 @@ $btnMenu.add_Opening({
     $isGrp = [bool]($script:menuSource -and $script:menuSource.Tag -and $script:menuSource.Tag.__isGroup)
     # Move stays live for a group: it reorders the whole group as one block on the bar.
     foreach ($mi in @($miEdit, $miToggle, $miGroup, $miRemove)) { $mi.Enabled = -not $isGrp }
+    # A fresh open is never pre-armed: the confirm must be two clicks in ONE menu session.
+    # The hold flag is cleared alongside it, so a stale hold can never swallow the first click
+    # of the NEXT menu session.
+    $script:dissolveArmedFor = $null
+    $script:dissolveHoldOpen = $false
     $miDissolve.Text = L 'dissolve'
     $miDissolve.Visible = $isGrp
     if (-not $isGrp) { Fill-GroupMenu } else { $miGroup.DropDownItems.Clear() }
     $miBar.Text = L 'moveBar'
     Fill-BarMenu
     if ($script:menuSource -and $script:menuSource.Tag) { $miToggle.Checked = [bool]$script:menuSource.Tag.toggle } else { $miToggle.Checked = $false }
+})
+# Keep the menu OPEN after the arming click, or the "Confirm?" caption the user is supposed to
+# click would be painted onto a menu that is already closing. Cancel is honoured for the
+# ItemClicked close reason specifically; every other reason (clicking away, Escape) is a real
+# dismissal and disarms, so an armed dissolve can never survive into a later menu session.
+$btnMenu.add_Closing({
+    if ($script:dissolveHoldOpen -and
+        $_.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked) {
+        $script:dissolveHoldOpen = $false   # one click only
+        $_.Cancel = $true
+    } else {
+        $script:dissolveArmedFor = $null
+        $script:dissolveHoldOpen = $false
+    }
 })
 
 $miRename = $btnMenu.Items.Add('Rename...')
@@ -2665,10 +2822,30 @@ function Set-ButtonGroup([string]$gname) {
         if (-not ($src -and $src.Tag)) { return }
         $t = $src.Tag
         if ($t.__isGroup) { return }   # a group button is not itself groupable
+        # Snap onto the casing that already exists, so joining "deploy" to "Deploy" files the
+        # button under the group the user can actually see. See Resolve-GroupName.
+        $gname = Resolve-GroupName $gname
         $ok = Update-Buttons { param($btns)
+            $btns = @($btns)
+            # A group must not straddle two bars. Set-ButtonBar already enforces that when a
+            # group MOVES (it drags the whole membership along); joining one has to honour the
+            # same invariant from the other direction, or a left-bar button joining a row-bar
+            # group splits it - and the two strips then disagree about what the group contains,
+            # so the same group shows two different faces and its members render twice.
+            # The joiner adopts the bar the group already lives on.
+            $destBar = $null
+            if ($gname) {
+                foreach ($b in $btns) {
+                    if (([string]$b.group -eq $gname) -and -not (Same-Button $b $t)) { $destBar = Get-ButtonBar $b; break }
+                }
+            }
             foreach ($b in $btns) {
                 if (Same-Button $b $t) {
-                    if ($gname) { $b | Add-Member -NotePropertyName group -NotePropertyValue $gname -Force }
+                    if ($gname) {
+                        $b | Add-Member -NotePropertyName group -NotePropertyValue $gname -Force
+                        if ($destBar -eq 'row') { $b.PSObject.Properties.Remove('bar') }
+                        elseif ($destBar) { $b | Add-Member -NotePropertyName bar -NotePropertyValue $destBar -Force }
+                    }
                     else { $b.PSObject.Properties.Remove('group') }
                 }
             }
@@ -2681,6 +2858,11 @@ function Set-ButtonGroup([string]$gname) {
 function New-ButtonGroup {
     $val = Show-InputDialog (L 'groupTitle') (L 'groupAsk') ''
     if ($null -eq $val) { return }   # cancelled
+    # Cancel and "nothing usable typed" are different answers, and only cancel was handled:
+    # "   " trims to '', and Set-ButtonGroup '' is the code path that REMOVES a button from its
+    # group. So asking to create a group and typing spaces silently ungrouped the button - the
+    # opposite of what was asked for, with no message. Empty-after-trim is now a no-op.
+    if ([string]::IsNullOrWhiteSpace($val)) { return }
     Set-ButtonGroup $val.Trim()
 }
 
@@ -2748,11 +2930,38 @@ function Fill-GroupMenu {
 # bar (moving a group sets it on every member), and they already sit where the group face did,
 # so dropping the group field alone leaves them on the same bar in the same position. The
 # orphaned group definition is pruned by Update-Buttons.
+#
+# Dissolving DISCARDS things: the orphan prune in Update-Buttons drops the group definition, so
+# the custom icon and label the user chose for the group are gone, recreatable only by hand.
+# And it sits directly under "Remove this button" in the same menu. This codebase already has a
+# convention for an action that discards something - the /clear button ships with confirm = $true
+# and takes two clicks within 3 s, showing L 'confirm' in between - so dissolve gets the same
+# rule rather than a new one.
+$script:dissolveArmedFor = $null
+$script:dissolveArmedAt = Get-Date '2000-01-01'
+$script:dissolveHoldOpen = $false
+# Set the menu item's caption. A separate function ONLY so the two-click decision below can be
+# exercised headlessly - the arming logic itself stays in the handler, where it is the thing
+# under test.
+function Set-DissolveLabel([string]$key) { try { $miDissolve.Text = L $key } catch {} }
 $miDissolve.add_Click({
     try {
         $src = $script:menuSource
         if (-not ($src -and $src.Tag -and $src.Tag.__isGroup)) { return }
         $g = [string]$src.Tag.group
+        # First click ARMS and changes nothing on disk. Same 3 s window as the button path.
+        if (($script:dissolveArmedFor -ne $g) -or (((Get-Date) - $script:dissolveArmedAt).TotalSeconds -gt 3)) {
+            $script:dissolveArmedFor = $g
+            $script:dissolveArmedAt = Get-Date
+            # Hold the menu open for THIS click only. The flag is consumed by the very next
+            # close attempt, so clicking any OTHER item afterwards closes the menu normally
+            # instead of being swallowed by an arm that is still pending.
+            $script:dissolveHoldOpen = $true
+            Set-DissolveLabel 'confirm'
+            return
+        }
+        $script:dissolveArmedFor = $null
+        Set-DissolveLabel 'dissolve'
         $ok = Update-Buttons {
             param($btns)
             foreach ($b in $btns) { if ([string]$b.group -eq $g) { $b.PSObject.Properties.Remove('group') } }
@@ -3540,10 +3749,13 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
     $panel.SuspendLayout()
     $old = @($panel.Controls)
     $panel.Controls.Clear()
-    $vis = @(Get-VisibleButtons $paneTitle $isPrimary)
+    # Filter by bar BEFORE building, exactly like Build-StripPanel does for the row. Filtering
+    # per-item instead (and leaving $vis unfiltered) meant the group's `members` list below was
+    # still drawn from every bar: a group split across two bars showed a different membership in
+    # the row's flyout than in the side strip's, and its off-bar members rendered in both.
+    $vis = @(Get-VisibleButtons $paneTitle $isPrimary | Where-Object { (Get-ButtonBar $_) -eq $strip.Side })
     $seenGroup = @{}
     foreach ($src in $vis) {
-        if ((Get-ButtonBar $src) -ne $strip.Side) { continue }
         $gname = [string]$src.group
         if ($gname) {
             if ($seenGroup.ContainsKey($gname)) { continue }

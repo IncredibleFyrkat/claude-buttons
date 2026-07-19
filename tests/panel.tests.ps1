@@ -644,7 +644,12 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($panel, [ref]$n
 function Write-CkLog([string]$m) { $script:ckLog += , $m }
 function Hide-GroupFlyout { $script:rebuilt++ }
 function Rebuild-Buttons { $script:rebuilt++ }
+# The dissolve item's CAPTION is a GUI edge (it writes $miDissolve.Text), so it is stubbed like
+# the others. The two-click DECISION that calls it is not stubbed - it stays in the handler and
+# is what the confirm tests below actually exercise.
+function Set-DissolveLabel([string]$key) { $script:dissolveLabel = $key }
 $script:ckLog = @(); $script:rebuilt = 0; $script:flyForm = $null; $script:menuSource = $null
+$script:dissolveLabel = ''; $script:dissolveArmedFor = $null; $script:dissolveArmedAt = Get-Date '2000-01-01'
 # A test-private mutex name. Taking the panel's real 'Local\ClaudeButtonsConfig' here would
 # contend with the user's running panel for no benefit - the lock's own behaviour is covered
 # by the concurrent-writer test above.
@@ -655,7 +660,8 @@ $script:cfgLock = New-Object System.Threading.Mutex($false, "Local\CbTests-$PID"
 # against whatever definition happened to be left over.
 $panelFns = @('Get-ButtonBlocks', 'Get-ButtonBar', 'Same-Button', 'Get-ColorKind', 'Get-KindColor',
               'Read-FreshConfig', 'Write-ConfigAtomic', 'Update-Buttons', 'Update-Config',
-              'Set-ButtonBar', 'Set-ButtonGroup', 'Set-KindColor', 'Move-GroupMember', 'Move-PinButton')
+              'Set-ButtonBar', 'Set-ButtonGroup', 'Set-KindColor', 'Move-GroupMember', 'Move-PinButton',
+              'Get-GroupNames', 'Resolve-GroupName', 'Set-GroupProp', 'Get-GroupDef')
 $missingFns = @()
 foreach ($fn in $panelFns) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
@@ -675,6 +681,126 @@ foreach ($vn in @('$script:ckBars', '$script:ckPalette')) {
 }
 Check ("the bar list and colour palette were extracted from source" + $(if ($missingVars) { ": MISSING $($missingVars -join ', ')" } else { '' })) `
     ($missingVars.Count -eq 0)
+
+# =====================================================================================
+# F1: the colour picker must actually SHOW its colours, and they must be readable
+# =====================================================================================
+# Fill-ColorMenu sets $mi.ForeColor per swatch, but CkRenderer.OnRenderItemText overwrote
+# e.TextColor unconditionally - and since ToolStripManager.Renderer is set globally and a
+# ContextMenuStrip defaults to ManagerRenderMode, EVERY swatch rendered in the same grey. The
+# picker whose whole job is to show the colour showed none of them.
+# MUTATION: restore the unconditional `e.TextColor = ...` and the first check goes red.
+$renderText = [regex]::Match($srcText, '(?s)protected override void OnRenderItemText\(.*?\n    \}').Value
+Check 'the menu renderer was located in source' ($renderText.Length -gt 60)
+Check 'the menu renderer READS the item ForeColor instead of always overwriting it' `
+    ($renderText -match 'e\.Item\.ForeColor' -and $renderText -match 'e\.TextColor = own')
+Check 'a disabled item is still forced to the greyed colour (an unusable row must not shout)' `
+    ($renderText -match 'e\.Item\.Enabled')
+# ...and the picker must still be the thing that sets those colours.
+Check 'Fill-ColorMenu still colours each swatch from the palette' `
+    ($srcText -match '\$mi\.ForeColor = \$script:ckPalette\[\$n\]')
+
+# Now that the swatches render in their own colours, they are TEXT (WCAG 1.4.3, 4.5:1) against
+# the menu rows - including the SELECTED row, which is the binding case because a row has to be
+# hovered to be clicked. Both row colours are parsed from the code that paints them, so the
+# assertion cannot drift away from the rendering.
+$rowHi   = ArgbFrom 'e\.Item\.Selected \|\| e\.Item\.Pressed\) \? Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$rowNorm = ArgbFrom 'e\.Item\.Pressed\) \? Color\.FromArgb\(\d+,\s*\d+,\s*\d+\) : Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+Check 'both menu row colours are parseable from the renderer' ($rowHi -and $rowNorm)
+Check 'the palette actually has entries to measure' ($script:ckPalette.Keys.Count -ge 6)
+if ($rowHi -and $rowNorm) {
+    foreach ($pn in $script:ckPalette.Keys) {
+        $pc = $script:ckPalette[$pn]
+        $rgb = @([int]$pc.R, [int]$pc.G, [int]$pc.B)
+        # MUTATION: revert red to (224,138,123) or blue to (107,166,232) and the highlighted-row
+        # check goes red at 4.24:1 and 4.32:1 respectively.
+        $rn = Ratio $rgb $rowNorm
+        $rh = Ratio $rgb $rowHi
+        Check ("colour-picker swatch '$pn' is readable on a resting menu row: {0:N2}:1 >= 4.5" -f $rn) ($rn -ge 4.5)
+        Check ("colour-picker swatch '$pn' is readable on a HIGHLIGHTED menu row: {0:N2}:1 >= 4.5" -f $rh) ($rh -ge 4.5)
+    }
+}
+
+# =====================================================================================
+# F2 + F3: state cues inside the group flyout are measured against the FLYOUT's surface
+# =====================================================================================
+# The flyout surface (46,45,43) is lighter than the bar (29,29,28), and the bar's hover fill
+# measured 1.04:1 on it - on a 27px icon with no label, where hover is the only signal that a
+# member is live. The toggled fill measured 2.69:1 there, below the 3:1 a colour-only state cue
+# needs. Every colour below is parsed from the source that uses it.
+$flySurface = ArgbFrom 'public Color Surface = Color\.FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$flyHover     = ArgbFrom '\$colFlyHover\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$flyDown      = ArgbFrom '\$colFlyDown\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$flyHoverRing = ArgbFrom '\$colFlyHoverRing\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$flyDownRing  = ArgbFrom '\$colFlyDownRing\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$flyTogRing   = ArgbFrom '\$colFlyToggleRing\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+$iconGrey     = ArgbFrom '\$colIcon\s*=\s*\[System\.Drawing\.Color\]::FromArgb\((\d+),\s*(\d+),\s*(\d+)\)'
+Check 'every flyout state colour is parseable from source' `
+    ($flySurface -and $flyHover -and $flyDown -and $flyHoverRing -and $flyDownRing -and $flyTogRing -and $iconGrey)
+if ($flySurface -and $flyHoverRing -and $flyDownRing -and $flyTogRing -and $iconGrey -and $togFill) {
+    # MUTATION: point $colFlyHoverRing back at $colHover (48,48,47) and this goes red at 1.04:1.
+    $hr = Ratio $flyHoverRing $flySurface
+    $dr = Ratio $flyDownRing $flySurface
+    Check ("flyout HOVER ring against the flyout's own surface: {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $hr) ($hr -ge 3.0)
+    Check ("flyout PRESS ring against the flyout's own surface: {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $dr) ($dr -ge 3.0)
+    # Press must be distinguishable from hover, or the press cue says nothing new.
+    Check ("the press ring is visibly brighter than the hover ring ({0:N2} vs {1:N2})" -f $dr, $hr) ($dr -ge $hr * 1.3)
+    # MUTATION: set $colFlyToggleRing to Color.Empty / the ToggleFill and this goes red at 2.69:1.
+    $tr = Ratio $flyTogRing $flySurface
+    $trf = Ratio $flyTogRing $togFill
+    Check ("flyout TOGGLE-ON ring against the flyout surface: {0:N2}:1 >= 3.0 (WCAG 1.4.11)" -f $tr) ($tr -ge 3.0)
+    Check ("the toggle ring also separates from the toggle FILL: {0:N2}:1 >= 3.0" -f $trf) ($trf -ge 3.0)
+    # The reason this is a RING and not simply a brighter fill. A fill that clears 3:1 against
+    # the flyout surface reaches ~(120,117,112), and the icon glyph on top of it measures
+    # 1.93:1 - the exact trap the ToggleFill comment describes. Pin the glyph legibility so a
+    # future "just brighten the fill" change cannot pass.
+    # MUTATION: set $colFlyHover to (120,117,112) and this goes red at 1.93:1.
+    $gh = Ratio $iconGrey $flyHover
+    $gd = Ratio $iconGrey $flyDown
+    Check ("the icon glyph stays readable on the flyout hover fill: {0:N2}:1 >= 4.5" -f $gh) ($gh -ge 4.5)
+    Check ("the icon glyph stays readable on the flyout press fill: {0:N2}:1 >= 4.5" -f $gd) ($gd -ge 4.5)
+    # The ON state is still not user-colourable, and white-on-amber must stay where it was.
+    Check ("toggle-ON label on the unchanged fill is still {0:N2}:1 >= 4.5" -f (Ratio $togFore $togFill)) `
+        ((Ratio $togFore $togFill) -ge 4.5)
+}
+# The colours have to be WIRED to the flyout, not merely defined. The bar's own buttons must
+# keep using the bar colours, so this is asserted as a pairing, not a global replace.
+# MUTATION: revert the flyout member to $colHover/$colDown and the first check goes red.
+$flyFn = [regex]::Match($srcText, '(?s)function Show-GroupFlyout.*?\n\}').Value
+Check 'Show-GroupFlyout was located' ($flyFn.Length -gt 200)
+Check 'flyout members take the flyout hover/press fills, not the bar''s' `
+    ($flyFn -match '\$mb\.HoverFill = \$colFlyHover' -and $flyFn -match '\$mb\.DownFill = \$colFlyDown')
+Check 'flyout members get hover, press AND toggle rings' `
+    ($flyFn -match '\$mb\.HoverRing = \$colFlyHoverRing' -and
+     $flyFn -match '\$mb\.DownRing = \$colFlyDownRing' -and
+     $flyFn -match '\$mb\.ToggleRing = \$colFlyToggleRing')
+Check 'the bar keeps its own hover colours (the flyout fix is not a global repaint)' `
+    ($srcText -match '\$btn\.HoverFill = \$colHover')
+# A ring drawn in only one paint path is invisible where it matters: the flyout composites
+# through RenderTo (layered window), the bar through OnPaint.
+# MUTATION: delete the ring block from RenderTo and this goes red.
+$ringDraws = [regex]::Matches($srcText, 'Color (?:ring|ring2) = StateRing\(\);').Count
+Check "the state ring is drawn in BOTH paint paths (found $ringDraws)" ($ringDraws -eq 2)
+Check 'the ring precedence is press > hover > toggle' `
+    ($srcText -match '(?s)Color StateRing\(\) \{\s*if \(down\) return DownRing;\s*if \(hover\) return HoverRing;\s*if \(toggled\) return ToggleRing;')
+# Default Color.Empty means the bar opts out entirely and is pixel-identical to before.
+Check 'the ring fields default to Color.Empty so the bar is unchanged' `
+    ($srcText -match 'public Color HoverRing = Color\.Empty' -and
+     $srcText -match 'public Color DownRing = Color\.Empty' -and
+     $srcText -match 'public Color ToggleRing = Color\.Empty')
+
+# =====================================================================================
+# F8: no unbounded debug line in a hover path
+# =====================================================================================
+# Show-GroupFlyout is bound to MouseEnter on every group button, and this line embedded changing
+# screen coordinates, so Write-CkLog's identical-message dedupe never fired: the log grew with
+# mouse movement alone. MUTATION: put the line back and this goes red.
+Check 'the per-hover flyout geometry trace is gone from the log path' ($srcText -notmatch 'FLY btnW=')
+# Count CALLS, not mentions: this file's own explanatory comments name the function too, and
+# counting raw occurrences made the check depend on how the source is commented.
+$flyLogCalls = @($flyFn -split "`n" | Where-Object { $_ -notmatch '^\s*#' -and $_ -match 'Write-CkLog' })
+Check "Show-GroupFlyout logs nothing on the success path, only its catch (found $($flyLogCalls.Count))" `
+    ($flyLogCalls.Count -eq 1 -and $flyLogCalls[0] -match 'catch')
 # The dissolve action is a click handler, not a function, so it is extracted as the
 # scriptblock argument of $miDissolve.add_Click({...}) and invoked as-is.
 $dissolveNode = $ast.Find({ param($n)
@@ -975,7 +1101,10 @@ $dissJson = '{"buttons":[
     {"label":"G1","text":"/g1","group":"g","bar":"right"},
     {"label":"G2","text":"/g2","group":"g","bar":"right"},
     {"label":"B","text":"/b"}],"groups":{"g":{"icon":"note","label":"G"}}}'
-$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ __isGroup = $true; group = 'g' }) $dissolveAction
+# Dissolve now takes TWO clicks (see the confirm section below), so the behaviour tests drive
+# it twice. Both clicks go through the SHIPPED handler - nothing here re-implements the arming.
+$dissolveTwice = { $script:dissolveArmedFor = $null; & $dissolveAction; & $dissolveAction }
+$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ __isGroup = $true; group = 'g' }) $dissolveTwice
 $d = @($r.Cfg.buttons)
 Check 'dissolving keeps the members on their bar' ((@($d | Where-Object { $_.bar -eq 'right' }).Count) -eq 2)
 Check 'dissolving keeps them in the group face position' (((($d | ForEach-Object { $_.label }) -join ',')) -eq 'A,G1,G2,B')
@@ -989,9 +1118,83 @@ Check 'dissolving prunes the orphaned group definition' `
     (-not ($r.Cfg.PSObject.Properties['groups'] -and $r.Cfg.groups.PSObject.Properties['g']))
 # A dissolve aimed at a non-group target must do nothing at all (the handler guards on
 # __isGroup; without the guard a plain right-click would dissolve whatever it landed on).
-$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ label = 'A'; text = '/a' }) $dissolveAction
+$r = Invoke-PanelEdit $dissJson ([pscustomobject]@{ label = 'A'; text = '/a' }) $dissolveTwice
 Check 'dissolve on a non-group target changes nothing' `
     ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 2)
+
+# --- F4: dissolve is destructive, so it takes TWO clicks (the /clear convention) ---
+# One click dropped `group` from every member and the orphan prune then permanently discarded
+# the group's custom icon and label - recoverable only by recreating both by hand - from a menu
+# item sitting directly above "Remove this button". /clear ships with confirm = $true for
+# exactly this reason, so dissolve follows the same rule.
+$grpT = [pscustomobject]@{ __isGroup = $true; group = 'g' }
+$r = Invoke-PanelEdit $dissJson $grpT { $script:dissolveArmedFor = $null; & $dissolveAction }
+# MUTATION: delete the arming branch from the handler and this goes red (it dissolves at once).
+Check 'ONE click on dissolve changes nothing on disk' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 2)
+Check 'ONE click on dissolve does not write at all' ($r.Rebuilt -eq 0)
+Check 'the first click relabels the item to the confirm caption' ($script:dissolveLabel -eq 'confirm')
+# MUTATION: make the second click arm again (never clear $dissolveArmedFor) and this goes red.
+$r = Invoke-PanelEdit $dissJson $grpT $dissolveTwice
+Check 'the SECOND click within the window actually dissolves' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group }).Count) -eq 0)
+Check 'the caption returns to the dissolve label once it fires' ($script:dissolveLabel -eq 'dissolve')
+# The window is 3 s, like the button path. An arm older than that must re-arm, not fire.
+# MUTATION: drop the elapsed-time test from the guard and this goes red.
+$r = Invoke-PanelEdit $dissJson $grpT {
+    $script:dissolveArmedFor = $null
+    & $dissolveAction
+    $script:dissolveArmedAt = (Get-Date).AddSeconds(-10)   # the arm goes stale
+    & $dissolveAction
+}
+Check 'a STALE arm re-arms instead of dissolving' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 2)
+# Arming on one group must not fire on a DIFFERENT one - the menu is rebuilt per right-click and
+# $menuSource changes under it. MUTATION: compare only the timestamp and this goes red.
+$twoGrpJson = '{"buttons":[
+    {"label":"P","text":"/p","group":"g"},
+    {"label":"Q","text":"/q","group":"h"}],"groups":{"g":{"icon":"note"},"h":{"icon":"star"}}}'
+$r = Invoke-PanelEdit $twoGrpJson ([pscustomobject]@{ __isGroup = $true; group = 'g' }) {
+    $script:dissolveArmedFor = $null
+    & $dissolveAction                                        # arms group g
+    $script:menuSource = [pscustomobject]@{ Tag = [pscustomobject]@{ __isGroup = $true; group = 'h' } }
+    & $dissolveAction                                        # ...must only ARM h, not dissolve it
+}
+Check 'an arm on one group does not dissolve a different group' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group }).Count) -eq 2)
+# The confirm caption must exist in BOTH language tables (it is reused from the button path).
+foreach ($lang in @('en', 'da')) {
+    $tbl = [regex]::Match($srcText, "(?s)\b$lang = @\{(.*?)\n    \}").Groups[1].Value
+    Check "the '$lang' string table has a confirm caption for the dissolve prompt" ($tbl -match "(?m)^\s*confirm\s*=")
+    Check "the '$lang' string table still has the dissolve caption" ($tbl -match "(?m)^\s*dissolve\s*=")
+}
+# The arming click must not let the menu close, or the "Confirm?" caption is painted onto a
+# menu that is already going away and there is nothing left to click.
+# MUTATION: delete the Closing handler and this goes red.
+$closingFn = [regex]::Match($srcText, '(?s)\$btnMenu\.add_Closing\(\{.*?\n\}\)').Value
+Check 'the button menu Closing handler was located' ($closingFn.Length -gt 60)
+Check 'the button menu cancels its close while a dissolve is armed' `
+    ($closingFn -match 'ItemClicked' -and $closingFn -match '\$_\.Cancel = \$true')
+Check 'any other close reason disarms the pending dissolve' `
+    ($closingFn -match '(?s)\}\s*else\s*\{\s*\$script:dissolveArmedFor = \$null')
+# The hold must be consumed by the ONE click that set it. Cancelling on "an arm is pending"
+# instead would swallow the next click on any OTHER item too - the menu would refuse to close
+# when the user gave up on dissolving and picked Rename instead.
+# MUTATION: cancel on $script:dissolveArmedFor rather than the one-shot flag, or drop the
+# `$script:dissolveHoldOpen = $false` line inside the cancel branch, and this goes red.
+Check 'the menu is held open for exactly one click, not for as long as the arm lasts' `
+    ($closingFn -match '\$script:dissolveHoldOpen' -and
+     $closingFn -match '(?s)\$script:dissolveHoldOpen -and.*?\$script:dissolveHoldOpen = \$false\s*[^\r\n]*\r?\n\s*\$_\.Cancel = \$true')
+Check 'the one-shot hold flag is armed by the dissolve handler itself' `
+    ($srcText -match '\$script:dissolveHoldOpen = \$true')
+# Reopening must clear BOTH the arm and the one-shot hold, or a stale hold swallows the first
+# click of the next menu session.
+$openingFn = [regex]::Match($srcText, '(?s)\$btnMenu\.add_Opening\(\{.*?\n\}\)').Value
+Check 'the button menu Opening handler was located' ($openingFn.Length -gt 60)
+Check 'reopening the button menu clears any pending dissolve arm' `
+    ($openingFn -match '\$script:dissolveArmedFor = \$null')
+Check 'reopening the button menu also clears the one-shot hold flag' `
+    ($openingFn -match '\$script:dissolveHoldOpen = \$false')
 
 # --- Update-Buttons prunes orphaned group definitions (whatever emptied them) ---
 # The prune lives in Update-Buttons so EVERY path that edits buttons is covered. Gutting it
@@ -1028,6 +1231,138 @@ Check 'a group face cannot be put into a group' `
 $r = Invoke-PanelEdit $casedJson ([pscustomobject]@{ label = 'Deploy'; text = '/deploy prod' }) { Set-ButtonGroup 'g' }
 Check 'grouping is case-sensitive (only the exact button joins)' `
     ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' }).Count) -eq 1)
+
+# =====================================================================================
+# F5: GROUP NAMES are matched case-INSENSITIVELY - the opposite of Same-Button, on purpose
+# =====================================================================================
+# The decision and its justification live in the Resolve-GroupName comment. In short: a button's
+# label+text IS the prompt, so -ceq; a group name is a folder label AND a JSON key, and PS 5.1's
+# ConvertFrom-Json THROWS on an object whose keys differ only in case. A case-SENSITIVE group
+# would let the panel write a buttons.json it can never read back - every button gone, silently.
+# The tests below pin both halves: the merge happens, and it is NOT silent (the name snaps onto
+# the casing that already exists, so the user lands in the group they can see).
+$caseGrpJson = '{"buttons":[
+    {"label":"M","text":"/m","group":"Deploy"},
+    {"label":"N","text":"/n"}],"groups":{"Deploy":{"icon":"note","label":"Deploy"}}}'
+# MUTATION: make Resolve-GroupName return $name unchanged and this goes red - the button gets
+# a second group literally spelled "deploy" and the config now holds two case-colliding names.
+$r = Invoke-PanelEdit $caseGrpJson ([pscustomobject]@{ label = 'N'; text = '/n' }) { Set-ButtonGroup 'deploy' }
+$nBtn = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'N' })[0]
+Check 'joining "deploy" snaps onto the existing "Deploy" casing' ($nBtn.group -ceq 'Deploy')
+Check 'both buttons end up in ONE group, not two that look identical' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'Deploy' }).Count) -eq 2)
+Check 'no second case-differing group name is created' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'deploy' }).Count) -eq 0)
+# Resolve-GroupName is the single point of that decision, so exercise it directly too.
+$script:config = $caseGrpJson | ConvertFrom-Json
+Check 'Resolve-GroupName maps a differently-cased name onto the existing one' `
+    ((Resolve-GroupName 'DEPLOY') -ceq 'Deploy')
+Check 'Resolve-GroupName leaves a genuinely new name alone' ((Resolve-GroupName 'Ship') -ceq 'Ship')
+Check 'Resolve-GroupName passes an empty name straight through' ((Resolve-GroupName '') -eq '')
+
+# The failure this is really guarding: Set-GroupProp is the only path that mints a key under
+# config.groups, and it must never write a second key differing only in case. The proof is a
+# real round-trip - PS 5.1 THROWS on parse, so if a collision were written, ConvertFrom-Json
+# on the file would fail and buttons.json would be permanently unreadable.
+# MUTATION: drop the $key resolution loop from Set-GroupProp (Add-Member on $name directly) and
+# the round-trip below throws and this goes red.
+$r = Invoke-PanelEdit $caseGrpJson ([pscustomobject]@{ label = 'N'; text = '/n' }) {
+    Set-GroupProp 'deploy' 'icon' 'star'
+}
+$roundTripped = $true
+try { [void]($r.Raw | ConvertFrom-Json) } catch { $roundTripped = $false }
+Check 'setting a group property under a different casing still round-trips through ConvertFrom-Json' $roundTripped
+$grpKeys = @($r.Cfg.groups.PSObject.Properties.Name)
+Check "config.groups holds ONE key for the group, not two ($($grpKeys -join '/'))" ($grpKeys.Count -eq 1)
+Check 'the surviving key keeps the casing that was already there' ($grpKeys[0] -ceq 'Deploy')
+Check 'the property was applied to that existing group, not a new one' ($r.Cfg.groups.Deploy.icon -ceq 'star')
+# And the render side reads the definition case-insensitively too, so nothing falls back to the
+# generic face just because the button's field is cased differently from the definition key.
+$script:config = $r.Cfg
+Check 'Get-GroupDef resolves a differently-cased name to the same definition' `
+    ((Get-GroupDef 'DEPLOY').icon -ceq 'star')
+# Get-GroupNames must not list the same group twice under two casings.
+$script:config = '{"buttons":[{"label":"M","text":"/m","group":"deploy"}],"groups":{"Deploy":{"icon":"note"}}}' | ConvertFrom-Json
+Check 'Get-GroupNames lists a case-differing pair as ONE group' ((@(Get-GroupNames)).Count -eq 1)
+
+# =====================================================================================
+# F6: "Move to group" must not split a group across two bars
+# =====================================================================================
+# Set-ButtonGroup used to set only `group`, never `bar` - unlike Set-ButtonBar, which moves the
+# whole membership precisely so a group cannot straddle two bars. Joining a row-bar button to a
+# left-bar group created exactly that split, and the two strips then disagreed about the group's
+# membership, so it rendered a different face on each and its members appeared twice.
+$splitJson = '{"buttons":[
+    {"label":"S1","text":"/s1","group":"g","bar":"left"},
+    {"label":"S2","text":"/s2","group":"g","bar":"left"},
+    {"label":"R","text":"/r"}],"groups":{"g":{"icon":"note"}}}'
+# MUTATION: delete the $destBar block from Set-ButtonGroup and this goes red - R joins the group
+# while staying on the control row.
+$r = Invoke-PanelEdit $splitJson ([pscustomobject]@{ label = 'R'; text = '/r' }) { Set-ButtonGroup 'g' }
+$rBtn = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'R' })[0]
+Check 'joining a side-bar group moves the joiner onto that bar' ($rBtn.bar -ceq 'left')
+Check 'the whole group now sits on exactly one bar' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' -and $_.bar -ceq 'left' }).Count) -eq 3)
+Check 'no member of the group is left on another bar' `
+    ((@($r.Cfg.buttons | Where-Object { $_.group -ceq 'g' -and $_.bar -ne 'left' }).Count) -eq 0)
+# The mirror case: joining a ROW group from a side bar must DROP the bar field, not set it to
+# the string 'row' (Get-ButtonBar would still work, but the config grows a knob nobody chose).
+$rowGrpJson = '{"buttons":[
+    {"label":"T1","text":"/t1","group":"g"},
+    {"label":"T2","text":"/t2","bar":"right"}],"groups":{"g":{"icon":"note"}}}'
+$r = Invoke-PanelEdit $rowGrpJson ([pscustomobject]@{ label = 'T2'; text = '/t2'; bar = 'right' }) { Set-ButtonGroup 'g' }
+$t2 = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'T2' })[0]
+Check 'joining a row group drops the bar field entirely' ($null -eq $t2.PSObject.Properties['bar'])
+# Joining a group that does not exist yet must not invent a bar for the button.
+$r = Invoke-PanelEdit $rowGrpJson ([pscustomobject]@{ label = 'T2'; text = '/t2'; bar = 'right' }) { Set-ButtonGroup 'brand-new' }
+$t2 = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'T2' })[0]
+Check 'joining a brand-new group leaves the button on the bar it was already on' ($t2.bar -ceq 'right')
+# Leaving a group must still not touch the bar.
+$r = Invoke-PanelEdit $splitJson ([pscustomobject]@{ label = 'S1'; text = '/s1'; group = 'g'; bar = 'left' }) { Set-ButtonGroup '' }
+$s1 = @($r.Cfg.buttons | Where-Object { $_.label -ceq 'S1' })[0]
+Check 'leaving a group leaves the button on its bar' (($s1.bar -ceq 'left') -and -not $s1.group)
+
+# The render half of the same defect: the row strip filters $vis by bar BEFORE building the
+# group's member list; the side strip filtered per-item and left $vis unfiltered, so a group
+# split by a hand-edited config still showed off-bar members in the side flyout.
+# MUTATION: move the filter back to a per-item `continue` and this goes red.
+$sideFn = [regex]::Match($srcText, '(?s)function Build-SideStrip.*?\n\}').Value
+Check 'Build-SideStrip was located' ($sideFn.Length -gt 200)
+Check 'the side strip filters the visible set by bar BEFORE building, like the row does' `
+    ($sideFn -match '\$vis = @\(Get-VisibleButtons [^\r\n]*Where-Object \{ \(Get-ButtonBar \$_\) -eq \$strip\.Side \}\)')
+Check 'the side strip no longer skips off-bar buttons per item (the members list was still unfiltered)' `
+    ($sideFn -notmatch '-ne \$strip\.Side\) \{ continue \}')
+
+# =====================================================================================
+# F7: a whitespace group name must not silently UNGROUP the button
+# =====================================================================================
+# New-ButtonGroup trims, so "   " became '' - and Set-ButtonGroup '' is the path that REMOVES a
+# button from its group. Asking to create a group took the button out of the one it was in.
+# Cancel ($null) was handled; empty-after-trim was not distinguished from it.
+function Show-InputDialog([string]$t, [string]$m, [string]$d) { $script:dlgAnswer }
+function L([string]$k) { $k }
+$newGrpNode = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-ButtonGroup' }, $true)
+Check 'New-ButtonGroup was found in the panel source' ($null -ne $newGrpNode)
+if ($newGrpNode) {
+    Invoke-Expression $newGrpNode.Extent.Text
+    # MUTATION: delete the IsNullOrWhiteSpace guard and this goes red - G1 loses its group.
+    foreach ($blank in @('   ', '', "`t", "  `t ")) {
+        $script:dlgAnswer = $blank
+        $r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' }) { New-ButtonGroup }
+        Check ("a whitespace-only group name ('" + ($blank -replace "`t", '\t') + "') leaves the button in its group") `
+            (@($r.Cfg.buttons | Where-Object { $_.label -ceq 'G1' })[0].group -ceq 'grp')
+    }
+    # Cancel is still a no-op, and a REAL name must still work - the guard must not eat those.
+    $script:dlgAnswer = $null
+    $r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'G1'; text = '/g1'; group = 'grp' }) { New-ButtonGroup }
+    Check 'cancelling the new-group prompt still changes nothing' `
+        (@($r.Cfg.buttons | Where-Object { $_.label -ceq 'G1' })[0].group -ceq 'grp')
+    $script:dlgAnswer = '  shipping  '
+    $r = Invoke-PanelEdit $fixJson ([pscustomobject]@{ label = 'A'; text = '/a' }) { New-ButtonGroup }
+    Check 'a real group name still creates the group, trimmed' `
+        (@($r.Cfg.buttons | Where-Object { $_.label -ceq 'A' })[0].group -ceq 'shipping')
+}
 
 # --- Update-Config: it writes the WHOLE config under the lock ---
 # Zero references before this. Update-Config is the most damaging thing here that had no
