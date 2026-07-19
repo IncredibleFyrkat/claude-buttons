@@ -311,6 +311,37 @@ Check 'markdown whose blank lines the composer collapsed still confirms' `
     ((PasteState '{"baseline":"\n","payload":"## Heading\n\nBody text.\n\n- item","observed":"## Heading\nBody text.\n- item\n"}') -eq 'Confirmed')
 # Coverage alone is satisfied by "stale clipboard THEN our payload" - an in-order walk just
 # skips the prefix. The size bound is the half that catches it, so it needs its own test.
+# THE COVERAGE HALF WAS ENTIRELY UNPINNED. Five mutants passed all 85 tests: raising
+# MaxMissingWords to 99, MaxMissingFraction to 0.90, ExtraFraction to 0.50, deleting the coverage
+# check, and making Get-WordCoverage return 1.0. Every 'Confirmed' case above is also satisfied
+# by a comparator that always passes on words, and every 'Mismatch' case was caught by the SIZE
+# bound - so nothing measured coverage at all. These cases hold size constant and vary only the
+# words, so they can ONLY be caught by coverage.
+Check 'a substituted word at the SAME length is a Mismatch (coverage, not size)' `
+    ((PasteState '{"baseline":"\n","payload":"send nu","observed":"send bad\n"}') -eq 'Mismatch')
+Check 'a wholly different text of the same size is a Mismatch (coverage)' `
+    ((PasteState '{"baseline":"\n","payload":"gennemgaa min kode","observed":"kontonummer 5479 1122\n"}') -eq 'Mismatch')
+Check 'words in the WRONG ORDER are a Mismatch (coverage is ordered)' `
+    ((PasteState '{"baseline":"\n","payload":"alfa beta gamma delta epsilon zeta","observed":"zeta epsilon delta gamma beta alfa\n"}') -eq 'Mismatch')
+# Non-alnum growth was unbounded: the ceiling counted letters and digits only, so a clipboard of
+# emoji or punctuation rode in at any length and was Confirmed.
+# The three cases above are all SHORT, so the floor(n/4) cap decides them and MaxMissingWords /
+# MaxMissingFraction stay inert - raising them to 99 and 0.90 passed the whole suite. This one is
+# 20 words with 4 substituted: the cap allows 5, so only the allowance of 3 can refuse it.
+Check 'four substituted words in a twenty-word payload is a Mismatch (MaxMissingWords binds)' `
+    ((PasteState '{"baseline":"\n","payload":"et to tre fire fem seks syv otte ni ti elleve tolv tretten fjorten femten seksten sytten atten nitten tyve","observed":"et to xyz fire fem seks qqq otte ni ti zzzzzz tolv tretten fjorten wwwwww seksten sytten atten nitten tyve\n"}') -eq 'Mismatch')
+# Likewise every size-based Mismatch above overshoots the ceiling so far that ExtraFraction stayed
+# inert - 0.0 -> 0.50 passed everything. This appends ~30% extra, which only the tight ceiling refuses.
+Check 'a 30% overshoot is a Mismatch (ExtraFraction binds, not just the absolute margin)' `
+    ((PasteState '{"baseline":"\n","payload":"alfa beta gamma delta epsilon zeta eta theta","observed":"alfa beta gamma delta epsilon zeta eta theta kodeord1234\n"}') -eq 'Mismatch')
+Check 'injected punctuation/symbols are a Mismatch (non-alnum ceiling)' `
+    ((PasteState '{"baseline":"\n","payload":"gennemgaa min kode","observed":"gennemgaa min kode !!! ??? ---> @@@ *** ~~~ %%%\n"}') -eq 'Mismatch')
+# The false refusal that shipped twice, in its remaining form: each fence language counted as a
+# missing payload word, so four or more fenced blocks in a short button exceeded the allowance.
+Check 'a button with FOUR fenced code blocks still confirms' `
+    ((PasteState '{"baseline":"\n","payload":"Kør disse:\n```powershell\nGet-Date\n```\n```powershell\nGet-Host\n```\n```json\n{}\n```\n```bash\nls\n```","observed":"Kør disse:\nGet-Date\nGet-Host\n{}\nls\n"}') -eq 'Confirmed')
+Check 'a short button that is ONLY a fenced block still confirms' `
+    ((PasteState '{"baseline":"\n","payload":"```json\n{\"a\":1}\n```","observed":"{\"a\":1}\n"}') -eq 'Confirmed')
 Check 'stale clipboard text pasted ALONGSIDE the payload is a Mismatch (size bound)' `
     ((PasteState '{"baseline":"\n","payload":"## Titel\n\nDu skal svare.","observed":"kodeord hemmeligt kontonummer 4471 privat besked\n## Titel\nDu skal svare.\n"}') -eq 'Mismatch')
 Check 'a multi-line payload with blank lines confirms' `

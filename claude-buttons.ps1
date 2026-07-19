@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.9.0'
+$CB_VERSION = '1.9.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1957,10 +1957,24 @@ $script:ExtraCharsAllowed  = 2
 $script:ExtraFraction      = 0.0
 $script:MinSizeFraction    = 0.60   # below this, too little landed to be our payload at all
 
+# Drop the info-string of a fenced code block: the whole ```lang line, markers and language.
+# The renderer consumes both, so counting the language as a payload word charged one "missing
+# word" per fence. With an allowance of max(3, 2%), any button with four or more fenced blocks
+# under ~150 words was silently refused - the same false refusal 1.8.0 and 1.8.1 shipped, moved
+# rather than removed. Widening the allowance would have been the wrong fix: it would have
+# bought compatibility with a weaker leak bound. Removing what the renderer removes is exact.
+function Remove-FenceInfoStrings([string]$s) {
+    ($s -replace '(?m)^[ \t]*(```|~~~)[^\r\n]*$', '')
+}
 function Get-CompareWords([string]$s) {
-    @([regex]::Matches($s, '[\p{L}\p{N}]+') | ForEach-Object { $_.Value.ToLowerInvariant() })
+    @([regex]::Matches((Remove-FenceInfoStrings $s), '[\p{L}\p{N}]+') | ForEach-Object { $_.Value.ToLowerInvariant() })
 }
 function Get-AlnumLength([string]$s) { ($s -replace '[^\p{L}\p{N}]', '').Length }
+# Everything that is NOT a letter or digit: punctuation, symbols, emoji, whitespace.
+# The size ceiling counted alnum only, so injected non-alnum content was UNBOUNDED - a clipboard
+# of emoji or punctuation of any length rode in and was Confirmed. Rendering only deletes
+# markdown syntax, which is non-alnum, so this count can shrink a great deal but must never grow.
+function Get-NonAlnumLength([string]$s) { ($s -replace '[\p{L}\p{N}]', '').Length }
 
 # In-order word coverage with a bounded look-ahead on BOTH sides. A strict two-pointer walk
 # deadlocks: the payload word 'text' (a fence language) is absent from the read-back, so the
@@ -1988,16 +2002,22 @@ function Get-WordCoverage($payloadWords, $observedWords) {
 }
 
 function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed) {
+    # Strip the fence info-strings ONCE and measure everything against the result. Stripping them
+    # for the word count but not for the size count made it worse, not better: `powershell` and
+    # `json` still inflated the expected length, the rendered read-back fell under MinSizeFraction
+    # and a four-fence button was refused on size instead of on words. The baseline is itself a
+    # read-back, so it is already rendered and has no fences to strip.
+    $payload = Remove-FenceInfoStrings $payload
     $pw = @(Get-CompareWords $payload)
     if ($pw.Count -eq 0) { return $false }
     $coverage = Get-WordCoverage $pw (Get-CompareWords $observed)
     $missing  = $pw.Count - ($coverage * $pw.Count)
-    # Cap the allowance at half the payload. Without this a one-word payload could go entirely
-    # missing and still pass, because the absolute floor of 3 exceeded the whole word count -
-    # "secret token" in the box instead of "/review" was Confirmed.
+    # Cap the allowance at a QUARTER of the payload. At half, a two-word payload tolerated one
+    # substituted word: "send nu" read back as "send bad" was Confirmed and would have been
+    # submitted. A short button has no redundancy to spend, so it gets none.
     $allowedMissing = [Math]::Min(
         [Math]::Max($script:MaxMissingWords, $pw.Count * $script:MaxMissingFraction),
-        [Math]::Floor($pw.Count / 2))
+        [Math]::Floor($pw.Count / 4))
     if ($missing -gt $allowedMissing) { return $false }
 
     $expected = (Get-AlnumLength $baseline) + (Get-AlnumLength $payload)
@@ -2006,6 +2026,15 @@ function Test-PasteLanded([string]$baseline, [string]$payload, [string]$observed
     $ceiling = $expected + [Math]::Max($script:ExtraCharsAllowed, $expected * $script:ExtraFraction)
     if ($actual -gt $ceiling) { return $false }               # something else is in the box
     if ($actual -lt ($expected * $script:MinSizeFraction)) { return $false }
+
+    # Non-alnum has its own ceiling. Without this the size bound counted letters and digits only,
+    # so a clipboard of emoji, punctuation or symbols was unbounded: "gennemgaa min kode" read
+    # back as "gennemgaa min kode !!! ??? ---> @@@ ***" was Confirmed. Rendering deletes markdown
+    # syntax, which is non-alnum, so this may shrink freely but must not grow.
+    $expectedSym = (Get-NonAlnumLength $baseline) + (Get-NonAlnumLength $payload)
+    $actualSym   = Get-NonAlnumLength $observed
+    $symCeiling  = $expectedSym + [Math]::Max($script:ExtraCharsAllowed, $expectedSym * $script:ExtraFraction)
+    if ($actualSym -gt $symCeiling) { return $false }
     return $true
 }
 

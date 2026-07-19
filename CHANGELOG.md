@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.9.0 — 2026-07-19
+## 1.9.1 — 2026-07-19
 
 **1.8.0 and 1.8.1 both shipped a panel that refused to send any formatted button. This is the
 fix, and it is based on measurement rather than on a third guess about why.**
@@ -23,21 +23,35 @@ Verification now compares **words and size** instead of characters:
 
 - **Coverage** — the payload's words must appear in the read-back, in order. Rendering deletes a
   few (fence languages) but never invents or reorders any, so a small shortfall is allowed:
-  three words, or 2%, whichever is larger, and never more than half the payload.
+  three words, or 2%, whichever is larger, and never more than a quarter of the payload. (At a
+  half, a two-word button tolerated one substituted word: "send nu" read back as "send bad" was
+  confirmed and would have been submitted.)
 - **Size** — the read-back must not be larger than baseline+payload by more than a rounding
-  margin. Rendering only ever *deletes*, so any growth is content nobody pasted.
+  margin. Rendering only ever *deletes*, so any growth is content nobody pasted. Letters/digits
+  and everything else (punctuation, symbols, emoji, whitespace) are bounded **separately**: with
+  a single alphanumeric bound, a clipboard of pure punctuation was unbounded and rode in at any
+  length.
 
 Both must hold. Coverage alone is satisfied by "stale clipboard, then our text", because an
 in-order walk skips the prefix; the size ceiling is what catches that.
+
+Fenced code blocks are stripped from the button's text before any of this, because the renderer
+consumes the whole ```` ```lang ```` line. Counting the language as a payload word charged one
+missing word per fence, so a button with four or more fenced blocks was refused — the same
+false refusal as 1.8.0, narrowed rather than removed.
 
 Measured against the real 12,752-character paste: genuine paste confirmed; stale clipboard
 instead, before, or after the payload all refused; half the payload refused; eleven stray
 characters refused; ten substituted words refused.
 
-**Known limits, stated plainly.** A substitution that swaps a handful of words while preserving
-the total length can stay inside the 2% coverage allowance. That is not reachable by a stale
-clipboard, which is the threat this defends against, but it is not a content signature. And
-verification still assumes the paste is the only change to the box while it is happening.
+**Known limits, stated plainly.** On a long button, a substitution that swaps up to 2% of the
+words while preserving the total length stays inside the coverage allowance — this is a
+similarity check, not a content signature. An earlier draft of this entry claimed such a
+substitution "is not reachable by a stale clipboard"; that was wrong, and a review demonstrated
+a 156-character clipboard-shaped append that passed. The allowance for short buttons has since
+been cut from half the payload to a quarter, and the separate non-alphanumeric bound closes the
+punctuation case, but the residual on long buttons is real. Verification also still assumes the
+paste is the only change to the box while it is happening.
 
 ## 1.8.1 — 2026-07-19
 
