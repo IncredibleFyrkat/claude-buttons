@@ -2,7 +2,8 @@
 
 En slank knap-strimmel, der klistrer sig til **Claude desktop-appens** bundbjælke (Windows) og
 skriver slash-kommandoer eller tekst ind i chatten, når du klikker. Pin dine mest brugte
-kommandoer som ét-kliks-knapper — globalt eller bundet til en bestemt chat.
+kommandoer som ét-kliks-knapper — globalt eller bundet til en bestemt chat, i bundrækken eller i
+en lodret bjælke i hver sin side, grupperet og farvekodet hvis du vil have det sådan.
 
 *(English README — den kanoniske: [README.md](README.md).)*
 
@@ -15,6 +16,11 @@ kommandoer som ét-kliks-knapper — globalt eller bundet til en bestemt chat.
 - **On/off-toggle-knapper** (`"toggle": true`) der lyser, mens de er tændt; `stateGlob` kan spejle en filsystem-tilstand, så knappen altid viser sandheden.
 - **Lange standard-prompts:** en knaps tekst kan være en hel prompt; lang/multiline tekst indsættes atomisk via clipboard (dit tidligere clipboard gendannes).
 - **Composer-forankret docking:** strimlen låser sig til chattens composer i appens accessibility-træ og sidder lige efter appens egne knapper. I split-/stacked-/grid-visning får hver synlig chat sin egen strimmel.
+- **Sidebjælker:** flyt knapper til en lodret strimmel i venstre eller højre margen i stedet for bundrækken. ⋮-menuen kan flytte med, og **Flyt til bjælke** tager hele strimlen med sig.
+- **Grupper:** fold flere knapper sammen til én knap på bjælken; hold musen over, og medlemmerne folder ud. En gruppe har sit eget ikon og navn, og flyttes som én blok i stedet for at blive spredt.
+- **Farver per type:** prompts, kommandoer, grupper og kontakter kan hver få sin farve fra ⋮ → Farver. Typen udledes af knappen, så en nypinnet slash-kommando automatisk får kommandofarven.
+- **Knapstørrelse** fra ⋮ → Knapstørrelse, 14–32 px, for hele panelet. Knapperne beholder deres størrelse når vinduet flyttes mellem skærme med forskellig DPI.
+- **Knappen kontrollerer før den sender.** Den læser beskedfeltet tilbage gennem accessibility-træet og trykker først Enter, når den kan se at det der landede, kom fra knappen. Kan den ikke bekræfte det — en indsætning der udeblev, en gammel udklipsholder, tekst den ikke selv lagde ind — sender den ingenting, lader feltet være og siger det. Se [CHANGELOG.md](CHANGELOG.md) for hvad den fanger og ikke fanger.
 - **To-kliks bekræftelse** på destruktive knapper; **EN/DA** UI; tooltips.
 - **Robust:** alt app-afhængigt (accessibility-navne, zoner) kan rettes i `buttons.json` uden kodeændring, så en app-opdatering degraderer pænt.
 

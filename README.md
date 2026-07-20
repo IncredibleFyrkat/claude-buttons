@@ -2,7 +2,8 @@
 
 A slim, native-looking button strip that docks onto the **Claude desktop app**'s bottom bar
 (Windows) and types slash-commands or text into the chat when you click. Pin your most-used
-commands as one-click buttons — globally or scoped to a specific chat.
+commands as one-click buttons — globally or scoped to a specific chat, on the bottom row or in a
+vertical bar down either side, grouped and colour-coded if you want them that way.
 
 *(Dansk vejledning: se [README.da.md](README.da.md).)*
 
@@ -20,6 +21,11 @@ appears only when it's in the foreground.
 - **Global or per-chat** buttons. Per-chat buttons appear only when that chat is on screen (detected from the app's own accessibility tree) and never auto-send — they insert the text so you review it first.
 - **Native look**: each strip is a transparent, per-pixel-alpha overlay that sits directly on the bottom bar with no backing box, so the pills read as part of the app's own chrome.
 - **Composer-anchored docking**: the strip locks onto the chat's composer in the app's accessibility tree and sits right after the app's own controls (Auto / + / mic). It follows resize, fullscreen, DPI, and **split / stacked / grid panes** — every visible chat gets its own strip.
+- **Side bars.** Move buttons to a vertical strip in the left or right pane margin instead of the bottom row, so a long row doesn't have to stay a long row. The ⋮ menu can move there too, and **Move to bar** takes the whole strip with it.
+- **Groups.** Collapse several buttons into one face on the bar; hovering opens a flyout with the members. A group carries its own icon and label, and reordering moves the group as a block rather than scattering its members.
+- **Per-kind colours.** Prompts, slash commands, groups and toggles can each take a colour, set from ⋮ → Colours. The kind is derived from the button, so a newly pinned slash command picks up the command colour automatically.
+- **Button size** from ⋮ → Button size, 14–32 px, applying to the whole panel. Buttons keep their size when the window moves between monitors of different DPI.
+- **The button verifies before it sends.** It reads the message box back through the accessibility tree and only presses Enter once it can see that what landed came from the button. If it can't confirm — a paste that didn't arrive, a stale clipboard, text it didn't put there — it sends nothing, leaves the box untouched and tells you. See [CHANGELOG.md](CHANGELOG.md) for what it does and does not catch.
 - **Two-click confirm** for destructive buttons (`"confirm": true`).
 - **Icon buttons**: give a button an icon instead of text (`"icon": "mic"`) — a small round button the same size as the app's own mic button. Uses Windows' built-in Fluent icon font (Lucide-style line icons, no downloads).
 - **Toggle (on/off) buttons** (`"toggle": true`): the button stays lit while active, like the app's mic — optionally sending different text on activate/deactivate (`textOn`/`textOff`).
