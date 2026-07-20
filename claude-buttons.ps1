@@ -1755,6 +1755,27 @@ function Update-UiaInfo {
                 # cluster; walking from the left stopped on it immediately, so the strip docked
                 # before the app's own +/mic instead of after them. Measured spacing inside a
                 # real cluster is 6-7px, so 20px still separates runs cleanly.
+                # Group by ROW before splitting by X. The X-gap walk below cannot tell two rows
+                # apart - it sorts by X and looks only at horizontal gaps - so a control sitting
+                # on a second row inside the band joins whichever run it happens to be near, and
+                # dockY is the MEAN Y of that run. One stray from another row therefore drags
+                # the whole strip off the app's control row, which is a per-pane failure: one
+                # chat sits wrong while the one beside it is fine.
+                # Most controls wins (the real control row has several; a stray has one or two),
+                # closest to the composer breaks a tie.
+                $bands = @()
+                foreach ($rb in $rowBtns) {
+                    $hit = $null
+                    foreach ($bd in $bands) { if ([Math]::Abs($bd.CY - $rb.CY) -le (SW 6)) { $hit = $bd; break } }
+                    if ($hit) { $hit.Items += $rb }
+                    else { $bands += @{ CY = [double]$rb.CY; Items = @($rb) } }
+                }
+                $bestBand = $null
+                foreach ($bd in $bands) {
+                    if ($null -eq $bestBand -or $bd.Items.Count -gt $bestBand.Items.Count -or
+                        ($bd.Items.Count -eq $bestBand.Items.Count -and $bd.CY -lt $bestBand.CY)) { $bestBand = $bd }
+                }
+                if ($bestBand) { $rowBtns = @($bestBand.Items) }
                 $runs = @(); $cur = @()
                 $prevR = $null
                 foreach ($rb in ($rowBtns | Sort-Object X)) {
@@ -1772,10 +1793,13 @@ function Update-UiaInfo {
                 $best = $null
                 foreach ($run in $runs) { if ($null -eq $best -or $run.Count -gt $best.Count) { $best = $run } }
                 $rightEdge = $c.X; $sumY = 0.0; $n = 0
+                $minCY = $null; $maxCY = $null
                 if ($best) {
                     foreach ($rb in $best) {
                         if ($rb.R -gt $rightEdge) { $rightEdge = $rb.R }
                         $sumY += $rb.CY; $n++
+                        if ($null -eq $minCY -or $rb.CY -lt $minCY) { $minCY = $rb.CY }
+                        if ($null -eq $maxCY -or $rb.CY -gt $maxCY) { $maxCY = $rb.CY }
                     }
                 }
                 # The row's OUTERMOST controls, for the side bars to sit just beyond. $rowBtns is
@@ -1802,7 +1826,12 @@ function Update-UiaInfo {
                 # Diagnostic: n is how many controls the cluster walk matched. When it is 0 the
                 # dock falls back to the composer's own left edge and a synthetic Y, which puts
                 # the strip at the far left and at the wrong height.
-                $script:dockDiag += ("{0}:n={1}/{2}:runs={3}" -f $newPanes.Count, $n, $rowBtns.Count, $runs.Count)
+                # spread = how far apart the matched controls sit VERTICALLY. The run split is
+                # by X gap only, so a control on a second row joins the same run and drags the
+                # mean Y down - which drops the whole strip a row. A healthy cluster is one row,
+                # so spread should be ~0; anything near a row height is the bug.
+                $script:dockDiag += ("{0}:n={1}/{2}:runs={3}:spread={4}" -f $newPanes.Count, $n, $rowBtns.Count, $runs.Count,
+                    $(if ($null -ne $minCY) { [int]($maxCY - $minCY) } else { -1 }))
                 if ($n -gt 0) {
                     $dockX = [int]$rightEdge
                     $dockY = [int]($sumY / $n)

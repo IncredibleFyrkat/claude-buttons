@@ -799,6 +799,51 @@ Check 'the trailing stray does not drag the dock right' ((($pick2 | Measure-Obje
 $normal = @( (B 0 27), (B 33 27), (B 66 27), (B 99 27) )
 Check 'an ordinary row is one run, unchanged' ((@(Pick-Run $normal 20)).Count -eq 4)
 
+# --- Rows must be separated BEFORE the X-gap walk ---
+# The X walk sorts by X and looks only at horizontal gaps, so it cannot tell two rows apart: a
+# control on a second row joins whichever run it lands near, and dockY is that run's MEAN Y.
+# One stray from another row therefore drags the whole strip off the app's control row.
+function Pick-Band($items, [int]$tol) {
+    $bands = @()
+    foreach ($rb in $items) {
+        $hit = $null
+        foreach ($bd in $bands) { if ([Math]::Abs($bd.CY - $rb.CY) -le $tol) { $hit = $bd; break } }
+        if ($hit) { $hit.Items += $rb } else { $bands += @{ CY = [double]$rb.CY; Items = @($rb) } }
+    }
+    $best = $null
+    foreach ($bd in $bands) {
+        if ($null -eq $best -or $bd.Items.Count -gt $best.Items.Count -or
+            ($bd.Items.Count -eq $best.Items.Count -and $bd.CY -lt $best.CY)) { $best = $bd }
+    }
+    if ($best) { @($best.Items) } else { @() }
+}
+function BY($x, $w, $cy) { [pscustomobject]@{ X = [double]$x; R = [double]($x + $w); CY = [double]$cy } }
+
+# The real control row (4 controls at y=100) plus one stray a row lower (y=118).
+$twoRows = @( (BY 0 27 100), (BY 33 27 100), (BY 66 27 100), (BY 99 27 100), (BY 132 27 118) )
+$band = @(Pick-Band $twoRows 6)
+Check 'a control from a second row is dropped from the cluster' ($band.Count -eq 4)
+Check 'the surviving cluster is all one row' `
+    ((@($band | ForEach-Object { $_.CY } | Sort-Object -Unique)).Count -eq 1)
+# The mean Y is what positions the strip, so prove the stray can no longer move it.
+$meanAll = (($twoRows | Measure-Object -Property CY -Average).Average)
+$meanBand = (($band | Measure-Object -Property CY -Average).Average)
+Check 'the stray would have dragged the dock down, and no longer does' `
+    ($meanAll -gt $meanBand -and $meanBand -eq 100)
+
+# Ties go to the row nearest the composer (the app's control row sits directly under it).
+$tied = @( (BY 0 27 100), (BY 33 27 100), (BY 0 27 118), (BY 33 27 118) )
+Check 'a tie picks the row closest to the composer' `
+    ((($(Pick-Band $tied 6) | Measure-Object -Property CY -Average).Average) -eq 100)
+
+# Jitter within a row must NOT split it: UIA rects wobble by a pixel between reads.
+$jitter = @( (BY 0 27 100), (BY 33 27 101), (BY 66 27 99), (BY 99 27 100) )
+Check 'sub-pixel row jitter does not split the cluster' ((@(Pick-Band $jitter 6)).Count -eq 4)
+
+# An ordinary single row is returned untouched.
+$oneRow = @( (BY 0 27 100), (BY 33 27 100), (BY 66 27 100) )
+Check 'a single-row cluster is unchanged by banding' ((@(Pick-Band $oneRow 6)).Count -eq 3)
+
 # --- A palette-eaten Enter must be retried, but never blindly ---
 # A "/" payload opens the app's command palette and the first Enter selects the highlighted
 # entry instead of submitting. The retry is only safe because it is CONDITIONAL: an emptied
