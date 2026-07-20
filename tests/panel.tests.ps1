@@ -799,6 +799,58 @@ Check 'the trailing stray does not drag the dock right' ((($pick2 | Measure-Obje
 $normal = @( (B 0 27), (B 33 27), (B 66 27), (B 99 27) )
 Check 'an ordinary row is one run, unchanged' ((@(Pick-Run $normal 20)).Count -eq 4)
 
+# --- A palette-eaten Enter must be retried, but never blindly ---
+# A "/" payload opens the app's command palette and the first Enter selects the highlighted
+# entry instead of submitting. The retry is only safe because it is CONDITIONAL: an emptied
+# composer means the app took the message, so a second Enter would submit again.
+$clearedNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Wait-ComposerCleared' }, $true)
+Check 'Wait-ComposerCleared was found' ($null -ne $clearedNode)
+. ([scriptblock]::Create($clearedNode.Extent.Text))
+
+# Drive the real function with a stubbed reader, the same seam Wait-PasteLanded uses.
+$script:clearObserved = $null
+function script:Get-ComposerText($el) { $script:clearObserved }
+
+$script:clearObserved = 'Type / for commands'
+Check 'an emptied composer reads as cleared (the app took it)' ((Wait-ComposerCleared $null '/compact' 200) -eq $true)
+
+$script:clearObserved = '/compact'
+Check 'the payload still sitting there is NOT cleared (palette ate the Enter)' `
+    ((Wait-ComposerCleared $null '/compact' 200) -eq $false)
+
+$script:clearObserved = 'draft text /compact'
+Check 'the payload alongside a draft is still not cleared' `
+    ((Wait-ComposerCleared $null '/compact' 200) -eq $false)
+
+# An unreadable composer must NOT trigger a retry: the caller's only response to $false is
+# another Enter, and pressing it into a box we cannot see is the blind double-submit this
+# whole mechanism exists to avoid.
+$script:clearObserved = $null
+Check 'an unreadable composer counts as cleared (never blind-retry Enter)' `
+    ((Wait-ComposerCleared $null '/compact' 200) -eq $true)
+
+# A blank payload can never be found, so it must not report "not submitted" forever.
+Check 'a blank payload is trivially cleared' ((Wait-ComposerCleared $null '  ' 200) -eq $true)
+
+# It must actually WAIT rather than answering from the first read - the app needs time to
+# clear the box, and a zero-wait version would report every send as unsubmitted.
+$script:clearObserved = '/compact'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+[void](Wait-ComposerCleared $null '/compact' 300)
+$sw.Stop()
+Check 'Wait-ComposerCleared polls for its full window before giving up' ($sw.ElapsedMilliseconds -ge 250)
+
+$clickSrcE = if ($clickNode) { $clickNode.Extent.Text } else { (($astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-PillClick' }, $true)).Extent.Text) }
+Check 'the second Enter is gated on the composer NOT clearing' `
+    ($clickSrcE -match '(?s)if \(-not \(Wait-ComposerCleared.*?Send-SubmitKey')
+# Two unconditional submits in a row would double-send every non-palette button.
+Check 'no two unconditional submits back to back' `
+    (-not ($clickSrcE -match 'Send-SubmitKey\s*\r?\n\s*Send-SubmitKey'))
+# The retry must press Enter a second TIME without becoming a second place that can synthesise
+# input - that is what keeps the "named exactly twice" token gate above meaningful.
+Check 'the retry goes through the single submit helper' `
+    (@([regex]::Matches($clickSrcE, 'Send-SubmitKey')).Count -eq 2)
+
 # --- The clipboard must not go back while a paste can still be pending ---
 # Ctrl+V is queued; the app reads the clipboard when it gets round to it. Restoring the user's
 # clipboard on an UNCONFIRMED paste hands that pending read their own data, which is how an

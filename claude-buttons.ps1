@@ -14,8 +14,10 @@ param(
 # confirmed. That fallback was the leak: it typed the correct text underneath whatever had
 # actually landed in the box - often the user's own clipboard - and pressed Enter, sending
 # both. Removing the fallback made the function dead code, and deleting it removes the whole
-# class: this script now synthesises exactly two keystrokes, '^v' and '{ENTER}', and a test
-# asserts that no third one appears.
+# class: this script now synthesises exactly two keystrokes, '^v' and '{ENTER}', from exactly
+# two call sites, and a test asserts that no third one appears. Enter may be pressed a second
+# TIME when the app's command palette swallows the first, but only through the same single
+# submit helper and only while the composer proves the message was not sent.
 # Claude Buttons - a slim button strip that docks onto the Claude desktop app's bottom bar.
 # - Visible only when the Claude window itself is in the foreground
 # - Click (or right-click) the vertical 3-dot kebab for the menu
@@ -899,6 +901,7 @@ $script:strings = @{
         sendNoClipboard = 'Not sent: the clipboard was unavailable, so nothing was pasted. The message box was not changed.'
         sendMismatch = 'Not sent: the paste did not land as expected. Check the message box before sending - something else may be in it.'
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
+        sendNotSubmitted = 'The text is in the message box but Enter did not submit it. Press Enter yourself to send it.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         pinTitle = 'Pin new button'; askText = 'Text/command the button should type (e.g. /my-command or plain text):'
         askLabel = 'Button name (empty = use the text):'; renameAsk = 'New name for the button:'; renameTitle = 'Rename button'
@@ -934,6 +937,7 @@ $script:strings = @{
         sendNoClipboard = 'Ikke sendt: udklipsholderen var utilgængelig, så intet blev indsat. Beskedfeltet blev ikke ændret.'
         sendMismatch = 'Ikke sendt: indsættelsen landede ikke som forventet. Tjek beskedfeltet før du sender - der kan stå noget andet i det.'
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
+        sendNotSubmitted = 'Teksten står i beskedfeltet, men Enter sendte den ikke. Tryk selv Enter for at sende den.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         pinTitle = 'Pin ny knap'; askText = 'Tekst/kommando knappen skal skrive (f.eks. /min-command eller almindelig tekst):'
         askLabel = 'Knappens navn (tom = brug teksten):'; renameAsk = 'Nyt navn til knappen:'; renameTitle = 'Omdøb knap'
@@ -3039,6 +3043,38 @@ function Get-ComposerPlaceholder($el) {
 # panes, a UIA scan every 1.5s) took longer than that to process a queued Ctrl+V, so ordinary
 # sends were reported as failed pastes. The poll returns the instant the text matches, so a
 # longer ceiling costs nothing on the healthy path and only buys patience on the slow one.
+# The ONE submit keystroke in the panel. Deliberately a function with a single call site
+# inside it: the audited invariant is that this script names an input-synthesis API exactly
+# twice (once to paste, once to submit), which is what makes "there is no typing path" checkable
+# on tokens rather than on prose. The palette retry needs to press Enter a second TIME, not to
+# open a second place that can synthesise input, so it calls this instead of repeating the call.
+function Send-SubmitKey { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') }
+
+# Did the app actually TAKE the message? An emptied composer is its own acknowledgement, and
+# it is the only signal available: there is no submit event to observe, and a fixed delay
+# cannot tell "sent" from "the palette ate the keystroke" - the two look identical for the
+# first few hundred ms.
+#
+# Returns $true the moment our payload is no longer in the box (sent, or the user cleared it),
+# $false if it is still sitting there when the window expires. An UNREADABLE composer counts
+# as cleared: the caller's only response to $false is another Enter, and pressing Enter into a
+# box whose contents we cannot see is exactly the blind double-submit this exists to avoid.
+function Wait-ComposerCleared($el, [string]$payload, [int]$timeoutMs = 1200) {
+    if ([string]::IsNullOrWhiteSpace($payload)) { return $true }
+    $want = ($payload -replace "`r`n", "`n").TrimEnd("`n")
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-ComposerText $el
+        if ($null -eq $now) { return $true }
+        $cur = ($now -replace "`r`n", "`n").TrimEnd("`n")
+        # Substring, not equality: the palette may leave the text alongside a draft the user
+        # already had, and that still means nothing was submitted.
+        if (-not $cur.Contains($want)) { return $true }
+        Start-Sleep -Milliseconds 25
+    }
+    return $false
+}
+
 function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 3000) {
     # Normalize the baseline BEFORE concatenating. An "empty" Chromium composer does not read
     # as "" - it reads as "\n" - and a draft reads as "draft\n". Concatenating raw put that
@@ -3466,7 +3502,27 @@ function Invoke-PillClick($btn) {
             if ($item.submit -and -not $item.chat -and -not $holdShift) {
                 Start-Sleep -Milliseconds 90
                 if (-not (Test-TargetForeground)) { return }
-                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                Send-SubmitKey
+                # A payload starting with "/" opens the app's command palette, and the first
+                # Enter is consumed SELECTING the highlighted entry instead of submitting - so
+                # the command just sat in the composer looking like a dead button.
+                #
+                # Pressing Enter twice unconditionally is not the fix: on every button that did
+                # not open a palette the second one submits again. So OBSERVE instead. The
+                # composer emptying is the app's own acknowledgement that it took the message;
+                # only if our exact payload is STILL sitting there did the keystroke go
+                # somewhere else, and only then is a second Enter safe - it cannot double-send
+                # a message the box proves was never sent.
+                if (-not (Wait-ComposerCleared $composerEl $textToSend)) {
+                    if (Test-TargetForeground) {
+                        Write-CkLog 'First Enter did not submit (command palette); pressing Enter again'
+                        Send-SubmitKey
+                        if (-not (Wait-ComposerCleared $composerEl $textToSend)) {
+                            Write-CkLog 'Composer still holds the payload after a second Enter; left it for the user'
+                            Show-SendWarning (L 'sendNotSubmitted')
+                        }
+                    }
+                }
             }
         } finally {
             $script:sending = $false
