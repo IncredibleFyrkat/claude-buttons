@@ -88,6 +88,45 @@ function Write-JsonAtomic([string]$path, [string]$text) {
     }
 }
 
+# ---- buttons.json is SHARED STATE: take the panel's lock before writing it ----------------
+#
+# The panel serialises every config write under a named mutex and merges against a fresh read
+# (see claude-buttons.ps1, $script:cfgLockName). The installer writes the SAME file - the
+# schemaVersion migration and the shutdown power button - and used to do it with no lock at all,
+# so an install running while the panel wrote a pin, a colour or a group could lose the user's
+# buttons outright: the panel reads, the installer replaces the file, the panel writes back the
+# copy it read before. Nothing warns; the buttons are simply gone.
+#
+# The name comes from the SAME environment variable the panel honours, so the test suite can
+# point both sides at a per-run lock and never touch the production name (holding the real one
+# makes the live panel's write time out after 2000ms and DISCARD the user's edit).
+function Get-ConfigLockName {
+    if ($env:CB_CONFIG_LOCK) { return $env:CB_CONFIG_LOCK }
+    return 'Local\ClaudeButtonsConfig'
+}
+# Run $Body holding the config lock. A FUNCTION, not an inline try/finally at each write site,
+# so a test can execute it and prove it really excludes a concurrent writer.
+function Invoke-WithConfigLock([scriptblock]$Body, [int]$TimeoutMs = 10000) {
+    $name = Get-ConfigLockName
+    $m = New-Object System.Threading.Mutex($false, $name)
+    # Only release a mutex we actually acquired: WaitOne returns $false on timeout (releasing
+    # then throws), while AbandonedMutexException is thrown WHILE granting ownership - a prior
+    # holder died, and we DO own it. Same rule as the panel's writers.
+    $held = $false
+    try { $held = $m.WaitOne($TimeoutMs) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    catch { $held = $false }
+    if (-not $held) {
+        $m.Dispose()
+        # Refuse rather than write unsynchronised. Aborting here costs a re-run; writing anyway
+        # can silently delete buttons the user spent time creating.
+        throw ("Could not take the Claude Buttons config lock ($name) within $TimeoutMs ms - " +
+               "something else is writing buttons.json. NOTHING has been changed. " +
+               "Close the panel and re-run.")
+    }
+    try { & $Body } finally { [void]$m.ReleaseMutex(); $m.Dispose() }
+}
+
 # ---- Stopping the panel: kill the PANEL, and nothing else -------------------------------
 #
 # This used to be `CommandLine -like "*claude-buttons.ps1*"`, which force-kills ANY powershell
@@ -375,13 +414,17 @@ Copy-Item (Join-Path $src 'Launch.vbs') (Join-Path $InstallDir 'Launch.vbs') -Fo
 
 # 2) buttons.json - only create if missing (never wipe the user's buttons); migrate in place otherwise
 $cfgPath = Join-Path $InstallDir 'buttons.json'
-if (-not (Test-Path $cfgPath)) {
-    Copy-Item (Join-Path $src 'buttons.default.json') $cfgPath -Force
-} else {
-    try {
-        $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100) }
-    } catch {}
+# Under the shared lock: the read and the write must be ONE critical section, or the migration
+# re-writes a copy that a concurrent panel write has already superseded.
+Invoke-WithConfigLock {
+    if (-not (Test-Path $cfgPath)) {
+        Copy-Item (Join-Path $src 'buttons.default.json') $cfgPath -Force
+    } else {
+        try {
+            $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (-not $cfg.PSObject.Properties['schemaVersion']) { $cfg | Add-Member schemaVersion 1 -Force; Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100) }
+        } catch {}
+    }
 }
 
 # 3) Skills (core) - substitute nothing hardcoded; they read the marker file at runtime
@@ -461,20 +504,24 @@ if ($wantShutdown) {
             $d = Join-Path $skillsDir $s
             if (Test-Path $d) { Remove-Item $d -Recurse -Force }
         }
-        # Default stateful power button (mirrors the .request marker; added once)
-        try {
-            $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($null -eq $cfg.buttons) { $cfg | Add-Member buttons @() -Force }
-            if (-not (@($cfg.buttons) | Where-Object { $_.text -eq '/shutdown-on-done on' })) {
-                $cfg.buttons = @($cfg.buttons) + [pscustomobject]@{
-                    label = 'Shutdown on done'; short = 'Shutdown'; icon = 'power'
-                    desc = 'Shuts the PC down once this chat is COMPLETELY done with all its work (agent-judged, 60 s grace). Lit while a request is standing; click again to cancel.'
-                    toggle = $true; confirm = $true
-                    stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
-                    text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
-                Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100)
-            }
-        } catch {}
+        # Default stateful power button (mirrors the .request marker; added once).
+        # Read-modify-write on the user's buttons.json, so it takes the panel's lock: without it
+        # an install concurrent with a pin drops whichever side read first.
+        Invoke-WithConfigLock {
+            try {
+                $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -eq $cfg.buttons) { $cfg | Add-Member buttons @() -Force }
+                if (-not (@($cfg.buttons) | Where-Object { $_.text -eq '/shutdown-on-done on' })) {
+                    $cfg.buttons = @($cfg.buttons) + [pscustomobject]@{
+                        label = 'Shutdown on done'; short = 'Shutdown'; icon = 'power'
+                        desc = 'Shuts the PC down once this chat is COMPLETELY done with all its work (agent-judged, 60 s grace). Lit while a request is standing; click again to cancel.'
+                        toggle = $true; confirm = $true
+                        stateGlob = '%USERPROFILE%\.claude\shutdown-on-done\*.request'
+                        text = '/shutdown-on-done on'; textOff = '/shutdown-on-done off'; submit = $true }
+                    Write-JsonAtomic $cfgPath ($cfg | ConvertTo-Json -Depth 100)
+                }
+            } catch {}
+        }
         Write-Host "  + Shutdown-on-done engine installed (completion-judged; power button added to the panel)." -ForegroundColor DarkGray
     }
 }

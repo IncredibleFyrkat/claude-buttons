@@ -255,6 +255,99 @@ Check 'the skill does not pre-authorise request-on either (SEC-01)' ($allowLine 
 Check 'the skill body still instructs the agent to run request-on (it just prompts)' `
     ((($skillLines -join "`n") -match 'toggle request-on'))
 
+# ---- buttons.json must be written under the PANEL'S shared lock (INST-02) ------------------
+# The panel serialises every config write under a named mutex and merges against a fresh read.
+# The installer wrote the same file with no lock at all, so an install concurrent with a panel
+# write (a pin, a colour, a group move) could lose the user's buttons with nothing to warn them.
+#
+# This whole block runs under a PER-RUN lock name, never the production one: holding
+# 'Local\ClaudeButtonsConfig' makes the live panel's write time out after 2000ms and DISCARD the
+# user's edit - the suite would then cause the exact data loss it is testing for.
+$cbProdLockName = 'Local' + [char]92 + 'ClaudeButtonsConfig'   # the production default, for comparison only
+$prevLock = $env:CB_CONFIG_LOCK
+$env:CB_CONFIG_LOCK = 'Local\CbInstTest-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
+Check 'the installer tests run under a non-production config lock name' `
+    (($env:CB_CONFIG_LOCK) -and ($env:CB_CONFIG_LOCK -ne $cbProdLockName))
+
+Check 'Get-ConfigLockName honours CB_CONFIG_LOCK (so tests never touch the live lock)' `
+    ((Get-ConfigLockName) -eq $env:CB_CONFIG_LOCK)
+$env:CB_CONFIG_LOCK = $null
+Check 'Get-ConfigLockName defaults to the same production name the panel uses' `
+    ((Get-ConfigLockName) -eq $cbProdLockName)
+$env:CB_CONFIG_LOCK = 'Local\CbInstTest-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
+
+# The body runs, and the lock is RELEASED afterwards - a version that never released would wedge
+# every later write on the machine, and a same-process re-acquire would not notice (a mutex is
+# re-entrant for its owner), so the re-acquire below is done from ANOTHER PROCESS.
+$ran = $false
+Invoke-WithConfigLock { $script:ran = $true }
+Check 'Invoke-WithConfigLock runs the body' $ran
+
+# Does it actually LOCK? A no-op wrapper passes every test above. Hold the mutex in a background
+# job and prove the installer's writer cannot proceed while it is held. Start-Job does NOT inherit
+# $env:CB_CONFIG_LOCK, so the name is passed EXPLICITLY - a holder that read the variable itself
+# would find it empty, fall back to the production name and contend with the user's live panel.
+$lockName = $env:CB_CONFIG_LOCK
+$readyF   = Join-Path $sandbox 'lock-ready.flag'
+$holder = Start-Job -ArgumentList $lockName, $readyF -ScriptBlock {
+    param($n, $ready)
+    $m = New-Object System.Threading.Mutex($false, $n)
+    [void]$m.WaitOne(5000)
+    try { [IO.File]::WriteAllText($ready, 'held'); Start-Sleep -Milliseconds 2500 } finally { $m.ReleaseMutex() }
+}
+$deadline = (Get-Date).AddSeconds(30)
+while (-not (Test-Path $readyF) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+Check 'the concurrent holder acquired the config lock' (Test-Path $readyF)
+# A short timeout so the assertion is about CONTENTION, not about waiting out the holder.
+$blocked = $false
+$r = Try-Call { Invoke-WithConfigLock { $script:blocked = $true } 400 }
+Check 'Invoke-WithConfigLock BLOCKS while another writer holds the lock' `
+    ($r.Threw -and (-not $blocked))
+Check 'a blocked installer refuses loudly and says nothing was changed' `
+    ($r.Msg -match 'NOTHING has been changed')
+Wait-Job $holder -Timeout 20 | Out-Null
+Remove-Job $holder -Force
+# ...and once the holder is gone the writer proceeds again: the refusal above must be contention,
+# not a wrapper that always throws.
+$after = $false
+$r = Try-Call { Invoke-WithConfigLock { $script:after = $true } 5000 }
+Check 'Invoke-WithConfigLock proceeds once the lock is free (and released it earlier)' `
+    ((-not $r.Threw) -and $after)
+
+# Every buttons.json access in the MAIN FLOW must sit inside a lock block. Testing the helper
+# alone is what let the panel-side equivalent ship unprotected twice: the wrapper can be perfect
+# while the write site never calls it. Checked on the AST, so reformatting, renamed variables or
+# a moved block cannot fake it - the write must be a DESCENDANT of an Invoke-WithConfigLock call.
+$installAst = [System.Management.Automation.Language.Parser]::ParseFile($install, [ref]$null, [ref]$null)
+$cfgCmds = $installAst.FindAll({
+    param($n)
+    if ($n -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+    $nm = "$($n.GetCommandName())"
+    if ($nm -notin @('Write-JsonAtomic', 'Copy-Item', 'Get-Content')) { return $false }
+    return ($n.Extent.Text -match '\$cfgPath')
+}, $true)
+function Test-InsideConfigLock($node) {
+    $p = $node.Parent
+    while ($null -ne $p) {
+        if ($p -is [System.Management.Automation.Language.CommandAst] -and
+            "$($p.GetCommandName())" -eq 'Invoke-WithConfigLock') { return $true }
+        $p = $p.Parent
+    }
+    return $false
+}
+$cfgCmdList = @($cfgCmds)
+Check "found the installer's buttons.json read/write sites ($($cfgCmdList.Count))" ($cfgCmdList.Count -ge 5)
+$unlocked = @($cfgCmdList | Where-Object { -not (Test-InsideConfigLock $_) })
+Check "every buttons.json read/write is inside Invoke-WithConfigLock ($($unlocked.Count) unlocked)" `
+    ($unlocked.Count -eq 0)
+if ($unlocked.Count -gt 0) { $unlocked | ForEach-Object { Write-Host "       unlocked: $($_.Extent.Text)" -ForegroundColor DarkYellow } }
+# The installer must not build its lock from a hardcoded name either - the panel's own guard has
+# the mirror check, and a literal here would make CB_CONFIG_LOCK unhonoured on the installer side.
+$lockFnSrc = [regex]::Match((Get-Content $install -Raw), '(?s)function Invoke-WithConfigLock.*?\n\}').Value
+Check 'the installer builds its config mutex from the overridable name, not a literal' `
+    (($lockFnSrc -match 'Get-ConfigLockName') -and ($lockFnSrc -notmatch 'Mutex\(\$false,\s*[''"]'))
+$env:CB_CONFIG_LOCK = $prevLock
+
 # ---- Stop-Panel must kill the PANEL and nothing else (INST-01) ----------------------------
 # The old filter was `CommandLine -like "*claude-buttons.ps1*"`, so ANY powershell process whose
 # command line merely mentions the filename was force-killed - a grep, an AST analysis, a test

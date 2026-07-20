@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.10.3 — 2026-07-20
+
+Three defects an external review found in the release candidate, all fail-closed, all now
+refused rather than sent.
+
+- **A momentary read failure could send your unsent draft.** Verification reads the message box
+  before pasting to know what was already there. That read can fail transiently — and the failure
+  turned into an empty string, which every text "starts with", so the whole box was treated as
+  freshly pasted. If your draft happened to resemble the button's text, it was confirmed and sent.
+  An unreadable starting point is now reported as unverifiable and nothing is sent.
+- **A closed pane could redirect a click into the surviving chat.** If a split pane closed while
+  its strip was still on screen, the strip's own message box was gone, and the fallback that
+  guesses at the nearest box had no way to reject a box belonging to a *different* chat. It now
+  requires the box to sit within the strip's own horizontal span and within a bounded distance,
+  and refuses with a warning rather than guessing.
+- **Focus was not re-checked before Enter.** The panel focused the box, verified the paste, then
+  pressed Enter — with nothing confirming focus was still there. If it had moved in between, Enter
+  went elsewhere. Focus is re-verified immediately before the keystroke.
+
+Also: the shutdown feature could power the machine off **after consent was withdrawn**. Arming
+required a standing request, but only when arming — the shutdown itself never checked again, so
+if the request was cancelled and clearing the arm failed, the next completed turn still powered
+off. The arm is now bound to the specific request that authorised it and re-checked at the moment
+it would fire. Two tests had encoded the old behaviour as correct and were rewritten.
+
+And: the installer wrote `buttons.json` without the lock the panel uses, so installing while the
+panel saved a change could lose buttons. It now takes the same lock.
+
 ## 1.10.2 — unreleased
 
 **The panel could confirm a paste that never happened and submit your own draft.** Blocking

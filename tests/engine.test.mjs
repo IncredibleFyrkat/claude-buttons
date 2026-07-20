@@ -33,6 +33,19 @@ function stop(payload, { dryrun = true, rawInput = null } = {}) {
   return { out: (r.stdout || '').trim(), code: r.status };
 }
 
+// Arm a chat THE WAY A USER CAN: request-on (the consent marker), then on. Tests used to
+// hand-write `<id>.json` with no `<id>.request` beside it, which is not a state the engine can
+// legitimately produce - and asserting a countdown or a FIRE from it is asserting exactly the
+// defect: that the fire path trusts a flag written earlier instead of re-verifying live consent.
+// The arm flag is now bound to the request that authorised it, so a hand-written flag has no
+// valid token and could not carry these tests anyway.
+function arm(id, { thisTurn = true } = {}) {
+  const r1 = toggle('toggle request-on', id);
+  assert.equal(r1.code, 0, `request-on failed for ${id}: ${r1.err}`);
+  const r2 = toggle(`toggle on${thisTurn ? ' --this-turn' : ''}`, id);
+  assert.match(r2.out, /^Armed/m, `arm failed for ${id}: ${r2.out} ${r2.err}`);
+}
+
 test('toggle status: nothing armed', () => {
   const { out } = toggle('toggle status');
   assert.match(out, /Not armed for this chat/);
@@ -126,7 +139,7 @@ test('toggle off is per-chat: cancelling one chat leaves other armed chats intac
 });
 
 test('Stop hook: skip counter decrements without firing', () => {
-  writeFileSync(join(flagDir(), 'sSkip.json'), JSON.stringify({ skip: 1 }));
+  arm('sSkip', { thisTurn: false });          // skip 1, WITH the standing request that authorised it
   const { out } = stop({ session_id: 'sSkip' });
   assert.match(out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
   assert.doesNotMatch(out, /shutting down|would start/i);
@@ -134,8 +147,7 @@ test('Stop hook: skip counter decrements without firing', () => {
 });
 
 test('Stop hook: armed (skip 0) fires and consumes the flag (dry-run)', () => {
-  writeFileSync(join(flagDir(), 'sFire.json'), JSON.stringify({ skip: 0 }));
-  writeFileSync(join(flagDir(), 'sFire.request'), 'x');
+  arm('sFire');
   const { out } = stop({ session_id: 'sFire' });
   assert.match(out, /\[dry-run\].*shutdown/i);
   assert.ok(!existsSync(join(flagDir(), 'sFire.json')), 'flag consumed');
@@ -148,7 +160,7 @@ test('Stop hook: no flag and no machine switch does nothing', () => {
 });
 
 test('Stop hook: a leading UTF-8 BOM on the payload still parses (F8 fix)', () => {
-  writeFileSync(join(flagDir(), 'sBom.json'), JSON.stringify({ skip: 0 }));
+  arm('sBom');
   const { out } = stop(null, { rawInput: '﻿' + JSON.stringify({ session_id: 'sBom' }) });
   assert.match(out, /\[dry-run\].*shutdown/i);
 });
@@ -216,7 +228,7 @@ for (const [name, body] of [
 // instead of turns decremented twice and fired one response early.
 test('a re-entered Stop hook does not burn the grace turn', () => {
   const id = 'sReenter';
-  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 1 }));
+  arm(id, { thisTurn: false });
   const first = stop({ session_id: id });
   assert.match(first.out, /Shutdown-on-done armed:/, "must say ARMED - /armed/i also matches \"disarmed\"");
   const second = stop({ session_id: id, stop_hook_active: true });
@@ -286,8 +298,11 @@ test('an armed chat does not detonate in a LATER unrelated turn', () => {
   const id = 'sLater';
   writeFileSync(join(flagDir(), 'MACHINE-ARMED'), '');
   stop({ session_id: id, stop_hook_active: false });
-  toggle('toggle on --this-turn', id);
-  stop({ session_id: id, stop_hook_active: true });          // fires here
+  // The arm must really happen, or "does not fire in a later turn" passes for the empty reason
+  // that nothing was ever armed. arm() asserts the arm landed.
+  arm(id);
+  const fired = stop({ session_id: id, stop_hook_active: true });          // fires here
+  assert.match(fired.out, /would start PC shutdown/, 'the armed turn fires (else the test below is vacuous)');
   const later = stop({ session_id: id, stop_hook_active: false });
   assert.doesNotMatch(later.out, /would start PC shutdown/, 'must not fire again in a later turn');
 });
@@ -351,8 +366,7 @@ test('toggle request-on fails LOUDLY when the marker cannot be written (never sa
 test('Stop hook: an unwritable countdown DISARMS rather than promising a shutdown', () => {
   const id = 'sSkipWriteFail';
   const f = join(flagDir(), `${id}.json`);
-  writeFileSync(f, JSON.stringify({ skip: 1 }));
-  writeFileSync(join(flagDir(), `${id}.request`), 'x');
+  arm(id, { thisTurn: false });
   chmodSync(f, 0o444);          // readable (so skip parses) but unwritable
   const r = stop({ session_id: id });
   assert.equal(r.code, 0, 'the hook must not crash the turn');
@@ -363,6 +377,94 @@ test('Stop hook: an unwritable countdown DISARMS rather than promising a shutdow
   try { chmodSync(f, 0o666); } catch {}
   const later = stop({ session_id: id, stop_hook_active: false });
   assert.doesNotMatch(later.out, /would start PC shutdown/, 'must not detonate in a later turn');
+});
+
+// ---------------------------------------------------------------------------
+// SEC-03: the two-sided consent gate existed only at the arming COMMAND. `toggle on` required a
+// standing `<id>.request`, but the Stop hook checked only that `<id>.json` existed and the fire
+// path never looked at the request again. `request-off` deletes the request FIRST and the arm
+// flag SECOND, so a locked/failed second delete left a valid `skip: 0` flag with the consent
+// marker already gone - and the next turn end powered the machine off.
+//
+// These cases were verified to FAIL before the fix: with the old engine each of them fired.
+// ---------------------------------------------------------------------------
+test('an arm whose standing request has vanished does NOT fire (consent withdrawn)', () => {
+  const id = 'sReqGone';
+  arm(id);                                                   // armed for THIS turn, skip 0
+  rmSync(join(flagDir(), `${id}.request`), { force: true }); // the request-off half that succeeded
+  const { out, code } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/, 'must NOT power off after consent is gone');
+  assert.match(out, /NOT shut down/i, 'must say plainly that it did not shut down');
+  assert.equal(code, 0);
+  assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'the orphaned arm is consumed, not left to retry');
+});
+
+test('the exact reported sequence: request-off clears the request but the arm flag survives', () => {
+  const id = 'sHalfWithdrawn';
+  arm(id);
+  // Reproduce the failure of `request-off` at engine:257 - the request delete lands, the arm-flag
+  // delete does not (a Windows lock on the file). Reconstructing the flag with the SAME bytes is
+  // exactly what "the delete failed" means on disk.
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  toggle('toggle request-off', id);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/,
+    'a withdrawn request must stop the shutdown even when its arm flag survives the withdrawal');
+});
+
+test('an arm does NOT ride a LATER, differently-authorised request (token, not mere existence)', () => {
+  // Existence alone is not enough: withdraw, then make a NEW standing request for the same chat
+  // and never arm it. An existence check sees "a request" and fires an arm the user did not
+  // authorise in this consent episode. The token identifies WHICH request granted the arm.
+  const id = 'sReArmed';
+  arm(id);
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  toggle('toggle request-off', id);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);   // stale arm survives, as above
+  toggle('toggle request-on', id);                            // a NEW request, not armed
+  assert.ok(existsSync(join(flagDir(), `${id}.request`)), 'a standing request does exist again');
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/, 'the new request must not authorise the old arm');
+  // Only the stale ARM is dropped. Deleting the request the user has just made would withdraw
+  // consent they gave and darken the panel's power button (it mirrors *.request) - the UI lying
+  // in the other direction, which is the defect class this whole area exists to close.
+  assert.ok(existsSync(join(flagDir(), `${id}.request`)), 'the live standing request survives');
+  assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'the stale arm does not');
+});
+
+test('the countdown path re-verifies the request too, not only the fire path', () => {
+  // skip: 1 is one turn away from a power-off. If consent is withdrawn during the grace turn the
+  // engine must disarm THEN, rather than promise a countdown it will honour with no live request.
+  const id = 'sGraceGone';
+  arm(id, { thisTurn: false });
+  rmSync(join(flagDir(), `${id}.request`), { force: true });
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /Shutdown-on-done armed:/, 'must not promise a countdown without live consent');
+  assert.match(out, /NOT shut down/i);
+  assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'disarmed rather than left counting down');
+});
+
+test('a hand-written arm flag cannot fire: the flag alone is not a key', () => {
+  // The shape the old tests asserted a FIRE from. Any principal that can drop a file into
+  // FLAG_DIR could write this; only a request it was bound to makes it act.
+  const id = 'sForged';
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 0 }));
+  writeFileSync(join(flagDir(), `${id}.request`), 'x');   // even WITH a request beside it
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/, 'an unbound flag must never fire');
+});
+
+test('the consent token SURVIVES the countdown decrement (the fix must not kill the feature)', () => {
+  // Fail-closed re-verification plus a decrement that dropped `req` would disarm every chat at
+  // its grace turn - the feature dead, and every other test still green. This is the round trip.
+  const id = 'sTokenTrip';
+  arm(id, { thisTurn: false });
+  const first = stop({ session_id: id });
+  assert.match(first.out, /Shutdown-on-done armed:/, 'grace turn still counts down');
+  const second = stop({ session_id: id });
+  assert.match(second.out, /would start PC shutdown/, 'the promised turn still fires');
+  assert.ok(!existsSync(join(flagDir(), `${id}.request`)), 'request consumed by the fire');
 });
 
 // QA-07: machineArmedFresh() is what makes the 12h expiry real, but only the Stop path was

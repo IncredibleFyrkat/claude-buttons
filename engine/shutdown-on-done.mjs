@@ -17,6 +17,7 @@ import {
   readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync, renameSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -123,8 +124,33 @@ const validSessionId = (v) => typeof v === 'string' && /^[A-Za-z0-9._-]{1,128}$/
 
 const flagPath = (id) => join(FLAG_DIR, `${id}.json`);
 // Standing-request marker: exists from the moment the user asks until disarm or
-// fire. Carries no logic; external UIs (button panels) read it for toggle state.
+// fire. External UIs (button panels) read it for toggle state (existence only).
 const requestPath = (id) => join(FLAG_DIR, `${id}.request`);
+
+// CONSENT TOKEN. The arm flag records a fingerprint of the standing request that authorised it,
+// and the Stop hook re-derives that fingerprint from disk on EVERY run. This is the fix for the
+// defect where the gate existed only at the arming COMMAND: `toggle on` checked for a standing
+// request, but the Stop hook checked only that `<session>.json` existed and the fire path never
+// looked at the request again. `request-off` deletes the request first and the arm flag second,
+// so a locked/failed second delete left a valid `skip: 0` flag with NO request behind it - and
+// the next turn end powered the machine off AFTER the consent marker was gone.
+//
+// Existence alone would not be enough. Withdraw a request (arm-flag delete fails), then make a
+// NEW request for the same chat without arming it: an existence check sees a request and fires
+// an arm the user never authorised in this consent episode. The token distinguishes "the request
+// this arm was granted under" from "some request". Hence a per-request nonce, not just a
+// timestamp: two request-on calls inside the same millisecond must not produce the same token.
+const requestToken = (id) => {
+  try { return createHash('sha256').update(readFileSync(requestPath(id))).digest('hex').slice(0, 32); }
+  catch { return null; }   // missing or unreadable == no live consent, which is the safe answer
+};
+// The flag's recorded token matches a request that is STILL on disk right now. Fails closed on
+// every unknown: no request, unreadable request, no token in the flag (an arm written by an older
+// build), a non-string token, or a mismatch. Not firing is always the recoverable direction.
+const requestStillLive = (parsedFlag, id) => {
+  const live = requestToken(id);
+  return live !== null && typeof parsedFlag?.req === 'string' && parsedFlag.req === live;
+};
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 
 // Whether the Stop hook is re-entering within the same user-visible turn. ONE normalizer used
@@ -207,12 +233,23 @@ if (mode === 'toggle') {
       logLine(`ARM refused for session ${id}: no standing request`);
       process.exit(0);
     }
+    // Bind this arm to THE request that authorised it, so the Stop hook can re-verify the
+    // consent instead of trusting a flag written earlier. Read the token after the existence
+    // check above; if it cannot be read there is no key, so refuse rather than arm unbound.
+    const req = requestToken(id);
+    if (req === null) {
+      console.error(
+        'NOT armed: the standing shutdown request for this chat could not be read, so this arm could not be bound to it. Run `toggle request-on` again.',
+      );
+      logLine(`ARM refused for session ${id}: standing request unreadable`);
+      process.exit(1);
+    }
     // Fail CLOSED and LOUDLY. If the flag cannot be put on disk there is no arm, and saying
     // "Armed" would leave the user believing the PC will power off when the work finishes.
     let armed = false;
     try {
       mkdirSync(FLAG_DIR, { recursive: true });
-      armed = writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1 }));
+      armed = writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1, req }));
     } catch { armed = false; }
     if (!armed) {
       discardFlag(flagPath(id));   // never leave a half-written arm behind a "not armed" message
@@ -236,7 +273,10 @@ if (mode === 'toggle') {
     let recorded = false;
     try {
       mkdirSync(FLAG_DIR, { recursive: true });
-      recorded = writeFlagAtomic(requestPath(id), new Date().toISOString());
+      // Timestamp + a per-request nonce. The nonce is what makes the consent token identify THIS
+      // request rather than "a request": withdraw and re-request inside the same millisecond and
+      // the token still changes, so an arm granted under the old request cannot ride the new one.
+      recorded = writeFlagAtomic(requestPath(id), `${new Date().toISOString()} ${randomUUID()}`);
     } catch { recorded = false; }
     if (!recorded) {
       discardFlag(requestPath(id));
@@ -357,6 +397,33 @@ if (skip === null) {
   process.exit(0);
 }
 
+// THE SECOND SIDE OF THE GATE, AT THE DANGEROUS OPERATION.
+//
+// Everything below this line can power the machine off, so the standing request is re-verified
+// HERE, from disk, on every single Stop run - not merely at the arming command, and not by
+// trusting a flag that was written at some earlier moment under conditions that may no longer
+// hold. Consent that has been withdrawn must stop the shutdown even if the arm flag survives,
+// which is precisely what `request-off`'s failed second delete leaves behind.
+//
+// Deliberately BEFORE the same-turn early exit as well: a re-entry must not be a window in which
+// a dead arm quietly persists to detonate later. Every run either confirms live consent or
+// disarms.
+if (!requestStillLive(parsed, id)) {
+  // Only the ARM is dropped. The request marker is deliberately left alone: if the mismatch is
+  // because the user has since made a NEW standing request, deleting it would withdraw consent
+  // they just gave and darken the panel's power button, which mirrors *.request. Removing the
+  // arm is what makes this state safe; removing the request would only make the UI lie again,
+  // in the other direction.
+  try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
+  logLine(`arm flag for session ${id} has no live standing request; disarmed WITHOUT shutting down`);
+  emit({
+    systemMessage:
+      'Shutdown-on-done: this chat was armed, but the standing shutdown request that authorised it is gone ' +
+      '(or belongs to a later request), so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
+  });
+  process.exit(0);
+}
+
 // This turn has already been accounted for: either it burned the skip, or it decided not to
 // fire. Do nothing more. Crucially this must be checked BEFORE the skip branch AND before the
 // fire path: a counter decremented 1 -> 0 during THIS turn means "due next turn", not "due
@@ -371,7 +438,10 @@ if (skip > 0) {
   // state that is not there, and the undecremented counter relocates the power-off to some
   // arbitrary later turn the user never consented to. Disarm instead and say so: not shutting
   // down is always the safe direction, and an honest "disarmed" beats a confident wrong promise.
-  if (!writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true }))) {
+  // `req` is carried through the decrement. Dropping it would disarm the chat at the NEXT turn
+  // end (the re-verification above fails closed on a missing token), silently killing the very
+  // shutdown the message below promises - so the token must survive every rewrite of the flag.
+  if (!writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true, req: parsed.req }))) {
     discardFlag(flagPath(id));
     discardFlag(requestPath(id));
     logLine(`countdown write FAILED for session ${id}; disarmed WITHOUT shutting down`);

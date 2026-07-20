@@ -228,6 +228,59 @@ Check 'a whitespace-only payload can never be Confirmed' `
 Check 'an unreadable composer is Unverifiable, never Confirmed' `
     ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":null}') -eq 'Unverifiable')
 
+# --- AN UNREADABLE BASELINE. The OTHER direction, and it reopened defect 3. -----------------
+# The case above is a readable baseline with an unreadable OBSERVATION. Nothing covered the
+# reverse, and the reverse is the dangerous one. Get-ComposerText documents $null as a real
+# return - "unknown", never "empty" - but Wait-PasteLanded did `$base = [string]$baseline`, and
+# [string]$null is ''. EVERY string starts with '', so the prefix check passed trivially and the
+# WHOLE read-back became the delta. Measured through this seam before the fix:
+#
+#   {"baseline":null,"payload":"/review","observed":"/review\n"}  ->  Confirmed
+#
+# The live sequence: the composer already holds /review; the baseline read fails transiently; no
+# paste happens; a later read succeeds; the panel confirms and Enter sends the user's own draft.
+# That is "confirm a paste that never happened", arriving through the one input the delta logic
+# cannot see, and it must be Unverifiable - we cannot know the delta, and saying 'Mismatch' would
+# send the user hunting for contamination we never actually detected.
+Check 'an UNREADABLE BASELINE can never be Confirmed (delta is unknowable)' `
+    ((PasteState '{"baseline":null,"payload":"/review","observed":"/review\n"}') -eq 'Unverifiable')
+# The same shape where the read-back is NOT payload-derived. Still Unverifiable, not Mismatch:
+# with no baseline there is nothing to compare against, so the verdict cannot depend on what
+# happens to be in the box. A fix that merely reordered the checks would fail this.
+Check 'an unreadable baseline is Unverifiable regardless of the read-back' `
+    ((PasteState '{"baseline":null,"payload":"/review","observed":"noget helt andet\n"}') -eq 'Unverifiable')
+# ...and it must NOT be reached by short-circuiting. The caller restores the user's clipboard the
+# instant this returns, and Ctrl+V is read asynchronously, so returning early hands the app the
+# USER'S clipboard to paste. The unreadable-baseline path must hold the clipboard for the full
+# budget exactly like the unreadable-composer path above. (Same measurement as F8; a `return
+# 'Unverifiable'` placed before the poll would pass the two checks above and fail this one.)
+$nullBaseRaw = PasteState '{"baseline":null,"payload":"/review","observed":"/review\n"}' -Raw
+$nullBaseMs  = [int]($nullBaseRaw -split '\|')[1]
+Check "an unreadable baseline still polls until its timeout (${nullBaseMs}ms of a 120ms budget)" `
+    ($nullBaseMs -ge 100)
+# The control: a READABLE baseline of the same shape must still Confirm. Without this, "return
+# Unverifiable always" passes every check above.
+Check 'a readable baseline with the same read-back still Confirms (the gate is not blanket)' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
+
+# --- INTERLEAVING: words and symbols were checked as INDEPENDENT sequences ------------------
+# Derivation ran one ordered-subset walk over the words and a separate one over the symbols, so a
+# read-back could satisfy both while ordering the symbols differently against the words. All three
+# of these have the payload's exact word sequence, the payload's exact symbol sequence and
+# identical sizes in both character classes - so (a), (b), (c) and (d) are all satisfied - and all
+# three were Confirmed through this seam before the combined-stream check was added.
+Check 'a symbol moved to the front of a word is a Mismatch (interleaving)' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"alfa /beta","observed":"/alfa beta\n"}') -eq 'Mismatch')
+Check 'a colon moved to the end of the line is a Mismatch (interleaving)' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"gennemgaa: min kode","observed":"gennemgaa min kode:\n"}') -eq 'Mismatch')
+Check 'a quote moved across a word is a Mismatch (interleaving)' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"sig \"ja\" nu","observed":"\"sig ja\" nu\n"}') -eq 'Mismatch')
+# The combined check must not have been bought by refusing legitimate rendering. Markdown
+# rendering only DELETES tokens, which an ordered-subset walk permits freely, so a fenced and
+# bolded button still confirms - and the real 12k pair below is the load-bearing version of this.
+Check 'the combined-stream check still Confirms a fenced, bolded button' `
+    ((PasteState '{"baseline":"<EMPTY>","payload":"# Titel\n\n**fed** tekst\n\n```powershell\nGet-Date\n```\n\n- punkt et\n- punkt to","observed":"# Titel\nfed tekst\nGet-Date\n- punkt et\n- punkt to\n"}') -eq 'Confirmed')
+
 # Source invariants that cannot be probed: what the caller DOES with the state.
 # (The "nothing is submitted unless Confirmed" invariant used to live here as a regex for the
 # assignment `$pasted = ($pasteState -eq 'Confirmed')`. That asserted a LINE EXISTS, not that the
@@ -326,6 +379,24 @@ if ($enterCall.Count -eq 1) {
 }
 Check "Enter is structurally dominated by `$pasteState -ceq 'Confirmed' (guards: $($enterGuards -join ' / '))" `
     ($enterGuards -contains "`$pasteState -ceq 'Confirmed'")
+# ...AND by a re-verification that focus is STILL IN THIS COMPOSER. A confirmed paste proves what
+# is in the box, not where the caret is. Between the paste and the keystroke we wait for the
+# paste to be observed and then sleep 90ms, and focus can move in that window - the user
+# clicking, or Claude re-rendering. Test-TargetForeground does NOT cover this: it asks whether
+# Claude is the foreground WINDOW and says nothing about which control holds keyboard focus, so
+# in a multi-pane grid it passes while the caret sits in a different chat's composer. Enter goes
+# wherever focus is, so pressing it blind can submit ANOTHER conversation's half-written draft.
+#
+# A dominator, not a `if (-not ...) { return }` above the keystroke: that shape is exactly what
+# was hopped once before by moving the submit block above its guard, with the suite still green.
+Check "Enter is structurally dominated by a focus re-check (guards: $($enterGuards -join ' / '))" `
+    ($enterGuards -contains 'Wait-ComposerFocus $composerEl 250')
+# The re-check must target the composer we PASTED into. `Wait-ComposerFocus $best` or any other
+# element would re-verify the wrong box and pass while focus sits elsewhere.
+Check 'the focus re-check names the composer that was pasted into' `
+    ($srcText -match 'if \(Wait-ComposerFocus \$composerEl 250\) \{')
+Check 'losing focus before Enter warns the user rather than failing silently' `
+    ($srcText -match "Show-SendWarning \(L 'sendFocusLost'\)")
 # ...and that state may only ever be produced by the verifier. If anything else could assign
 # 'Confirmed', the dominator above would be satisfiable without a verified paste.
 $confirmAssigns = @($srcAst.FindAll({
@@ -511,6 +582,32 @@ Check 'the same draft WITH a real paste still confirms (delta is not just "refus
 # the user's draft submitted. The delta is empty here; that must remain the only verdict taken.
 Check 'a draft that IS the button text, with nothing pasted, is a Mismatch' `
     ((PasteState '{"baseline":"review\n","payload":"/review","observed":"review\n"}') -eq 'Mismatch')
+
+# --- A DECISION, PINNED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT ------------------------------
+# A draft that was REPLACED rather than appended to takes the fallback (the read-back does not
+# start with the baseline), the whole box is payload-derived, and it Confirms - so the draft is
+# gone and the button's text is sent. That is accepted deliberately; it is not the same bug as
+# the three above, and it must not be "fixed" without reading the long note in the source.
+#
+# The reviewer's proposal was to hardcode the measured placeholder and refuse the fallback for
+# any other baseline. THE FALLBACK IS THE DOMINANT PATH: an empty composer reads as its
+# placeholder, the paste REPLACES it, so every ordinary click into an empty box lands here.
+# Gating it on correctly identifying an English prose string gates EVERY SEND on that string
+# surviving app updates and localisation - the total-loss-of-function regression this file has
+# already shipped three times, where only a human clicking a button ever noticed.
+#
+# And refusing would not save the draft: by the time we read the box the draft is already gone,
+# destroyed by the Ctrl+V that hit a select-all or a remounted composer. Refusing preserves only
+# the chance to Ctrl+Z, at the cost of the button not working. What gets sent is verified
+# payload-derived - the text of the button the user just clicked - so no foreign content can ride
+# in; the leak classes above are still refused by derivation.
+Check 'a REPLACED draft still Confirms (deliberate: the fallback is the ordinary path)' `
+    ((PasteState '{"baseline":"bevar dette udkast\n","payload":"/review","observed":"/review\n"}') -eq 'Confirmed')
+# The guard on that decision: the fallback stays a FULL-STRENGTH gate, not a soft one. If the
+# whole read-back is not payload-derived, replacement is refused like anything else - so
+# "accepting the fallback" never means "accepting whatever replaced the draft".
+Check 'a draft replaced by something FOREIGN is still a Mismatch' `
+    ((PasteState '{"baseline":"bevar dette udkast\n","payload":"/review","observed":"helt andet indhold\n"}') -eq 'Mismatch')
 # A delta that is pure punctuation is invisible to the word checks - the word sequence is
 # perfectly derived. The symbol side of the derivation check is the only thing that refuses it.
 Check 'punctuation appended after a correct paste is a Mismatch (symbol derivation)' `
@@ -642,7 +739,9 @@ foreach ($lang in @('en', 'da')) {
     # sendNoPane joined these when the wrong-chat hazard was fixed: it is the string the user
     # sees when a side-bar send is abandoned because no composer could be identified safely.
     # Without it in this list the feature ships with a blank tooltip in one or both languages.
-    foreach ($k in @('sendMismatch', 'sendUnverified', 'sendNoPane')) {
+    # sendFocusLost joined them when the pre-Enter focus re-check was added: the paste succeeded,
+    # so the user sees their text sitting in the box and needs to be told why it was not sent.
+    foreach ($k in @('sendMismatch', 'sendUnverified', 'sendNoPane', 'sendFocusLost')) {
         if ($block -notmatch "$k\s*=\s*'[^']{10,}'") { $stringsOk = $false }
     }
 }
@@ -2221,7 +2320,8 @@ Check 'the toggle ON state is never recoloured (every palette pick regresses its
 # NEIGHBOURING pane's composer can pass instead and take the prompt. The everyday symptom was
 # that side-bar buttons silently did nothing; sending to the wrong chat was the tail case.
 foreach ($fn in @('Resolve-StripForm', 'Get-PaneForForm', 'Test-CanGuessFrom', 'Get-StripWidth', 'Get-PillWidth',
-                  'Get-ShortLabel', 'Get-GroupDef', 'Get-IconGlyph', 'Test-ChatButtonVisible', 'S')) {
+                  'Get-ShortLabel', 'Get-GroupDef', 'Get-IconGlyph', 'Test-ChatButtonVisible', 'S',
+                  'SW', 'Test-ComposerDockedTo')) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
     if ($node) { Invoke-Expression $node.Extent.Text } else { $missingFns += $fn }
 }
@@ -2290,6 +2390,64 @@ $form = $formSaved
 # the records rather than their .Form and quietly answer the wrong question.
 Check 'a mirror RECORD is not mistaken for its window' `
     (-not (Test-CanGuessFrom $script:mirrors[0]))
+
+# --- Test-ComposerDockedTo: the geometric fallback must not reach ANOTHER CHAT'S composer ---
+# Test-CanGuessFrom decides WHICH STRIPS may guess. It says a mirror may - correctly, a mirror is
+# a row strip. But nothing then bounded WHAT the guess could return, and that is a wrong-chat
+# hazard the moment a mirror's own composer dies:
+#
+#   Chats A and B side by side; B has a mirror strip. B closes, so the element the strip is bound
+#   to dies. Before the next UIA refresh tears the strip down, its button is clicked. The bound
+#   element fails, Test-CanGuessFrom permits the guess, and the old scorer took the best composer
+#   ABOVE the strip with no maximum distance and no identity check - so with A the only survivor
+#   it won by default. THE PROMPT WENT TO CHAT A.
+#
+# Asserted by VALUE, on the real layouts. $script:winScale is what SW scales by.
+$script:winScale = 1.0
+# The strip is docked to its own composer: the tick clamps its travel to the composer's X span
+# and places its centre on the composer's bottom edge, so a legitimate strip top sits a few px
+# BELOW that bottom (hence the +10 tolerance) and its centre X is inside the span.
+$ownComposer  = [pscustomobject]@{ X = 400; Y = 700; W = 400; H = 100 }   # spans x 400..800
+$dockedStripX = 600    # centre, inside 400..800
+$dockedStripY = 802    # just below the composer bottom (800)
+Check 'the strip''s OWN composer is accepted (the ordinary dock)' `
+    (Test-ComposerDockedTo $ownComposer $dockedStripX $dockedStripY 24)
+# THE FINDING. Side by side: A is at x 400..800, B at x 900..1300, both composers at the SAME
+# height - so no vertical test can separate them and only the X span can. B's strip is centred
+# over B, and must not match A.
+$neighbourA = [pscustomobject]@{ X = 400; Y = 700; W = 400; H = 100 }
+Check 'a SIDE-BY-SIDE neighbour''s composer is refused (horizontal identity)' `
+    (-not (Test-ComposerDockedTo $neighbourA 1100 802 24))
+Check '...and B''s own composer at the same height is still accepted' `
+    (Test-ComposerDockedTo ([pscustomobject]@{ X = 900; Y = 700; W = 400; H = 100 }) 1100 802 24)
+# THE MIRROR IMAGE, and it needs its own case: both checks above put the survivor to the LEFT of
+# the strip, so they are decided entirely by the right-hand edge and a mutant that deletes the
+# LEFT-hand one survives them both. Here the surviving chat is to the RIGHT of the dead strip -
+# equally real, since which pane closes is not up to us.
+Check 'a neighbour to the RIGHT of the strip is refused (left-hand identity)' `
+    (-not (Test-ComposerDockedTo ([pscustomobject]@{ X = 900; Y = 700; W = 400; H = 100 }) 600 802 24))
+Check 'a strip centred well to the LEFT of its composer is refused' `
+    (-not (Test-ComposerDockedTo $ownComposer 340 802 24))
+# STACKED: the X spans DO overlap, so identity cannot separate these - the distance bound must.
+# A sits far above B's strip.
+Check 'a STACKED neighbour far above the strip is refused (distance bound)' `
+    (-not (Test-ComposerDockedTo ([pscustomobject]@{ X = 400; Y = 100; W = 400; H = 100 }) 600 802 24))
+# Both halves are load-bearing: each layout is caught by exactly one of them, so deleting either
+# check leaves one of the two cases above passing. (Deleting only the distance bound was survived
+# by every side-by-side case; deleting only the identity check was survived by every stacked one.)
+Check 'a composer BELOW the strip is refused (it cannot be docked above it)' `
+    (-not (Test-ComposerDockedTo ([pscustomobject]@{ X = 400; Y = 900; W = 400; H = 100 }) 600 802 24))
+# The strip centre exactly on the composer's edges is still its own composer, not a neighbour's.
+Check 'the dock tolerates a strip centred on the composer''s left edge' `
+    (Test-ComposerDockedTo $ownComposer 400 802 24)
+Check 'the dock tolerates a strip centred on the composer''s right edge' `
+    (Test-ComposerDockedTo $ownComposer 800 802 24)
+# ...and just outside it is not. Without this, a "tolerance" of any size would pass the edge
+# cases above while still reaching the neighbour.
+Check 'a strip centred well outside the composer''s span is refused' `
+    (-not (Test-ComposerDockedTo $ownComposer 860 802 24))
+Check 'Test-ComposerDockedTo refuses a null composer' `
+    (-not (Test-ComposerDockedTo $null 600 802 24))
 
 # --- Resolve-StripForm: a flyout stands in for the strip that opened it ---
 # A button inside the group flyout belongs to the pane of the strip that opened it. The flyout
@@ -2416,6 +2574,20 @@ Check "the fallback guard IS the tested predicate, alone (conds: $($guardDesc -j
 # send - which is how this whole class of bug stayed invisible: "I clicked and nothing
 # happened" reads as a flaky panel, not as a refusal that protected the user.
 Check 'the abandoned side-bar send warns the user (sendNoPane)' ($srcText -match "Show-SendWarning \(L 'sendNoPane'\)")
+# The call site must hand Focus-ChatInput the strip's HEIGHT. Without it the distance bound
+# degenerates to a bare margin and the stacked-layout case above stops being enforced in
+# production, while Test-ComposerDockedTo's own tests still pass because they pass it directly.
+Check 'the geometric fallback passes the strip height to the scorer' `
+    ($srcText -match 'Focus-ChatInput \(\$sf\.Left \+ \$sf\.Width / 2\) \$sf\.Top \$sf\.Height')
+# The guess is bounded now, so it can legitimately return nothing - a mirror whose chat closed
+# beside a chat that is NOT its own. That must be an explicit refusal, not a fall-through into
+# Wait-ComposerFocus($null), which aborts with nothing on screen to explain it.
+$guessBlock = [regex]::Match($srcText, '(?s)if \(\$canGuess\) \{(.*?)\r?\n                \} else \{').Groups[1].Value
+Check 'the bounded guess returning nothing was located' ($guessBlock.Length -gt 40)
+Check 'a guess that identifies no docked composer is refused, and visibly' `
+    (($guessBlock -match 'if \(-not \$composerEl\)') -and
+     ($guessBlock -match "Show-SendWarning \(L 'sendNoPane'\)") -and
+     ($guessBlock -match '\breturn\b'))
 
 # --- Get-StripWidth measures what is actually ON the row ---
 # It used to sum every visible button regardless of bar and count each group member separately.

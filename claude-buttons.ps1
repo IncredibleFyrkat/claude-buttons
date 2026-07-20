@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.10.2'
+$CB_VERSION = '1.10.3'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1039,6 +1039,7 @@ $script:strings = @{
         sendMismatch = 'Not sent: the paste did not land as expected. Check the message box before sending - something else may be in it.'
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
         sendNoPane = 'Not sent: the panel could not tell which chat this button belongs to, so it did not risk sending to the wrong one. Click the chat, then try again.'
+        sendFocusLost = 'Not submitted: the text was inserted correctly, but the cursor left the message box before it could be sent. The text is ready - press Enter to send it.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         removeAmbiguous = 'Not removed: two or more buttons have exactly the same name, text and scope, so the panel cannot tell which one you clicked. Rename or retype one of them first. Nothing was changed.'
         cfgClobber = 'Not saved: buttons.json was changed by something else while this edit was being made, so the panel did not overwrite it. The change you just made was dropped - the file was not. The panel has reloaded; try again.'
@@ -1077,6 +1078,7 @@ $script:strings = @{
         sendMismatch = 'Ikke sendt: indsættelsen landede ikke som forventet. Tjek beskedfeltet før du sender - der kan stå noget andet i det.'
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
         sendNoPane = 'Ikke sendt: panelet kunne ikke afgøre hvilken chat denne knap hører til, så det undlod at sende til den forkerte. Klik på chatten, og prøv igen.'
+        sendFocusLost = 'Ikke afsendt: teksten blev indsat korrekt, men markøren forlod beskedfeltet, før den kunne sendes. Teksten er klar - tryk Enter for at sende den.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         removeAmbiguous = 'Ikke fjernet: to eller flere knapper har præcis samme navn, tekst og scope, så panelet kan ikke afgøre hvilken du klikkede på. Omdøb eller ret teksten på den ene først. Intet blev ændret.'
         cfgClobber = 'Ikke gemt: buttons.json blev ændret af noget andet mens denne redigering blev lavet, så panelet undlod at overskrive den. Den ændring du lige lavede blev kasseret - filen blev ikke. Panelet har genindlæst; prøv igen.'
@@ -3570,6 +3572,41 @@ function Get-ComposerText($el) {
 #     app-specific English prose. Any Claude update or a localised UI changes it, and the failure
 #     mode is not a degraded feature - it is THIS regression again, every send refused, silently.
 #     A knob that must be correct for the product to work at all is a knob that will be wrong.
+#   - LEARNED AT RUNTIME. Proposed at review: right after a confirmed send the composer is empty,
+#     so read it there and cache whatever comes back as "the placeholder", in whatever language,
+#     re-learned automatically across app updates. It does not hold up, for four reasons and any
+#     one of them is disqualifying. (i) The clear is ASYNCHRONOUS - we would have to poll for it,
+#     and the only way to recognise that the clear has happened is to know the placeholder, which
+#     is the thing being learned. (ii) It is a read that can be WRONG - too early, or after the
+#     user has started typing - and the value it produces is not a display string, it is a
+#     standing AUTHORISATION to treat a baseline as empty. Mis-learn a habitual draft once and
+#     that draft is silently discardable from then on: an unreliable read converted into a
+#     permanent safety decision, which is backwards for a fail-closed path. (iii) Before the first
+#     confirmed send of each run there is nothing cached, so the fallback would be refused and
+#     every send into an empty composer would fail - the exact total-loss failure hardcoding was
+#     rejected for, now on every launch. Persisting it to disk only makes a stale value permanent.
+#     (iv) It cannot be verified here at all: confirming what the composer reads back after Enter
+#     requires driving the live app, and unverified premises about this read-back are precisely
+#     what shipped the three regressions above.
+#
+# AND THE DECIDING ARGUMENT, which applies to hardcoding and learning alike: THE FALLBACK IS THE
+# DOMINANT PATH, not an edge case. An empty composer is the normal state when a button is clicked,
+# and an empty composer reads as the placeholder, which the paste REPLACES - so `observed` does not
+# begin with `baseline` and the fallback is taken. Measured on the real pair: the genuine 12,752-
+# character button into the genuine empty composer takes the fallback. Any scheme that gates the
+# fallback on correctly identifying the placeholder therefore gates EVERY ORDINARY SEND on it.
+#
+# So the residual risk is accepted, with eyes open. The counter-example is real: baseline
+# "bevar dette udkast", payload "/review", read-back "/review" - the whole box is payload-derived,
+# it Confirms, and the draft is gone. But note what is and is not lost. The draft was destroyed by
+# the Ctrl+V that replaced a select-all or landed in a remounted composer; REFUSING would not give
+# it back, because by the time we read the box it is already gone. What refusing would preserve is
+# only the chance to Ctrl+Z it, at the price of the button not working. And what gets sent is
+# verified payload-derived - the text of the button the user just clicked, not foreign content:
+# the leak classes (1), (2) and (3) are still refused by derivation, which is the property this
+# whole path exists for. Losing one recoverable draft is worse than nothing; a panel that cannot
+# send at all is worse still, and far more likely - it has happened three times in one day, and
+# every time a human clicking a button was the only thing that noticed.
 #
 # INSTEAD, MAKE THE PREFIX CHECK FALL BACK, and never name the placeholder at all. If `observed`
 # begins with `baseline`, subtract it and judge the delta, exactly as before. If it does NOT, do
@@ -3623,6 +3660,31 @@ function Get-CompareWords([string]$s) {
 # is an aggregate and aggregates are what let case 1 through.
 function Get-CompareSymbols([string]$s) {
     @([regex]::Matches((Remove-FenceInfoStrings $s), '[^\p{L}\p{N}\s]') | ForEach-Object { $_.Value })
+}
+# Words AND symbols as ONE sequence, in document order. The derivation check used to run the two
+# ordered-subset tests over INDEPENDENT sequences, so a read-back could satisfy both while
+# interleaving them differently from the payload. Measured through the -PasteProbe seam, all three
+# of these were Confirmed and would have been submitted:
+#
+#   payload "alfa /beta"          read back as "/alfa beta"
+#   payload "gennemgaa: min kode" read back as "gennemgaa min kode:"
+#   payload "sig \"ja\" nu"       read back as "\"sig ja\" nu"
+#
+# Each has the identical word sequence and the identical symbol sequence as the payload, and
+# identical sizes in both character classes, so nothing in (a), (b), (c) or (d) could see the
+# move. Checking ONE interleaved stream sees it, because the relative order of a symbol and its
+# neighbouring words is now part of what must be derived.
+#
+# This is strictly stronger than the two separate checks and cannot refuse anything they accept
+# for a legitimate reason: an ordered subset of the combined stream projects to an ordered subset
+# of each class, and markdown rendering only ever DELETES tokens, which a subset check permits
+# freely. VERIFIED against the real pair rather than argued: the genuine 12,752-character button
+# and its genuine 12,259-character read-back give 2,038 payload tokens and 2,034 candidate tokens,
+# and the combined subset still holds - so a real fenced, bolded button still confirms.
+function Get-CompareTokens([string]$s) {
+    @([regex]::Matches((Remove-FenceInfoStrings $s), '[\p{L}\p{N}]+|[^\p{L}\p{N}\s]') | ForEach-Object {
+        if ($_.Value -match '^[\p{L}\p{N}]') { $_.Value.ToLowerInvariant() } else { $_.Value }
+    })
 }
 # The composer's read-back always carries a trailing newline: an "empty" Chromium composer reads
 # as "\n", a draft as "draft\n". Strip it (and normalise CRLF) before the prefix check, or an
@@ -3718,6 +3780,25 @@ function Test-DeltaDerives([string]$candidate, [string]$payload, $pw) {
     # freely - which is why a fenced or bold button still confirms.
     if (-not (Test-IsOrderedSubsetOf (Get-CompareSymbols $candidate) (Get-CompareSymbols $payload))) { return $false }
 
+    # (e) INTERLEAVING. (a) and (c) walk two INDEPENDENT sequences, so a read-back can satisfy
+    # both while ordering the symbols differently against the words - see Get-CompareTokens for
+    # the three measured cases that were Confirmed under (a)+(c) alone. One combined stream pins
+    # the relative order too. (a) and (c) are implied by this and are kept because they name which
+    # class failed, which is what makes a refusal diagnosable.
+    #
+    # NOT FIXED HERE, deliberately: CASE. Get-CompareWords lowercases, so a read-back differing
+    # only in case ("continue" read back as "CONTINUE") derives cleanly and is Confirmed. Making
+    # derivation case-exact would be a one-word change, and it is NOT worth it: the read-back is
+    # produced by the app RENDERING our own payload, so nothing but the payload can supply those
+    # letters, and the worst outcome is sending the button's own text in the wrong case - not a
+    # leak, since no foreign content can enter through a subset check. Against that, UIA exposes
+    # STYLED text, and a heading or a button label rendered through a CSS text-transform would
+    # come back recased through no fault of ours; making case strict would then refuse every such
+    # button - the total-loss-of-function regression this file has already shipped three times.
+    # Confirming that premise either way needs typing into the live app, which cannot be done
+    # here. An unverifiable tightening against an unexploitable weakness is the wrong trade.
+    if (-not (Test-IsOrderedSubsetOf (Get-CompareTokens $candidate) (Get-CompareTokens $payload))) { return $false }
+
     # (d) SIZE, candidate against payload, with NO margin. Rendering only ever deletes, so what
     # landed cannot legitimately be larger than what we sent in either character class. The
     # 2-character rounding margin this replaced is exactly how "xx/review" got in.
@@ -3787,6 +3868,28 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
     # a draft in the box is refused. (An earlier version CONCATENATED baseline+payload and
     # compared, which put that terminator in the middle of the expected string; the empty case
     # only passed because Trim() happened to eat both newlines.)
+    #
+    # AN UNREADABLE BASELINE IS NOT AN EMPTY ONE. THIS REOPENED THE "confirm a paste that never
+    # happened" DEFECT, TWICE FIXED, AND IT WAS MEASURED THROUGH THIS SEAM:
+    #
+    #   {"baseline":null,"payload":"/review","observed":"/review\n"}  ->  Confirmed
+    #
+    # Get-ComposerText documents $null as a REAL return - "unknown", never "empty". But this line
+    # used to be a bare `$base = [string]$baseline`, and `[string]$null` is ''. EVERY string starts
+    # with '', so the prefix check passed trivially, the delta became the WHOLE read-back, and the
+    # comparator then judged the user's own untouched draft as if the paste had produced it.
+    #
+    # The sequence that makes it dangerous: the composer already holds `/review`; the baseline read
+    # fails transiently (UIA is flaky under load); the paste never lands; a later read succeeds; the
+    # panel confirms and Enter submits the USER'S OWN DRAFT. That is exactly defect 3 - a paste that
+    # never happened being confirmed - arriving through the one input the delta logic cannot see.
+    #
+    # There is no recovery to attempt: the baseline had to be captured BEFORE the clipboard was
+    # touched, and once the paste has been sent we can never learn what was in the box beforehand.
+    # So the delta is UNKNOWABLE for this send, and the only honest verdict is 'Unverifiable' - not
+    # 'Mismatch', which would tell the user to go inspect the box for contamination we never
+    # detected. Both fail closed identically at the call site; only the message differs.
+    $baselineReadable = ($null -ne $baseline)
     $base = [string]$baseline
     # A payload with no words at all can never be verified: coverage is undefined and the poll
     # would otherwise confirm a paste that never happened, then submit whatever the user already
@@ -3798,10 +3901,19 @@ function Wait-PasteLanded($el, $baseline, [string]$payload, [int]$timeoutMs = 12
         $now = Get-ComposerText $el
         if ($null -ne $now) {
             $sawText = $true
-            if (Test-PasteLanded $base $payload ([string]$now)) { return 'Confirmed' }
+            # Test-PasteLanded takes [string]$baseline and so CANNOT tell $null from '' - by the
+            # time it is called the distinction is already lost. The gate therefore has to be
+            # here, in the one function that still holds the unerased value.
+            if ($baselineReadable -and (Test-PasteLanded $base $payload ([string]$now))) { return 'Confirmed' }
         }
         Start-Sleep -Milliseconds 15
     }
+    # Deliberately AFTER the loop, never before it. Short-circuiting on an unreadable baseline
+    # would return instantly, and the caller's `finally` restores the user's clipboard the moment
+    # this returns - so the app's asynchronous read of Ctrl+V would find THEIR clipboard and paste
+    # that instead. We cannot verify this send, but we must still hold the clipboard for the full
+    # budget while the paste we already sent settles. (Pinned by the F15 structural test.)
+    if (-not $baselineReadable) { return 'Unverifiable' }
     if ($sawText) { return 'Mismatch' }
     return 'Unverifiable'
 }
@@ -3834,7 +3946,58 @@ function Invoke-PasteProbe([string]$jsonPath) {
 # either one and that stops being true.)
 if (-not [string]::IsNullOrEmpty($PasteProbe)) { Invoke-PasteProbe $PasteProbe }
 
-function Focus-ChatInput($stripCenterX, $stripTopY) {
+# WHY THIS NEEDS A MAXIMUM, NOT JUST A MINIMUM. This used to pick the best-scoring composer above
+# the strip with NO bound on how far away "best" could be, and no check that the composer had
+# anything to do with this strip. That is a wrong-chat hazard as soon as the strip's own composer
+# dies:
+#
+#   Chats A and B side by side; B has a mirror strip. B closes, so the element that strip is bound
+#   to dies. Before the next UIA refresh tears the strip down, its button is clicked. The bound
+#   element fails, Test-CanGuessFrom permits the geometric fallback (a mirror IS a row strip), and
+#   with A the only surviving candidate above the strip it wins by default however far away it is.
+#   THE PROMPT GOES TO CHAT A.
+#
+# The fix is to encode the model the guess already claims to have, instead of only half of it. A
+# strip is not merely "above some composer", it is DOCKED TO ITS OWN: the tick places it at
+# $startX = $pane.DockX + gap with its travel clamped to $pane.Cx .. $pane.Cx + $pane.Cw, and at
+# $my = $pane.DockY - height/2. So by construction the strip's centre X lies INSIDE its own
+# composer's horizontal span, and its top sits within half a strip of that composer's bottom edge.
+#
+# HORIZONTAL CONTAINMENT IS THE LOAD-BEARING TEST, and it is the one that had to be added: in a
+# side-by-side layout both composers sit at the SAME height, so no vertical bound can separate
+# them - but their X spans are disjoint, so A's composer simply is not a candidate for B's strip.
+# The vertical bound then covers the stacked layout, where the X spans do overlap but a foreign
+# composer is a whole pane away rather than docked.
+#
+# Both are derived from the dock geometry rather than tuned, and they can only ever REMOVE
+# candidates from a fallback that is already the unusual path (the bound element normally works).
+# The caller fails closed and tells the user when nothing qualifies, which is the correct outcome:
+# refusing to send beats sending to someone else's conversation.
+#
+# Kept as a SEPARATE PURE FUNCTION for the same reason Test-CanGuessFrom is: inline inside
+# Focus-ChatInput it could only ever be checked by reading the source or by driving live UIA,
+# and a source-shape test cannot tell a correct predicate from a broken one. As a function its
+# VALUE is asserted directly for the side-by-side, stacked and legitimate-dock layouts.
+# Fails CLOSED: a composer that is not positively identified as docked to this strip is rejected.
+function Test-ComposerDockedTo($c, $stripCenterX, $stripTopY, $stripHeight = 0) {
+    if (-not $c) { return $false }
+    $bottom = $c.Y + $c.H
+    if ($bottom -gt ($stripTopY + (SW 10))) { return $false }   # composer must be above the strip
+    # A composer this strip could be docked to is no further above it than the strip's own
+    # height plus a margin. This is what separates the STACKED layout, where the X spans overlap
+    # but a foreign composer is a whole pane away.
+    if (($stripTopY - $bottom) -gt ([double]$stripHeight + (SW 40))) { return $false }
+    # IDENTITY, and the load-bearing half. The tick clamps a strip's travel to its own composer's
+    # X span, so the strip's centre falls inside that span by construction. In a SIDE-BY-SIDE
+    # layout both composers sit at the same height - no vertical test can separate them - but
+    # their X spans are disjoint, so the neighbour is rejected outright instead of winning on
+    # distance because it happened to be the only candidate left.
+    if ($stripCenterX -lt ($c.X - (SW 8))) { return $false }
+    if ($stripCenterX -gt ($c.X + $c.W + (SW 8))) { return $false }
+    return $true
+}
+
+function Focus-ChatInput($stripCenterX, $stripTopY, $stripHeight = 0) {
     try {
         if ($script:target -eq [IntPtr]::Zero) { return }
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($script:target)
@@ -3842,10 +4005,9 @@ function Focus-ChatInput($stripCenterX, $stripTopY) {
         # just above the strip (and nearest in X) is this pane's input. Focus it directly.
         $best = $null; $bestScore = [double]::MaxValue
         foreach ($c in (Get-Composers $root)) {
-            $bottom = $c.Y + $c.H
-            if ($bottom -gt ($stripTopY + (SW 10))) { continue }   # composer must be above the strip
+            if (-not (Test-ComposerDockedTo $c $stripCenterX $stripTopY $stripHeight)) { continue }
             $dx = [Math]::Abs(($c.X + $c.W / 2) - $stripCenterX)
-            $dy = $stripTopY - $bottom
+            $dy = $stripTopY - ($c.Y + $c.H)
             $score = $dx + $dy
             if ($score -lt $bestScore) { $best = $c; $bestScore = $score }
         }
@@ -3988,7 +4150,18 @@ function Invoke-PillClick($btn) {
                 $canGuess = Test-CanGuessFrom $sf
                 if ($canGuess) {
                     Write-CkLog 'Bound composer unavailable; falling back to geometric focus'
-                    $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top
+                    $composerEl = Focus-ChatInput ($sf.Left + $sf.Width / 2) $sf.Top $sf.Height
+                    # The guess is bounded now (see Focus-ChatInput): a composer that is not
+                    # docked to THIS strip is rejected rather than accepted on distance, so the
+                    # guess can legitimately come back empty - e.g. this mirror's chat has closed
+                    # and the surviving chat beside it belongs to someone else's conversation.
+                    # Say so, rather than falling through to Wait-ComposerFocus($null) and
+                    # aborting with nothing on screen to explain it.
+                    if (-not $composerEl) {
+                        Write-CkLog 'Send abandoned: no composer is docked to this strip'
+                        Show-SendWarning (L 'sendNoPane')
+                        return
+                    }
                 } else {
                     Write-CkLog 'Send abandoned: no composer bound to this strip and geometry cannot identify one safely'
                     Show-SendWarning (L 'sendNoPane')
@@ -4119,7 +4292,30 @@ function Invoke-PillClick($btn) {
                 if ($item.submit -and -not $item.chat -and -not $holdShift) {
                     Start-Sleep -Milliseconds 90
                     if (-not (Test-TargetForeground)) { return }
-                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                    # RE-VERIFY THE FIELD, NOT JUST THE APP. Test-TargetForeground asks whether
+                    # Claude is the foreground WINDOW; it says nothing about which control has
+                    # keyboard focus inside it. Between the paste and here we have waited for the
+                    # paste to be observed and then slept 90ms, and in that window focus can have
+                    # moved to another pane's composer - the user clicking, or Claude itself
+                    # moving focus on a re-render. Enter goes wherever focus IS, so pressing it
+                    # blind can submit a DIFFERENT chat's box: their half-written draft, sent to
+                    # a conversation we never verified anything about.
+                    #
+                    # Short budget on purpose: focus is already supposed to be here, so this
+                    # confirms rather than waits for it, and a stalled UIA must not hold the
+                    # send open. Failing closed leaves the verified payload sitting in the right
+                    # composer, unsent - the user presses Enter themselves.
+                    # POSITIVE DOMINATOR, not a negative guard, for the same reason the
+                    # 'Confirmed' check is one: a `if (-not ...) { return }` above the keystroke
+                    # can be hopped by moving the keystroke above it, and that exact mutation
+                    # once passed the whole suite while a Mismatch pressed Enter. Enter lives
+                    # INSIDE the focus check and nowhere else.
+                    if (Wait-ComposerFocus $composerEl 250) {
+                        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                    } else {
+                        Write-CkLog 'Focus left the composer before Enter; pasted text left unsent'
+                        Show-SendWarning (L 'sendFocusLost')
+                    }
                 }
                 return
             }
