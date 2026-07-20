@@ -7,7 +7,14 @@ vertical bar down either side, grouped and colour-coded if you want them that wa
 
 *(Dansk vejledning: se [README.da.md](README.da.md).)*
 
-![The Claude Buttons strip docked in the Claude desktop app's bottom bar: a ⋮ menu followed by pinned command pills and icon buttons, sitting flush next to the app's own Auto / mic controls](docs/screenshot.png)
+![The strip docked in the Claude desktop app's control row: a ⋮ menu followed by five coloured icon buttons, sitting flush beside the app's own Manual / + / mic controls at the same size](docs/strip-row.png)
+
+The same buttons can live in a vertical bar down either margin instead — useful once the row gets
+long, and it leaves the control row to the app:
+
+![The same buttons as a vertical strip in the left margin, stacked from the ⋮ menu down, level with the app's own composer and control row](docs/strip-left.png)
+
+![The same buttons as a vertical strip in the right margin, hugging the edge of the chat](docs/strip-right.png)
 
 ## Why
 

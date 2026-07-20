@@ -7,6 +7,15 @@ en lodret bjælke i hver sin side, grupperet og farvekodet hvis du vil have det 
 
 *(English README — den kanoniske: [README.md](README.md).)*
 
+![Strimlen i Claude-appens knaprække: en ⋮-menu efterfulgt af fem farvede ikonknapper, der sidder i flugt med appens egne Manual- / plus- / mikrofon-knapper i samme størrelse](docs/strip-row.png)
+
+De samme knapper kan i stedet ligge i en lodret bjælke i hver sin margen — praktisk når rækken
+bliver lang, og det overlader knaprækken til appen selv:
+
+![De samme knapper som en lodret strimmel i venstre margen, stablet fra ⋮-menuen og nedad, på højde med appens beskedfelt og knaprække](docs/strip-left.png)
+
+![De samme knapper som en lodret strimmel i højre margen, klistret op ad chattens kant](docs/strip-right.png)
+
 ## Funktioner
 
 - **Pin en hvilken som helst kommando** som pille-knap — enten fra strimlens **⋮-menu** (uden om Claude) eller via `/pin`-skillen.
