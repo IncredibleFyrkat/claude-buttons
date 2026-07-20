@@ -173,6 +173,9 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `groups` | `{}` | Group definitions, keyed by group name: `{ "ops": { "icon": "settings", "label": "Ops" } }`. A group appears once a button carries its name in `group`, and its definition is dropped automatically when the last member leaves. **Keys are matched case-insensitively** — a group name is a JSON key, and PowerShell's JSON reader refuses a file containing keys that differ only in case, so `Ops` and `ops` are folded into one rather than allowed to become a file the panel cannot read. |
 | `colors` | `{}` | Per-kind button colour, keyed by kind: `prompt`, `command`, `group`, `toggle`. Set from the ⋮ menu. Kind is derived from the button, not stored, so a newly pinned slash command picks up the command colour. |
 | `kebabBar` | `"row"` | Which strip the ⋮ menu handle sits on: `row`, `left` or `right`. |
+| `btnSize` | `21` | Button size in logical px, 10–40, for the whole panel. Set from ⋮ → **Button size**; scales with the monitor like everything else. |
+| `sideNudge` | `0` | Moves a **right-hand** side bar further out from the chat, in logical px. Needed because the chat's visual edge is not exposed in the accessibility tree — every anchor that can be measured (the composer, the control row, the pane) sits somewhere *inside* the rounded container, so the last few pixels cannot be derived. The left bar needs no correction and is unaffected. |
+| `sideNudgeY` | `0` | Same, vertically: negative lifts a right-hand bar, positive lowers it. |
 
 Per-button fields:
 

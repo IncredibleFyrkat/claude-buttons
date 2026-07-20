@@ -61,7 +61,22 @@ annullerer. Der tilføjes en `/shutdown-on-done on|off|status`-kommando, en Stop
 - **Venstreklik** på en knap for at skrive dens kommando; globale knapper trykker også Enter, chat-knapper lader dig se teksten først.
 - **Shift-klik** indsætter teksten **uden** at sende, så du kan redigere eller udvide prompten før du selv trykker Enter. (Kun relevant på knapper der ellers sender. Toggles skifter ikke tilstand ved shift-klik: kommandoen er parkeret, ikke kørt.)
 - **Højreklik på en knap** → omdøb, redigér tekst, vælg ikon, on/off-tilstand, flyt (*Move left / Move right*) eller fjern.
-- **⋮-menuen** rummer også **Sprog** (English / Dansk), en **Hover tooltips**-kontakt og **Close panel**. Strimlen docker sig selv til composeren — ingen manuel placering.
+- **⋮-menuen** rummer også **Farver** (per type), **Knapstørrelse** (10–40 px), **Flyt til bjælke** (knaprækken, venstre eller højre side — hele strimlen flytter med), **Sprog** (English / Dansk), en **Hover tooltips**-kontakt og **Close panel**. Strimlen docker sig selv til composeren — ingen manuel placering.
+
+### Indstillinger i `buttons.json`
+
+Alle kan sættes i filen; de tre første også fra ⋮-menuen.
+
+| Felt | Standard | Betydning |
+|---|---|---|
+| `btnSize` | `21` | Knapstørrelse i logiske px, 10–40, for hele panelet. Skalerer med skærmen. |
+| `colors` | `{}` | Farve per type: `prompt`, `command`, `group`, `toggle`. |
+| `kebabBar` | `"row"` | Hvilken bjælke ⋮-håndtaget sidder på: `row`, `left` eller `right`. |
+| `bar` (per knap) | `row` | Hvilken bjælke knappen ligger på: `row`, `left` eller `right`. |
+| `group` (per knap) | — | Gruppenavn. Grupperede knapper folder sammen til én knap med en udfoldning. Matches **uden** hensyn til store/små bogstaver, fordi navnet er en JSON-nøgle og PowerShells JSON-læser afviser en fil med nøgler der kun adskiller sig i versaltype. |
+| `groups` | `{}` | Gruppedefinitioner: `{ "ops": { "icon": "settings", "label": "Drift" } }`. Ryddes automatisk når sidste medlem forlader gruppen. |
+| `sideNudge` | `0` | Skubber en **højre** sidebjælke længere væk fra chatten, i logiske px. Nødvendig fordi chattens synlige kant ikke findes i accessibility-træet — alt der *kan* måles (beskedfeltet, knaprækken, ruden) ligger inde i den afrundede boks, så de sidste par pixels kan ikke udledes. Venstre side skal ikke korrigeres og påvirkes ikke. |
+| `sideNudgeY` | `0` | Samme, lodret: negativ løfter en højre bjælke, positiv sænker den. |
 
 ## Fejlsøgning
 
