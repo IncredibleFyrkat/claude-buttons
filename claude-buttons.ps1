@@ -3250,22 +3250,46 @@ function Focus-ChatInput($stripCenterX, $stripTopY) {
 # normally lands in ~20-40ms. Returns $false on timeout so the caller aborts instead of typing
 # into the wrong chat. Focus often lands on an inner editable node, so a descendant whose rect
 # sits inside the composer counts as focused.
-function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 800) {
+# RE-ASKS for focus while it waits. The caller calls SetFocus once before this, and on a first
+# click that single request has to drag the app forward from another window - which Windows may
+# delay or drop while the window is still activating. Watching for a focus change that was
+# never going to happen is what produced "Send aborted: focus never landed", almost always on
+# the FIRST click of a session while every click after it worked.
+#
+# 800ms was also too short for a cold activation. The healthy path is unaffected either way:
+# this returns the moment focus lands, so a longer ceiling costs nothing when it lands fast.
+function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 2500, [int]$retryMs = 300) {
     if (-not $composerEl) { return $false }
     try { $cr = $composerEl.Current.BoundingRectangle } catch { return $false }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    $lastAsk = Get-Date
+    $asks = 0
     while ((Get-Date) -lt $deadline) {
         try {
             $f = [System.Windows.Automation.AutomationElement]::FocusedElement
             if ($f) {
-                if ([System.Windows.Automation.Automation]::Compare($f, $composerEl)) { return $true }
-                $fr = $f.Current.BoundingRectangle
-                if ($fr.Width -gt 0 -and $fr.Height -gt 0 -and
-                    $fr.X -ge ($cr.X - 4) -and $fr.Y -ge ($cr.Y - 4) -and
-                    ($fr.X + $fr.Width) -le ($cr.X + $cr.Width + 4) -and
-                    ($fr.Y + $fr.Height) -le ($cr.Y + $cr.Height + 4)) { return $true }
+                $landed = $false
+                if ([System.Windows.Automation.Automation]::Compare($f, $composerEl)) { $landed = $true }
+                else {
+                    $fr = $f.Current.BoundingRectangle
+                    if ($fr.Width -gt 0 -and $fr.Height -gt 0 -and
+                        $fr.X -ge ($cr.X - 4) -and $fr.Y -ge ($cr.Y - 4) -and
+                        ($fr.X + $fr.Width) -le ($cr.X + $cr.Width + 4) -and
+                        ($fr.Y + $fr.Height) -le ($cr.Y + $cr.Height + 4)) { $landed = $true }
+                }
+                if ($landed) {
+                    if ($asks -gt 0) { Write-CkLog "Focus landed only after re-asking ($asks retries)" }
+                    return $true
+                }
             }
         } catch {}
+        # Ask again periodically rather than once up front. Bounded by the same deadline, so a
+        # user who clicks away is not fought over indefinitely.
+        if (((Get-Date) - $lastAsk).TotalMilliseconds -ge $retryMs) {
+            try { $composerEl.SetFocus() } catch {}
+            $lastAsk = Get-Date
+            $asks++
+        }
         Start-Sleep -Milliseconds 12
     }
     return $false

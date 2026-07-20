@@ -844,6 +844,25 @@ Check 'sub-pixel row jitter does not split the cluster' ((@(Pick-Band $jitter 6)
 $oneRow = @( (BY 0 27 100), (BY 33 27 100), (BY 66 27 100) )
 Check 'a single-row cluster is unchanged by banding' ((@(Pick-Band $oneRow 6)).Count -eq 3)
 
+# --- Focus must be re-asked for, not asked once and waited on ---
+# The caller calls SetFocus once before waiting. On a first click that single request has to
+# drag the app forward from another window, which Windows may delay or drop - so the wait was
+# watching for a focus change that was never going to happen, and the send aborted. Almost
+# always the FIRST click of a session, with every click after it fine.
+$focusNode = $astP.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Wait-ComposerFocus' }, $true)
+Check 'Wait-ComposerFocus was found' ($null -ne $focusNode)
+$focusSrc = if ($focusNode) { $focusNode.Extent.Text } else { '' }
+Check 'the focus wait re-asks for focus inside its loop' ($focusSrc -match 'SetFocus')
+$fTo = [regex]::Match($focusSrc, '\[int\]\$timeoutMs = (\d+)')
+Check 'the focus wait allows for a cold activation' `
+    ($fTo.Success -and ([int]$fTo.Groups[1].Value -ge 1500))
+# The retry must be bounded by the same deadline: a loop that keeps grabbing focus forever
+# would fight a user who clicked away mid-send.
+Check 'the re-ask is bounded by the deadline, not unbounded' `
+    ($focusSrc -match 'while \(\(Get-Date\) -lt \$deadline\)')
+# Returning early on success is what keeps the longer ceiling free on the healthy path.
+Check 'it returns as soon as focus lands' ($focusSrc -match 'return \$true')
+
 # --- A palette-eaten Enter must be retried, but never blindly ---
 # A "/" payload opens the app's command palette and the first Enter selects the highlighted
 # entry instead of submitting. The retry is only safe because it is CONDITIONAL: an emptied
