@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.10.4 — 2026-07-20
+
+Side-bar polish, all of it found by using the thing rather than by testing it.
+
+- **Button size is now a menu.** Kebab → **Button size**, from 14 to 32 px, applying to the whole
+  panel. It replaced four rounds of picking a number in code, each needing a rebuild, a reinstall
+  and a look before anyone could say whether it was right. How big a button should be is not a
+  question code can answer.
+- **The icon now scales with the button.** The glyph font was a fixed 9pt and the button was
+  described as "padding around the icon", so making a button smaller left the icon exactly as
+  large. Three size changes moved only the frame; the thing being looked at never moved.
+- **Buttons keep their size when the window moves between monitors.** Control sizing used the
+  scale captured at startup while positioning followed the current monitor, so on a second screen
+  of a different DPI the panel was the only thing on screen that changed size relative to the app.
+  It now rebuilds at the new scale — and reads the size from the setting rather than a constant it
+  had been left with.
+- **Side bars no longer shrink to fit the margin.** A narrower pane drew smaller buttons; they now
+  keep the panel's size, and the bar hides where there is no room for it. A missing bar is easier
+  to understand than one whose buttons changed size since you last looked.
+- **"Move to bar" takes the buttons with it.** It used to move only the kebab, leaving the buttons
+  on the old bar — so the strip split in two and the only way back was to move each button by hand.
+  Both halves are now written in one config change, so they cannot land separately.
+- **Right-hand bars sit next to the chat.** They were anchored to the pane rectangle, which on a
+  wide window is the window edge — out past anything else in that margin.
+- **New settings for the last few pixels:** `sideNudge` and `sideNudgeY` move a right-hand bar
+  outward and vertically. They exist because the chat's visual edge is not in the accessibility
+  tree at all: every anchor that *can* be measured — the composer, the control row, the pane — sits
+  somewhere inside the rounded container, so the final offset is a judgement the panel cannot make
+  for itself. Right side only; the left needs no correction.
+
 ## 1.10.3 — 2026-07-20
 
 Three defects an external review found in the release candidate, all fail-closed, all now

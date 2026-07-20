@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.10.3'
+$CB_VERSION = '1.10.4'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1000,6 +1000,39 @@ if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config
 # rename or localization on Claude's side can be self-healed from buttons.json.
 $script:uiaComposerName = 'Prompt'
 if ($script:config.uiaComposerName) { $script:uiaComposerName = [string]$script:config.uiaComposerName }
+# Side-strip button size, in logical px, scaled for the monitor like everything else.
+# The control row is 27 to match the app's own bottom-bar buttons. The side strips sat at the
+# same 27, which reads as too big beside the app's smaller in-chat icons (measured: mostly 20x20,
+# some 21x21 and 25x24). This is a matter of taste rather than correctness, so it is a knob.
+# PIXELS, applied as-is on every monitor - see the sizing pass for why this one is not scaled.
+# 21 is what the panel's owner approved on screen. They named "14", but that was read through
+# S() on a 150% monitor and drew 21 physical pixels; taking the 14 literally would have shrunk
+# the bar on the very screen they had just accepted. The number that matters is the one that
+# was looked at, not the one that was typed.
+# How far OUTWARD a side bar sits from the chat, in logical px. Positive moves it away from the
+# chat on both sides. Exists because the chat's visual container edge is not in the accessibility
+# tree - see the placement code - so the anchor is always somewhere inside the rounded box and
+# the last few pixels are a judgement the panel cannot make for itself.
+$script:sideNudge = 0
+if ($null -ne $script:config.sideNudge) {
+    $v = [int]$script:config.sideNudge
+    if ($v -ge -40 -and $v -le 200) { $script:sideNudge = $v }
+}
+# Vertical companion to sideNudge. The side bars align their lowest button to the app's control
+# row, measured off the control itself - but the app's own padding is not in the tree either, so
+# the last few pixels are the same unmeasurable judgement as the horizontal case. Negative lifts.
+$script:sideNudgeY = 0
+if ($null -ne $script:config.sideNudgeY) {
+    $v = [int]$script:config.sideNudgeY
+    if ($v -ge -100 -and $v -le 100) { $script:sideNudgeY = $v }
+}
+$script:btnLogical = 21
+if ($script:config.btnSize) {
+    $v = [int]$script:config.btnSize
+    # Clamp: below 10 the glyph is unreadable, above the row size it stops being a side strip
+    # and starts overlapping the chat.
+    if ($v -ge 10 -and $v -le 40) { $script:btnLogical = $v }
+}
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
@@ -1053,7 +1086,7 @@ $script:strings = @{
         editText = 'Edit text/prompt...'; editTextTitle = 'Edit button text'
         groupTitle = 'Move to group'; groupAsk = 'Group name (empty = no group):'
         groupNew = 'New group...'; groupNone = 'No group'
-        moveBar = 'Move to bar'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
+        moveBar = 'Move to bar'; sideSize = 'Button size'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
         moveUp = 'Move up'; moveDown = 'Move down'
         dissolve = 'Dissolve group'
         colours = 'Colours'; colDefault = 'Default'
@@ -1092,7 +1125,7 @@ $script:strings = @{
         editText = 'Redigér tekst/prompt…'; editTextTitle = 'Redigér knappens tekst'
         groupTitle = 'Flyt til gruppe'; groupAsk = 'Gruppenavn (tomt = ingen gruppe):'
         groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
-        moveBar = 'Flyt til bjælke'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
+        moveBar = 'Flyt til bjælke'; sideSize = 'Knapstørrelse'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
         moveUp = 'Flyt op'; moveDown = 'Flyt ned'
         dissolve = 'Opløs gruppe'
         colours = 'Farver'; colDefault = 'Standard'
@@ -1498,6 +1531,30 @@ $fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
 $script:iconFontName = if ($fams -contains 'Segoe Fluent Icons') { 'Segoe Fluent Icons' }
                        elseif ($fams -contains 'Segoe MDL2 Assets') { 'Segoe MDL2 Assets' } else { $null }
 $script:iconFont = if ($script:iconFontName) { New-Object System.Drawing.Font($script:iconFontName, 9) } else { $null }
+# The side strips get their OWN glyph font, scaled to their own button size.
+#
+# The glyph font was a fixed 9pt everywhere, and $pillH was described as "padding around the
+# icon" - so shrinking a side button shrank its BOX and left the icon exactly as large. That is
+# why the side strip kept reading as oversized next to the app's own composer icons even after
+# its buttons measured the same as theirs (22px against the app's 20-24): the boxes matched and
+# the glyphs did not. 9pt is calibrated for the 27px control row, so scale it by the same ratio
+# the button was scaled by, and the icon keeps its proportion instead of its absolute size.
+$script:iconFontPanel = $script:iconFont
+function Update-PanelIconFont {
+    if (-not $script:iconFontName) { return }
+    # PIXELS, not points. A point size is resolved against the target's DPI, so the same font
+    # object draws a bigger glyph on a 144-DPI monitor than on a 96-DPI one - the very thing the
+    # side strip is not supposed to do. The button beside it is a fixed pixel size, so the glyph
+    # has to be one too, or the two drift apart as the window moves between screens.
+    # 0.45 is the ratio the control row uses (9pt renders ~12px inside its 27px button) and it is
+    # the proportion the panel's owner approved on screen.
+    $px = [Math]::Max(6.0, $script:btnLogical * 0.45)
+    if ($script:iconFontPanel -and $script:iconFontPanel -ne $script:iconFont) { $script:iconFontPanel.Dispose() }
+    $script:iconFontPanel = New-Object System.Drawing.Font($script:iconFontName, $px, [System.Drawing.GraphicsUnit]::Pixel)
+}
+# Called once here rather than at the knob, because the knob is read long before the font
+# families are enumerated - reading it there would size a font that does not exist yet.
+Update-PanelIconFont
 # Lucide-style names -> glyph codepoints (shared between Fluent Icons and MDL2 Assets)
 $script:iconMap = @{
     'mic'='E720'; 'power'='E7E8'; 'play'='E768'; 'pause'='E769'; 'stop'='E71A'
@@ -1821,7 +1878,7 @@ function Set-PillFace($btn) {
     $b = $btn.Tag
     $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
     if ($glyph) {
-        $btn.Font = $script:iconFont
+        $btn.Font = $script:iconFontPanel
         $btn.Text = $glyph
         $btn.Width = $pillH
     } else {
@@ -2273,7 +2330,13 @@ function Get-ButtonFore($b, [bool]$isOn) {
     if ($b.icon) { return $colIcon }
     return $colText
 }
-$pillH = S(27)   # square icon buttons; the glyph font stays fixed, so this is padding around the icon
+# Square icon buttons, sized from the SAME setting the side strips use, so the menu's choice
+# applies to the whole panel rather than to one bar. Not run through S(): the number is applied
+# as pixels on every monitor, because a bar that changes size when the window moves between
+# screens is the thing this setting exists to stop. The row therefore no longer tracks the app's
+# own DPI scaling - a deliberate trade, and the reason the setting is a menu rather than a
+# constant: on a scaled monitor, pick a larger number.
+$pillH = S $script:btnLogical
 
 # Strip background color (alias kept so the transparent-strip work has one knob).
 $script:barColor = $colBar
@@ -2821,12 +2884,59 @@ $miColors = New-Object System.Windows.Forms.ToolStripMenuItem 'Colours'
 [void]$gripMenu.Items.Add($miColors)
 $miKebabBar = New-Object System.Windows.Forms.ToolStripMenuItem 'Move to bar'
 [void]$gripMenu.Items.Add($miKebabBar)
+# Side-bar button size, picked from the menu rather than guessed in code. How large this should
+# be turned out to be pure taste, and four rounds of choosing a number here - 40, 27, 22, 21 -
+# each needed a rebuild, a reinstall and a look before anyone could say whether it was right.
+# A menu makes that one click, and the answer lands in buttons.json where it survives updates.
+$miSideSize = New-Object System.Windows.Forms.ToolStripMenuItem 'Side bar size'
+[void]$gripMenu.Items.Add($miSideSize)
+$script:ckSideSizes = @(14, 16, 18, 21, 24, 27, 32)
 
+function Set-SideBtnSize([int]$px) {
+    $ok = Update-Config {
+        param($cfg)
+        $cfg | Add-Member -NotePropertyName btnSize -NotePropertyValue $px -Force
+        $cfg
+    }
+    if ($ok) {
+        $script:btnLogical = $px
+        $script:pillH = S $px     # the row is sized from this too now, via S() like everything
+                                  # else that has to line up with the app's own controls
+        Update-PanelIconFont      # the glyph is sized from this too, or the box moves alone
+        Hide-GroupFlyout
+        Rebuild-Buttons
+    }
+}
+
+function Fill-SideSizeMenu {
+    $miSideSize.DropDownItems.Clear()
+    foreach ($px in $script:ckSideSizes) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem ("$px px")
+        $mi.Tag = $px
+        $mi.Checked = ($px -eq $script:btnLogical)
+        $mi.add_Click({ Set-SideBtnSize ([int]$this.Tag) })
+        [void]$miSideSize.DropDownItems.Add($mi)
+    }
+}
+
+# Moves the kebab AND every button with it, because "move the bar" is what the menu says and
+# what people mean. It used to move the kebab alone, leaving the buttons behind on the old bar -
+# so the strip appeared to split in two and the only way to reunite it was to move each button
+# by hand through its own context menu.
 function Set-KebabBar([string]$bar) {
     $ok = Update-Config {
         param($cfg)
         if ($bar -eq 'row') { $cfg.PSObject.Properties.Remove('kebabBar') }
         else { $cfg | Add-Member -NotePropertyName kebabBar -NotePropertyValue $bar -Force }
+        # Take the buttons along. Written inside the SAME transform as the kebab move, so the two
+        # cannot land separately: one lock, one atomic write, and a failure leaves both where
+        # they were rather than splitting the strip across two bars.
+        $cfg.buttons = @(@($cfg.buttons) | ForEach-Object {
+            if ($null -eq $_) { return }
+            if ($bar -eq 'row') { $_.PSObject.Properties.Remove('bar') }
+            else { $_ | Add-Member -NotePropertyName bar -NotePropertyValue $bar -Force }
+            $_
+        })
         $cfg
     }
     if ($ok) { $script:kebabBar = $bar; Hide-GroupFlyout; Rebuild-Buttons }
@@ -2946,6 +3056,8 @@ $gripMenu.add_Opening({
     $miColors.Text = L 'colours'
     $miKebabBar.Text = L 'moveBar'
     Fill-KebabBarMenu
+    $miSideSize.Text = L 'sideSize'
+    Fill-SideSizeMenu
     foreach ($k in $script:ckKinds) {
         $script:miKind[$k].Text = L "kind_$k"
         Fill-ColorMenu $script:miKind[$k] $k
@@ -4346,7 +4458,8 @@ $script:mirrors = @()
 # from the control row, so the first one always sits nearest the row the eye is already on.
 # Created lazily: a pane with nothing assigned to a side costs nothing.
 $script:sideStrips = @()
-$script:sideMinBtn = 18   # narrower than this and the margin is not worth drawing into
+# (sideMinBtn lived here: a floor of 18px that side buttons could shrink to. Side strips now use
+# the control row's size or hide, so there is nothing left to shrink and no floor to set.)
 
 function New-SideStrip([string]$side) {
     $sf = New-Object LayeredForm
@@ -4401,7 +4514,7 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
         $btn.Width = $btnSize; $btn.Height = $btnSize
         $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
         if ($glyph) {
-            $btn.Font = $script:iconFont; $btn.Text = $glyph; $btn.Glyph = $true; $btn.Bold = $true
+            $btn.Font = $script:iconFontPanel; $btn.Text = $glyph; $btn.Glyph = $true; $btn.Bold = $true
         } else {
             $btn.Font = $script:btnFont
             $lbl = [string]$(if ($b.short) { $b.short } else { $b.label })
@@ -4592,17 +4705,33 @@ function Rebuild-Buttons {
         $script:mirrors[$i].Form.ResumeLayout()
         Update-LayeredStrip $script:mirrors[$i].Form $script:mirrors[$i].Panel
     }
-    # Side strips: sized to the margin they have to live in, so a narrow pane gets smaller
-    # buttons rather than a bar that overlaps the chat.
+    # Side strips use the SAME button size as the control row, never a smaller one.
+    #
+    # This used to size each strip to the margin it had to live in - `min($pillH, $room - 6)` -
+    # so a narrower pane drew smaller buttons. That is defensible in isolation, but it made the
+    # panel the only thing on screen that changes size when the window moves to another monitor:
+    # the app's own buttons keep their size, and the strip did not. $pillH is 27 logical px
+    # precisely because that matches the app's icon rhythm, so scaling away from it is scaling
+    # away from the thing the panel is supposed to look like it belongs to.
+    #
+    # The trade this makes deliberately: where the margin is too narrow for a full-size button,
+    # the strip now HIDES rather than shrinking. A missing bar is easier to understand than a bar
+    # whose buttons are a different size than they were a moment ago on the other screen.
     for ($i = 0; $i -lt $script:sideStrips.Count; $i++) {
         $st = $script:sideStrips[$i]
         $pIdx = [int][Math]::Floor($i / 2)   # [int] ROUNDS in PowerShell: [int](3/2) is 2
         if ($pIdx -ge $script:panes.Count) { if ($st.Form.Visible) { $st.Form.Hide() }; continue }
         $pn = $script:panes[$pIdx]
         $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
-        $size = [Math]::Min($pillH, $room - (S 6))
+        # NOT scaled by DPI, deliberately. S() would multiply by the monitor's scale, which keeps
+        # a control the same PHYSICAL size across monitors - correct for the control row, which
+        # has to line up with the app's own bottom bar. A side strip lines up with nothing: it
+        # floats in the pane margin, and the panel's owner wants it to look identical on every
+        # screen rather than to track each monitor's scale. Scaling it made it 14px on one
+        # monitor and 21px on the other, which reads as the bar shrinking when the window moves.
+        $size = $script:btnLogical
         $st.BtnSize = $size
-        if ($size -lt (S $script:sideMinBtn)) { $st.Form.Hide(); continue }
+        if (($room - (S 6)) -lt $size) { $st.Form.Hide(); continue }
         # The stack is bottom-anchored but the FORM grows from its Top, so adding a button made
         # the whole bar drop until the next tick recomputed the position and snapped it back up.
         # Pin the bottom edge here and the growth goes upward straight away; the tick's exact
@@ -4718,6 +4847,34 @@ $timer.add_Tick({
         # Keep per-window scale current (the window may move between monitors)
         $ws = [CkWin]::WindowScale($script:target)
         if ($ws -gt 0) { $script:winScale = $ws }
+
+        # ...and RESIZE the buttons to match, not just reposition them.
+        #
+        # S() sized every control from the scale captured at startup, while SW() positioned them
+        # from the window's current monitor. On a single-DPI desktop that is invisible. Across
+        # monitors of different DPI it is not: the Claude app is per-monitor DPI aware and redraws
+        # its own icons at the new scale, so a panel frozen at the old one is the only thing on
+        # screen that changes size relative to everything around it. Measured here: 3840x2160 at
+        # 144 DPI beside 2560x1080 at 96, so a panel started on the first drew 40px buttons next
+        # to the app's 27px ones on the second.
+        #
+        # Rebuilding is the whole fix: control sizes are computed through S() when the buttons are
+        # built, so re-running that with the new scale is what makes them match again. Guarded by
+        # a comparison so an unchanged scale costs nothing - Rebuild-Buttons disposes and recreates
+        # every control, which would flicker on every tick.
+        if ($ws -gt 0 -and [Math]::Abs($ws - $script:scale) -gt 0.01) {
+            Write-CkLog ("Monitor scale changed {0} -> {1}; rebuilding buttons to match the app" -f $script:scale, $ws)
+            $script:scale = $ws
+            # $script: prefix is required. Inside the tick scriptblock a bare `$pillH = ...`
+            # creates a LOCAL that vanishes when the tick returns, so every control would be
+            # rebuilt from the OLD size and the fix would silently do nothing.
+            # From the SETTING, not a hardcoded 27. This was written before the size became
+            # configurable and kept resizing the row to the old constant on every monitor
+            # change - so choosing 32 in the menu held until the window crossed to another
+            # screen, at which point the row silently reverted.
+            $script:pillH = S $script:btnLogical
+            Rebuild-Buttons
+        }
 
         # stateGlob poll (~1 s): keep glob-backed toggle buttons truthful even when
         # an agent, hook or another machine changes the state behind our back
@@ -4909,7 +5066,12 @@ $timer.add_Tick({
             $pn = $script:panes[$pIdx]
             if (-not $pn.Cx) { if ($sForm.Visible) { $sForm.Hide() }; continue }
             $room = if ($st.Side -eq 'left') { [int]$pn.LeftRoom } else { [int]$pn.RightRoom }
-            if ($room -lt ((S $script:sideMinBtn) + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            # Same threshold as the sizing pass above: full-size button or no bar at all. These
+            # two must agree - if placement kept a bar the sizing pass had hidden (or the other
+            # way round), the strip would flicker on every tick.
+            # Unscaled, to agree with the sizing pass - if these two disagreed the strip would
+            # flicker on every tick, appearing and vanishing as each pass reached its own verdict.
+            if ($room -lt ($script:btnLogical + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
             # Anchor to the CHAT's own left/right edges, exactly as the row bar anchors to its
             # bottom edge. Hugging a derived "pane edge" instead gave every pane a different
             # answer: a pane edge is not measured, it is the midpoint between neighbouring
@@ -4925,12 +5087,38 @@ $timer.add_Tick({
             # the composer's right edge sits left of the row's own outermost controls. The pane
             # rect is the real outer bound. Used only when it came from a measured UIA pane
             # group; otherwise fall back to clearing the row, which is never worse than today.
+            # Anchor BOTH sides to the chat itself, which is measured, and never to the pane rect,
+            # which is not. Two wrong answers were tried here: PaneR put the bar at the window's
+            # far right edge, out past a second empty pane; rowR + gap put it immediately right of
+            # the model picker, inside the chat. The right-hand equivalent of the left's rowL is
+            # the composer's own right edge - the composer is a measured UIA element, and the bar
+            # belongs in the margin just outside it.
+            # Still clamped by the pane rect where that is real, so a bar can never be drawn off
+            # the far side of the window if the composer measurement is wrong.
+            # OUTWARD NUDGE, because the chat's visual edge cannot be measured. Every anchor here
+            # is an element INSIDE the chat - the composer, the control row - but the chat is drawn
+            # as a rounded container with padding beyond them, and that container is not in the
+            # accessibility tree. So each anchor lands somewhere inside the box: the pane rect is
+            # the window edge (far too wide), the row's outermost control is under the model
+            # picker, the composer's right edge is under the chat's own padding. sideNudge moves
+            # the bar outward from whichever anchor is closest, and the user dials it once.
+            # Read once at startup, not per tick. A live read was added to make a look-and-adjust
+            # loop possible, and it cost visible smoothness: this runs for every strip on every
+            # tick, inside the same pass that repositions the bars, so a window drag turned into
+            # a config property lookup per frame and the bars visibly lagged the window.
+            # The setting is still a setting - it just takes effect on restart.
+            # RIGHT SIDE ONLY. Left already lands correctly: there is real margin to the left of
+            # the control row, so rowL is a good anchor and needs no correction. Applying the
+            # nudge to both sides pushed the left bar off a position that was already right -
+            # a fix for one side breaking the other.
+            $nudge = if ($st.Side -eq 'right') { [int](S $script:sideNudge) } else { 0 }
+            $nudgeY = if ($st.Side -eq 'right') { [int](S $script:sideNudgeY) } else { 0 }
+            $chatR = [int]($pn.Cx + $pn.Cw)
             $sx = if ($st.Side -eq 'left') {
                       $rowL - $edgeGap - $sForm.Width + (S 2)
-                  } elseif ($pn.BoundsReal) {
-                      [Math]::Max([int]($pn.PaneR - $sForm.Width - $edgeGap), [int]($rowR + $edgeGap))
                   } else {
-                      [int]($rowR + $edgeGap)
+                      $want = [int]([Math]::Max($chatR, $rowR) + $edgeGap) - (S 2) + $nudge
+                      if ($pn.BoundsReal) { [Math]::Min($want, [int]($pn.PaneR - $sForm.Width - 2)) } else { $want }
                   }
             # Line the lowest side BUTTON up with the row, not the form that contains it. The
             # panel's padding and the button's margin sit between the two, so aligning form
@@ -4938,7 +5126,7 @@ $timer.add_Tick({
             # correct if either ever changes.
             $sBtm = $st.Panel.Controls[0]      # BottomUp: the first control is the bottom one
             $sCtr = $st.Panel.Top + $sBtm.Top + [int]($sBtm.Height / 2)
-            $sy = [int]($pn.DockY + (SW $script:vNudge) - $sCtr)
+            $sy = [int]($pn.DockY + (SW $script:vNudge) + $nudgeY - $sCtr)
             $sx = [Math]::Max($r.Left + 2, [Math]::Min($sx, $r.Right - $sForm.Width - 2))
             $sy = [Math]::Max($r.Top + 2, [Math]::Min($sy, $r.Bottom - $sForm.Height - 2))
             $sVis = [bool]$pn.Anchored
