@@ -1098,7 +1098,20 @@ $panelFns = @('Get-ButtonBlocks', 'Get-ButtonBar', 'Same-Button', 'Get-ColorKind
               # user-facing half. NOT `L`: an echo stub for it is defined further down for the
               # New-ButtonGroup fixture and would shadow the real one anyway, so loading it here
               # would only look like coverage that is not in force.
-              'Get-TagIndex', 'Get-TargetIndex', 'Notify-ConfigClobber')
+              'Get-TagIndex', 'Get-TargetIndex', 'Notify-ConfigClobber',
+              # The clipboard lease and its neighbours. Loaded for real for the same reason
+              # everything else here is: the first version of the send-path tests grepped the
+              # source and six of nine injected defects survived, one of them the leak itself.
+              'Test-PasteConfirmed', 'Get-ClipboardLeaseAction', 'Resolve-ClipboardLease',
+              'Test-SendBlockedByLease', 'Test-LeaseNagDue', 'Wait-EnterSwallowed',
+              'Wait-ComposerFocus',
+              # Wait-EnterSwallowed's verdict IS Test-PasteLanded's verdict, so the whole
+              # comparator chain is loaded rather than stubbed - a stub would let the retry be
+              # licensed by a rule the shipped code does not use.
+              'Test-PasteLanded', 'Remove-FenceInfoStrings', 'Get-CompareWords',
+              'Get-CompareSymbols', 'Get-CompareTokens', 'Get-ComposerCore',
+              'Test-IsOrderedSubsetOf', 'Get-AlnumLength', 'Get-NonAlnumLength',
+              'Get-WordCoverage', 'Test-DeltaDerives')
 $missingFns = @()
 foreach ($fn in $panelFns) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
@@ -1111,13 +1124,332 @@ Check ("every transform under test was found in the panel source" + $(if ($missi
 # either here would reintroduce exactly the "fixture asserts the fixture" defect.
 Add-Type -AssemblyName System.Drawing   # $script:ckPalette is a table of [System.Drawing.Color]
 $missingVars = @()
-foreach ($vn in @('$script:ckBars', '$script:ckPalette')) {
+foreach ($vn in @('$script:ckBars', '$script:ckPalette',
+                  # The comparator's thresholds. Retyping them here is exactly the
+                  # "fixture asserts the fixture" defect this block exists to prevent.
+                  '$script:MaxMissingWords', '$script:MaxMissingFraction', '$script:MinSizeFraction')) {
     $asn = $ast.Find({ param($n)
         $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $vn }, $true)
     if ($asn) { Invoke-Expression $asn.Extent.Text } else { $missingVars += $vn }
 }
 Check ("the bar list and colour palette were extracted from source" + $(if ($missingVars) { ": MISSING $($missingVars -join ', ')" } else { '' })) `
     ($missingVars.Count -eq 0)
+
+# =====================================================================================
+# THE CLIPBOARD LEASE
+# =====================================================================================
+# THE LIVE LEAK, as it was reported and reproduced: the user has an image on the clipboard, the
+# panel sets the button text and sends ^v, the app is busy and has not read it after 1200ms, the
+# verification therefore returns Mismatch/Unverifiable - and the old `finally` restored the image
+# THERE AND THEN. The queued paste then read the image and attached it to the conversation.
+#
+# Failing closed does not help: nothing is submitted, but the leak IS the paste, and by then the
+# data has already been handed over.
+#
+# NONE OF THIS IS TESTED THROUGH THE REAL CLIPBOARD. The restore is a CALLBACK, so every case
+# below asserts on CALLS - what was restored, how many times, and with which object - and the
+# machine's own clipboard is never read or written. That is not only hygiene: writing to the
+# clipboard is the very resource the bug is about, and a test that clobbered it would be
+# reproducing the defect in order to check for it.
+$script:leaseRestores = @()
+$leaseCb = { param($b) $script:leaseRestores += , $b }
+# The same echo stub for `L` the rest of this file uses (it is redefined identically further down,
+# next to the tests that were written against it). Echoing the KEY lets the assertions below pin
+# WHICH string is shown rather than merely that something non-empty was; that the strings exist
+# with real text in both languages is asserted separately, against the tables themselves.
+function L([string]$k) { $k }
+
+# --- The pure decision, in isolation. Four inputs, four outcomes. ---
+# 'Drop' first, and that ORDER is load-bearing: once the clipboard belongs to someone else,
+# writing a stale backup over it is a write we have no right to make - even on the confirmed
+# path, where the restore would otherwise be unconditional.
+Check 'lease: a CONFIRMED paste restores (the app has provably read the clipboard)' `
+    ((Get-ClipboardLeaseAction $true $true $true $true) -ceq 'Restore')
+Check 'lease: an UNCONFIRMED paste HOLDS - the pending read must not be handed the user data' `
+    ((Get-ClipboardLeaseAction $true $false $true $true) -ceq 'Hold')
+Check 'lease: nothing was ever pasted, so there is no pending read to wait for - restore' `
+    ((Get-ClipboardLeaseAction $false $false $true $true) -ceq 'Restore')
+Check 'lease: the target process is gone, so the read can never happen - restore' `
+    ((Get-ClipboardLeaseAction $true $false $true $false) -ceq 'Restore')
+Check 'lease: something else took the clipboard - DROP, never overwrite their new copy' `
+    ((Get-ClipboardLeaseAction $true $false $false $true) -ceq 'Drop')
+Check 'lease: Drop beats Confirmed (a stale backup must not clobber a newer copy)' `
+    ((Get-ClipboardLeaseAction $true $true $false $true) -ceq 'Drop')
+# The whole point of the fix in one line: an unconfirmed paste into a LIVE app whose clipboard is
+# still ours has no release condition at all, and must not acquire one. A mutant that returns
+# 'Restore' here is the reported leak, verbatim.
+Check 'lease: the leak case (sent, unconfirmed, ours, alive) is the ONLY Hold' `
+    ((Get-ClipboardLeaseAction $true $false $true $true) -ceq 'Hold')
+
+# --- The lifecycle, driven end to end through the callback. ---
+function New-Lease([string]$backup, [bool]$sent = $true) {
+    @{ Backup = $backup; Seq = 7; Composer = $null; Baseline = 'udkast'; Payload = '/review'
+       Pid = 1234; PasteSent = $sent; OpenedAt = (Get-Date); Restored = $false }
+}
+
+# 1. Confirmed: restored IMMEDIATELY, ONCE, with the user's own backup, and the lease is closed.
+$script:leaseRestores = @(); $script:clipLease = $null
+$L1 = New-Lease 'BRUGERENS BILLEDE'
+$a1 = Resolve-ClipboardLease $L1 $true $true $true $leaseCb
+Check 'lease: Confirmed restores exactly once' ($script:leaseRestores.Count -eq 1)
+Check 'lease: ...and restores the USER''S backup, not our payload' ($script:leaseRestores[0] -eq 'BRUGERENS BILLEDE')
+Check 'lease: ...and closes the lease' (($a1 -ceq 'Restore') -and ($null -eq $script:clipLease))
+# Asked twice - which the tick genuinely does - it must not write a second time.
+$a1b = Resolve-ClipboardLease $L1 $true $true $true $leaseCb
+Check 'lease: a second resolution of the same lease does NOT restore again' ($script:leaseRestores.Count -eq 1)
+
+# 2. The three fail-closed states must NEVER restore. This is the leak, enumerated.
+#    Test-PasteConfirmed is the shipped translation from state to boolean, so it is used here
+#    rather than a hand-written comparison - otherwise a mutant that made 'Mismatch' read as
+#    confirmed would be invisible to this table.
+foreach ($st in @('Mismatch', 'Unverifiable', 'NotAttempted', 'confirmed')) {
+    $script:leaseRestores = @(); $script:clipLease = $null
+    $Lx = New-Lease 'BRUGERENS BILLEDE'
+    $ax = Resolve-ClipboardLease $Lx (Test-PasteConfirmed $st) $true $true $leaseCb
+    Check "lease: '$st' never restores the clipboard (the reported leak)" ($script:leaseRestores.Count -eq 0)
+    Check "lease: '$st' keeps the lease OPEN" (($ax -ceq 'Hold') -and ($null -ne $script:clipLease))
+}
+# 'confirmed' in that list is not padding: -eq is case-insensitive in PowerShell, so a state
+# spelled in lower case would satisfy a non-strict comparison and license a restore.
+Check 'lease: Test-PasteConfirmed is CASE-SENSITIVE' `
+    ((Test-PasteConfirmed 'Confirmed') -and -not (Test-PasteConfirmed 'confirmed'))
+
+# 3. A SECOND CLICK DURING A LEASE IS REFUSED, AND THE BACKUP IS UNTOUCHED.
+#    This is the half a fixed delay gets wrong: inside a 6s window the second click would
+#    snapshot the FIRST button's payload as "the user's clipboard", make that the backup, and
+#    restore it later - so the real backup is destroyed silently and permanently.
+$script:clipLease = New-Lease 'BRUGERENS BILLEDE'
+$backupBefore = $script:clipLease.Backup
+$script:warned = @(); $script:leaseRestores = @()
+$blocked = Test-SendBlockedByLease
+Check 'lease: a click during an open lease is REFUSED' ($blocked -eq $true)
+Check 'lease: ...and it is refused VISIBLY, not silently' `
+    (($script:warned.Count -eq 1) -and ($script:warned[0] -eq 'sendLeaseOpen'))
+Check 'lease: ...and the refusal does not alter the backup' ($script:clipLease.Backup -eq $backupBefore)
+Check 'lease: ...and does not restore anything' ($script:leaseRestores.Count -eq 0)
+Check 'lease: ...and leaves the lease open' ($null -ne $script:clipLease)
+$script:clipLease = $null
+$script:warned = @()
+Check 'lease: with NO lease open a click is not blocked' ((Test-SendBlockedByLease) -eq $false)
+Check 'lease: ...and nothing is said' ($script:warned.Count -eq 0)
+
+# 4. A LATER CONFIRMATION RESTORES THE ORIGINAL BACKUP. The lease survives an arbitrary number
+#    of inconclusive sweeps and then hands back exactly what was there before the click - not
+#    whatever the clipboard happened to hold in between.
+$script:leaseRestores = @(); $script:clipLease = $null
+$L4 = New-Lease 'BRUGERENS BILLEDE'
+for ($i = 0; $i -lt 5; $i++) { $null = Resolve-ClipboardLease $L4 $false $true $true $leaseCb }
+Check 'lease: five inconclusive sweeps restore nothing' ($script:leaseRestores.Count -eq 0)
+Check 'lease: ...and the lease is still open after them' ($null -ne $script:clipLease)
+$a4 = Resolve-ClipboardLease $L4 $true $true $true $leaseCb
+Check 'lease: a LATER confirmation releases it' (($a4 -ceq 'Restore') -and ($null -eq $script:clipLease))
+Check 'lease: ...restoring the ORIGINAL backup, exactly once' `
+    (($script:leaseRestores.Count -eq 1) -and ($script:leaseRestores[0] -eq 'BRUGERENS BILLEDE'))
+
+# 5. The user's escape hatch: they copy something, and we must NOT put the old contents back on
+#    top of it. Drop closes the lease without a write.
+$script:leaseRestores = @(); $script:clipLease = $null
+$L5 = New-Lease 'BRUGERENS BILLEDE'
+$a5 = Resolve-ClipboardLease $L5 $false $false $true $leaseCb
+Check 'lease: the user copying something releases the lease' (($a5 -ceq 'Drop') -and ($null -eq $script:clipLease))
+Check 'lease: ...WITHOUT writing the stale backup over their new copy' ($script:leaseRestores.Count -eq 0)
+
+# 6. The cost must be VISIBLE while it lasts. An open lease means the clipboard is not the
+#    user's yet; announced once and never again, that becomes silent within seconds.
+$now = Get-Date
+Check 'lease: the held-clipboard warning repeats once its interval has passed' `
+    (Test-LeaseNagDue $now.AddSeconds(-30) $now)
+Check 'lease: ...but not on every 50ms tick' `
+    (-not (Test-LeaseNagDue $now.AddSeconds(-1) $now))
+Check 'lease: the nag interval outlives the tip it shows (8s), so the warning PULSES' `
+    ((([regex]::Match($srcText, '\[int\]\$intervalSec = (\d+)')).Groups[1].Value -as [int]) -ge 9)
+
+# --- Wiring. The behaviour above is only in force if the send path actually uses it. ---
+# $pasteSent is tracked SEPARATELY from $pasteState: a throw after SendWait('^v') leaves the state
+# at 'NotAttempted' while a read is genuinely queued, and restoring on the state alone would then
+# reintroduce the leak through the exception path.
+Check 'the send path records that ^v was actually sent (not inferred from the state)' `
+    ($srcText -match 'SendKeys\]::SendWait\(''\^v''\)\r?\n\s*\$pasteSent = \$true')
+Check 'the lease is what the finally resolves - no unconditional restore survives' `
+    (($srcText -match '\$act = Resolve-ClipboardLease \$lease \(Test-PasteConfirmed \$pasteState\)') -and
+     ($srcText -match '\$lease\s*=\s*@\{'))
+# ...and the lease must carry the TRACKED value, not a constant. Pinning only that the field
+# exists let `PasteSent = $false` survive the whole suite: every unconfirmed paste would then look
+# like one that was never sent, restore immediately, and the reported leak would be back in full
+# with the lease machinery still apparently in place. Measured, not predicted.
+Check 'the lease records whether ^v was actually sent, from the tracked variable' `
+    ($srcText -match '(?m)^\s*PasteSent = \$pasteSent\s*$')
+# The same trap one level down: the tracked variable itself must be set to $true at the keystroke.
+Check 'the lease baseline and payload are the ones that were actually pasted' `
+    (($srcText -match '(?m)^\s*Baseline  = \$baseline\s*$') -and
+     ($srcText -match '(?m)^\s*Payload   = \$textToSend\s*$'))
+# THREE clipboard writes exist in the whole file and no more: the payload itself, and the two
+# restore callbacks (the send-path finally and the tick sweep). A fourth is a restore that
+# bypasses the lease - which is the leak, whatever else the lease then decides.
+$clipWrites = @([regex]::Matches($srcText, '(?m)^(?!\s*#).*Clipboard\]::SetDataObject'))
+Check "no clipboard write exists outside the payload and the lease's two callbacks (found $($clipWrites.Count), expected 3)" `
+    ($clipWrites.Count -eq 3)
+Check 'the tick sweeps the lease, so it can be released by a LATER observation' `
+    ($srcText -match '(?m)^\s*if \(\$script:clipLease -and .*\{\r?\n\s*\$script:leaseSweptAt = Get-Date')
+# ABOVE the visibility gate. Two of the three release conditions - the app exiting, and something
+# else taking the clipboard - arrive precisely when the panel is hidden, and gating the sweep on
+# visibility would strand the clipboard for as long as Claude stayed minimised.
+# The CALL SITE, matched exactly. `Select-String 'Update-ClipboardLease' | Last` would fall back
+# to the function DEFINITION once the call was deleted - and the definition sits above $show, so
+# the ordering assertion would still pass with the sweep gone entirely.
+$sweepLine = ($src | Select-String -Pattern '^\s*try \{ Update-ClipboardLease \} catch \{\}' | Select-Object -First 1).LineNumber
+$showLine2 = ($src | Select-String -Pattern '^\s*\$show = \(\$script:target -ne' | Select-Object -First 1).LineNumber
+Check 'the lease sweep runs even while the panel is hidden' `
+    (($sweepLine -gt 0) -and ($showLine2 -gt 0) -and ($sweepLine -lt $showLine2))
+# The refusal must come before ANY state is touched - before the confirm arming, before the
+# toggle decision, and long before the clipboard is snapshotted.
+$leaseGuardLine = ($src | Select-String -Pattern 'if \(Test-SendBlockedByLease\) \{ return \}' | Select-Object -First 1).LineNumber
+$armLine        = ($src | Select-String -Pattern '\$script:armedBtn = \$btn' | Select-Object -First 1).LineNumber
+Check 'the lease refusal precedes the clipboard snapshot' `
+    (($leaseGuardLine -gt 0) -and ($leaseGuardLine -lt $clipLine))
+Check 'the lease refusal precedes the confirm-arming (a refused click changes nothing)' `
+    (($leaseGuardLine -gt 0) -and ($armLine -gt 0) -and ($leaseGuardLine -lt $armLine))
+# A fixed delay is the fix that was rejected. It cannot PROVE the pending read has happened, and
+# a second click inside it destroys the backup. If one reappears, the lease has been undone.
+Check 'no fixed delay was reintroduced in place of the lease' `
+    (-not ($srcText -match 'Start-Sleep -(Milliseconds ([2-9]\d{3,})|Seconds \d)'))
+Check 'the held / restored / dropped states are all reported to the user' `
+    (($srcText -match "Show-SendWarning \(L 'clipHeld'\)") -and
+     ($srcText -match "Show-SendWarning \(L 'clipBack'\)") -and
+     ($srcText -match "Show-SendWarning \(L 'clipDropped'\)"))
+$leaseStringsOk = $true
+foreach ($lang in @('en', 'da')) {
+    $block = [regex]::Match($srcText, "(?s)\b$lang\s*=\s*@\{(.*?)\r?\n\s*\}").Groups[1].Value
+    foreach ($k in @('clipHeld', 'clipBack', 'clipDropped', 'sendLeaseOpen')) {
+        if ($block -notmatch "$k\s*=\s*'[^']{40,}'") { $leaseStringsOk = $false }
+    }
+}
+Check 'every lease string exists with real text in EN and DA' $leaseStringsOk
+
+# =====================================================================================
+# THE COMMAND PALETTE SWALLOWING THE FIRST ENTER
+# =====================================================================================
+# A payload starting with "/" opens the app's command palette, and the first Enter picks the
+# highlighted entry instead of submitting: the text lands and then sits there, so the button reads
+# as one that did nothing.
+#
+# The contributor's fix pressed Enter again whenever the composer had EMPTIED. That is inverted -
+# emptying is what SUCCESS looks like; the swallowed case is the one where the text is still
+# there - and it is unsafe, because "empty" says nothing about where the caret is.
+#
+# The only condition that licenses a second press is positive evidence that the first did nothing:
+# the composer still holds baseline+payload, judged by the same comparator that returned
+# 'Confirmed'. These cases are the four ways that can be false, and every one of them must refuse.
+$script:swallowSeen = @()
+function Get-ComposerText($el) {
+    if ($script:swallowSeen.Count -eq 0) { return $script:swallowFixed }
+    $i = [Math]::Min($script:swallowIdx, $script:swallowSeen.Count - 1)
+    $script:swallowIdx++
+    $script:swallowSeen[$i]
+}
+# $baseline is UNTYPED, and that is the whole of one test below. Declared `[string]$baseline` it
+# coerces $null to '' before Wait-EnterSwallowed ever sees it, so the unknown-baseline case never
+# reached the branch it was written for - the assertion passed either way, and a mutation that
+# let an unknown baseline license a retry survived the whole suite. Measured, not predicted.
+function Swallowed($baseline, [string]$payload, $observed) {
+    $script:swallowFixed = $observed; $script:swallowSeen = @(); $script:swallowIdx = 0
+    Wait-EnterSwallowed $null $baseline $payload 120
+}
+# THE BUG ITSELF. The palette ate the Enter, so our text is untouched. Retry.
+Check 'palette: the composer still holding our text means the Enter did NOTHING - retry' `
+    ((Swallowed 'udkast' '/review' "udkast/review`n") -eq $true)
+# THE DOUBLE-SEND THIS MUST NEVER CAUSE. The Enter submitted, so the composer now reads as its
+# placeholder. Pressing again would submit whatever came next.
+Check 'palette: a composer that SUBMITTED must not be pressed again' `
+    ((Swallowed 'udkast' '/review' $script:EmptyComposerReadback) -eq $false)
+# The palette replaced our text with a different command. We never verified that, so we never
+# submit it.
+Check 'palette: text REPLACED by something else must not be pressed again' `
+    ((Swallowed 'udkast' '/review' "helt andet indhold`n") -eq $false)
+# Unreadable: we know nothing, so we do nothing. Fail closed.
+Check 'palette: an unreadable composer must not be pressed again' `
+    ((Swallowed 'udkast' '/review' $null) -eq $false)
+# An unreadable BASELINE means the delta was never knowable, so no comparison can license a retry.
+Check 'palette: an unknown baseline can never license a retry' `
+    ((Swallowed $null '/review' "udkast/review`n") -eq $false)
+# IT MUST HOLD FOR THE WHOLE BUDGET, not at one instant. A submit is asynchronous too: sampling
+# once immediately after the keystroke sees the pre-submit state and would retry into a message
+# already on its way. Here the first two reads still show our text and the third shows the
+# composer cleared - which must refuse.
+$script:swallowSeen = @("udkast/review`n", "udkast/review`n", $script:EmptyComposerReadback)
+$script:swallowIdx = 0
+Check 'palette: a composer that clears LATE in the budget must not be pressed again' `
+    ((Wait-EnterSwallowed $null 'udkast' '/review' 400) -eq $false)
+# THE TWO-KEYSTROKE CEILING IS NOT BROKEN BY THE RETRY. Reviews rejected the contributor's fix
+# because it added a second SendWait. The retry here re-enters the ONE call site through a loop,
+# so the AST count above is unchanged - and re-entering it means re-entering both dominators, so
+# the focus re-check runs again before the second press. (The count itself is asserted at the top
+# of this file; what is asserted here is that the retry is bounded and re-verified.)
+$retryBlock = [regex]::Match($srcText, "(?s)\`$enterPresses = 0(.*?)\r?\n                \}").Groups[1].Value
+Check 'palette: the retry region was located' ($retryBlock.Length -gt 100)
+# The LOOP CONDITION specifically. A bare `-lt 2` also occurs in the retry decision inside the
+# body, so a widened loop bound would still satisfy a pattern that did not say which one.
+Check 'palette: the retry is bounded at two presses' `
+    ($retryBlock -match 'while \(\$pressAgain -and \$enterPresses -lt 2\) \{')
+Check 'palette: the second press re-verifies the composer focus (same call site, same guard)' `
+    ($retryBlock -match 'if \(Wait-ComposerFocus \$composerEl 250\) \{')
+Check 'palette: the second press re-verifies that Claude is still foreground' `
+    ($retryBlock -match 'Test-TargetForeground')
+Check 'palette: the retry is licensed by Wait-EnterSwallowed, not by the composer emptying' `
+    (($retryBlock -match 'Wait-EnterSwallowed \$composerEl \$baseline \$textToSend') -and
+     ($retryBlock -notmatch 'IsNullOrWhiteSpace|IsNullOrEmpty'))
+
+# =====================================================================================
+# THE FIRST CLICK: focus must be RE-ASKED, not merely watched
+# =====================================================================================
+# SetFocus was called once and the wait then only observed. On a cold activation - Claude not yet
+# foreground - Chromium drops that request while the window comes forward, so focus never lands,
+# nothing re-asks, and the wait burns its whole budget before the send is abandoned. That is why
+# the first click of a session so often did nothing.
+#
+# The stub below is never a real UIA element and nothing here moves real focus: SetFocus is a
+# counter. Its rectangle is off-screen-impossible, so no genuinely focused element can ever fall
+# inside it and the poll is guaranteed to run the full budget - which is exactly the cold case.
+function New-FocusStub {
+    $s = New-Object psobject -Property @{ Asked = 0 }
+    $s | Add-Member ScriptMethod SetFocus { $this.Asked++ }
+    $s | Add-Member NoteProperty Current ([pscustomobject]@{
+        BoundingRectangle = [pscustomobject]@{ X = -999999.0; Y = -999999.0; Width = 1.0; Height = 1.0 } })
+    $s
+}
+$fs = New-FocusStub
+$focusRes = Wait-ComposerFocus $fs 1500 -Reassert
+# 1500ms at a 300ms cadence is 4 asks on an idle machine. Asserting >=2 tolerates a loaded box
+# while still failing BOTH a deleted re-ask (0) and an ask-once-and-watch (1) - which is the
+# shipped defect. The upper bound catches a cadence collapsed to every iteration.
+Check "first click: focus is RE-ASKED inside the deadline ($($fs.Asked) asks in 1500ms)" `
+    (($fs.Asked -ge 2) -and ($fs.Asked -le 10))
+Check 'first click: an impossible composer still times out rather than reporting success' `
+    ($focusRes -eq $false)
+# ...and WITHOUT -Reassert it must never ask. The same function re-verifies focus immediately
+# before Enter, and a verification that calls SetFocus MAKES ITS OWN ANSWER TRUE: it would drag
+# focus back from wherever the user moved it and then report success, defeating the one check
+# that stops Enter submitting another chat's draft.
+$fs2 = New-FocusStub
+$null = Wait-ComposerFocus $fs2 600
+Check "first click: the Enter re-check never asks for focus, it only observes ($($fs2.Asked) asks)" `
+    ($fs2.Asked -eq 0)
+# The cold-activation budget. 800ms was measurably too short for a window that is still coming
+# forward; the whole point of re-asking is to have time to be heard.
+$focusDefault = [regex]::Match($srcText, 'function Wait-ComposerFocus\(\$composerEl, \[int\]\$timeoutMs = (\d+)')
+Check "first click: the activation budget is a cold-start budget ($($focusDefault.Groups[1].Value)ms)" `
+    ($focusDefault.Success -and ([int]$focusDefault.Groups[1].Value -ge 2000))
+Check 'first click: the send path asks for focus rather than only watching for it' `
+    ($srcText -match 'Wait-ComposerFocus \$composerEl 2500 -Reassert')
+# The re-ask must survive a throwing observation. Folded into the poll's own try/catch, a dead
+# UIA element would silently disable re-asking for the rest of the budget - the exact failure
+# being fixed, restored with a green suite.
+$wcfBody = [regex]::Match($srcText, '(?s)function Wait-ComposerFocus.*?\r?\n\}').Value
+$reaskIdx = $wcfBody.IndexOf('$composerEl.SetFocus()')
+$pollIdx  = $wcfBody.IndexOf('AutomationElement]::FocusedElement')
+Check 'first click: the re-ask has its own try, ahead of the observation that can throw' `
+    (($reaskIdx -gt 0) -and ($pollIdx -gt $reaskIdx) -and
+     ($wcfBody.Substring($reaskIdx, $pollIdx - $reaskIdx) -match 'try \{'))
 
 # =====================================================================================
 # Clear-FlyoutForForm: a pinned flyout must not outlive the strip that owns it

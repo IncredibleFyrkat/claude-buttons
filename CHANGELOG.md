@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.11.0 — 2026-07-20
+
+**Your clipboard could end up in a chat.** Reported by
+[@RasmusKD](https://github.com/RasmusKD), who watched an image from his own clipboard appear
+attached to a conversation — alongside text from a button he had clicked earlier.
+
+`Ctrl+V` is asynchronous: the app reads the clipboard whenever it gets round to it. The panel
+waited up to 1.2 seconds for the paste to show up and then, having given up, put the user's
+clipboard back. Under load the app's read happened *after* that — so the queued paste delivered
+**the restored contents**, the user's own data, into the message box.
+
+Refusing to send did not help. Nothing was submitted, but **the leak is the paste itself**: by
+then the data had already been handed over. This is a real limit of fail-closed as a design, and
+it took someone using the tool to find it.
+
+**The clipboard is now held under a lease, with no deadline.** Time is not evidence that a read
+has happened, so the restore waits for proof:
+
+- **Confirmed** — the button's text was seen in the box, so the read demonstrably happened.
+  Restore immediately.
+- **Someone else took the clipboard** (you pressed Ctrl+C) — a pending paste can no longer
+  deliver our data, and writing a stale backup over your new copy would be the same harm. The
+  lease is dropped **without** restoring. This is also how you take your clipboard back: use it.
+- **The app is gone** — the read can never happen. Restoring is safe.
+- **A second click while a lease is open is refused**, so a first button's text can never be
+  backed up as if it were yours.
+
+If the app never reads it, the lease never releases — any deadline is the bug. What is held is
+the button's own text, and what you lose is only automatic restoration; the panel says so, and
+keeps saying so, rather than failing quietly. It is deliberately **not** written to disk: saving
+it would put the very thing this protects — an image, a password — into a file that outlives the
+only process able to put it back.
+
+Also fixed, both reported by the same contributor and both confirmed present here:
+
+- **A `/command` button often did nothing.** Text starting with `/` opens the app's command
+  palette, and the first Enter picks the highlighted entry instead of sending — so the text
+  landed and then just sat there. The panel now retries, but only on positive evidence that the
+  first press did nothing: the box must still hold exactly what it held before, for the whole
+  wait. Submitted, edited or unreadable means no retry, because a wrong retry sends twice.
+- **The first click after switching to Claude often failed.** Focus was requested once, and a
+  window still coming to the foreground can drop that request — so the panel waited for a change
+  that was never coming. It now re-asks while it waits.
+
 ## 1.10.4 — 2026-07-20
 
 Side-bar polish, all of it found by using the thing rather than by testing it.

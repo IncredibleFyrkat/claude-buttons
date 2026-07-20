@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.10.4'
+$CB_VERSION = '1.11.0'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1073,6 +1073,10 @@ $script:strings = @{
         sendUnverified = 'Not sent: could not read the message box to confirm the paste. Nothing was submitted.'
         sendNoPane = 'Not sent: the panel could not tell which chat this button belongs to, so it did not risk sending to the wrong one. Click the chat, then try again.'
         sendFocusLost = 'Not submitted: the text was inserted correctly, but the cursor left the message box before it could be sent. The text is ready - press Enter to send it.'
+        clipHeld = 'Your clipboard is still on hold. The paste was never confirmed, so the button text has to stay on the clipboard until Claude reads it - putting your own contents back now could paste them into the chat. Copy anything at all to take your clipboard back.'
+        clipBack = 'Your clipboard has been given back: the paste finally landed, so the contents from before the click are restored.'
+        clipDropped = 'Your clipboard was NOT restored: you copied something else while it was on hold, and overwriting that would have lost it. The older contents are gone.'
+        sendLeaseOpen = 'Not sent: the previous click is still holding your clipboard, and a second send now would discard the backup of it. Wait for the first one to finish, or copy anything to release it.'
         noActive = 'The panel cannot tell which chat is active right now (send a message in the chat first). The button was NOT pinned.'
         removeAmbiguous = 'Not removed: two or more buttons have exactly the same name, text and scope, so the panel cannot tell which one you clicked. Rename or retype one of them first. Nothing was changed.'
         cfgClobber = 'Not saved: buttons.json was changed by something else while this edit was being made, so the panel did not overwrite it. The change you just made was dropped - the file was not. The panel has reloaded; try again.'
@@ -1112,6 +1116,10 @@ $script:strings = @{
         sendUnverified = 'Ikke sendt: kunne ikke læse beskedfeltet for at bekræfte indsættelsen. Intet blev afsendt.'
         sendNoPane = 'Ikke sendt: panelet kunne ikke afgøre hvilken chat denne knap hører til, så det undlod at sende til den forkerte. Klik på chatten, og prøv igen.'
         sendFocusLost = 'Ikke afsendt: teksten blev indsat korrekt, men markøren forlod beskedfeltet, før den kunne sendes. Teksten er klar - tryk Enter for at sende den.'
+        clipHeld = 'Din udklipsholder holdes stadig tilbage. Indsættelsen blev aldrig bekræftet, så knappens tekst skal blive liggende, indtil Claude læser den - lægger vi dit eget indhold tilbage nu, kan det blive indsat i chatten. Kopiér hvad som helst for at få din udklipsholder tilbage.'
+        clipBack = 'Du har fået din udklipsholder tilbage: indsættelsen landede til sidst, så indholdet fra før klikket er gendannet.'
+        clipDropped = 'Din udklipsholder blev IKKE gendannet: du kopierede noget andet, mens den var holdt tilbage, og at overskrive det ville have mistet det. Det gamle indhold er væk.'
+        sendLeaseOpen = 'Ikke sendt: det forrige klik holder stadig din udklipsholder, og en ny afsendelse nu ville kassere sikkerhedskopien af den. Vent til den første er færdig, eller kopiér noget for at frigive den.'
         noActive = 'Panelet kan ikke afgøre hvilken chat der er aktiv lige nu (send en besked i chatten først). Knappen blev IKKE pinnet.'
         removeAmbiguous = 'Ikke fjernet: to eller flere knapper har præcis samme navn, tekst og scope, så panelet kan ikke afgøre hvilken du klikkede på. Omdøb eller ret teksten på den ene først. Intet blev ændret.'
         cfgClobber = 'Ikke gemt: buttons.json blev ændret af noget andet mens denne redigering blev lavet, så panelet undlod at overskrive den. Den ændring du lige lavede blev kasseret - filen blev ikke. Panelet har genindlæst; prøv igen.'
@@ -4135,11 +4143,34 @@ function Focus-ChatInput($stripCenterX, $stripTopY, $stripHeight = 0) {
 # normally lands in ~20-40ms. Returns $false on timeout so the caller aborts instead of typing
 # into the wrong chat. Focus often lands on an inner editable node, so a descendant whose rect
 # sits inside the composer counts as focused.
-function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 800) {
+#
+# THE FIRST CLICK OF A SESSION USED TO FAIL, and the reason is that focus was REQUESTED once and
+# then only WATCHED. When Claude is not yet the foreground window the SetFocus at the call site
+# arrives while the app is still coming forward, and Chromium drops it - it never lands, nothing
+# re-asks, and the wait burns its whole budget before the send is abandoned. So -Reassert re-asks
+# every 300ms inside the SAME deadline, and the cold-activation budget is 2500ms rather than 800.
+#
+# -Reassert IS A SWITCH, NOT THE DEFAULT, and that is load-bearing. This same function is called
+# a second time immediately before Enter to RE-VERIFY that focus is still in the composer we
+# pasted into. A verification that calls SetFocus would MAKE its own answer true: it would drag
+# focus back from wherever the user had moved it and then report success, defeating the one check
+# that stops Enter submitting another chat's draft. Asking is for the activation call; the
+# re-check only ever observes.
+function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 2500, [switch]$Reassert) {
     if (-not $composerEl) { return $false }
     try { $cr = $composerEl.Current.BoundingRectangle } catch { return $false }
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    # First re-ask is one interval in, not immediately: the caller has just asked once, and
+    # asking twice in the same millisecond would only cost a UIA round-trip.
+    $nextAsk = (Get-Date).AddMilliseconds(300)
     while ((Get-Date) -lt $deadline) {
+        # Its OWN try, outside the observation below. Folded into that one, a throw from the
+        # focused-element read (routine: UIA elements die when a pane re-mounts) would skip the
+        # re-ask for the rest of the budget, which is the exact failure being fixed.
+        if ($Reassert -and (Get-Date) -ge $nextAsk) {
+            try { $composerEl.SetFocus() } catch {}
+            $nextAsk = (Get-Date).AddMilliseconds(300)
+        }
         try {
             $f = [System.Windows.Automation.AutomationElement]::FocusedElement
             if ($f) {
@@ -4154,6 +4185,233 @@ function Wait-ComposerFocus($composerEl, [int]$timeoutMs = 800) {
         Start-Sleep -Milliseconds 12
     }
     return $false
+}
+
+# =====================================================================================
+# THE CLIPBOARD LEASE
+# =====================================================================================
+# Ctrl+V is ASYNCHRONOUS. SendWait('^v') queues a keystroke; the app reads the clipboard when it
+# gets round to it, which under load is long after we have stopped looking. Wait-PasteLanded gives
+# that read 1200ms to show up in the composer, and the `finally` that followed it restored the
+# user's clipboard the instant the wait returned - CONFIRMED OR NOT. So the live leak was:
+#
+#   user has an image on the clipboard -> we set the button text and send ^v -> the app is busy and
+#   has not read after 1200ms -> the verification returns Mismatch/Unverifiable -> the restore puts
+#   the IMAGE back -> the still-pending paste now reads the image and attaches it to the chat.
+#
+# Failing closed does not help. Nothing is submitted, but THE LEAK IS THE PASTE ITSELF: by the time
+# we could refuse, the user's data has already been handed to the app.
+#
+# A LONGER DELAY IS NOT THE FIX. A fixed 6s wait was proposed and it is the wrong shape twice over:
+# it cannot PROVE the pending read has happened (it is the same bet, at longer odds), and a second
+# click inside it snapshots the FIRST button's payload as though it were the user's clipboard and
+# restores that later - destroying the real backup. Time is not evidence.
+#
+# Only ONE observation proves the app has already read the clipboard: our text appearing in the
+# composer. So the restore is gated on evidence, not on a deadline, and the window in which we hold
+# the user's clipboard is called a LEASE.
+#
+# RELEASE CONDITIONS, and why these three and no others:
+#
+#   1. CONFIRMED - our payload was observed in the composer. The read has demonstrably happened, so
+#      no pending read can deliver anything, and the backup goes straight back. This is the
+#      overwhelmingly common path and it is unchanged from before: restore immediately, exactly once.
+#
+#   2. THE PAYLOAD IS NO LONGER ON THE CLIPBOARD (the sequence number moved). Someone else - most
+#      often the user pressing Ctrl+C - now owns the clipboard. A pending paste can no longer
+#      deliver OUR data, and it certainly must not deliver the stale backup, so the lease is DROPPED
+#      WITHOUT RESTORING. Writing the backup here would clobber the thing the user just copied,
+#      which is the same class of harm we are preventing. This is also the user's escape hatch: they
+#      take their clipboard back by using it.
+#
+#   3. THE TARGET PROCESS IS GONE. A process that has exited has no pending message queue, so the
+#      read can never happen. Restoring is then provably safe.
+#
+#   4. NOTHING WAS EVER SENT. If the SendWait('^v') did not run (the clipboard write threw first),
+#      there is no queued read at all, so there is nothing to wait for. This is evidence, not a
+#      timer: it is knowledge about our own actions.
+#
+# AND WHAT IF THE APP NEVER READS IT? Then the lease never releases, and that is the correct
+# answer rather than a gap. Restoring on ANY deadline is precisely the bug. What we hold in the
+# meantime is the BUTTON'S OWN TEXT - standing prompt text the user configured, not a secret - and
+# what we withhold is the convenience of getting their clipboard back automatically. That cost is
+# real, so it is made VISIBLE (the tick re-shows the warning while a lease is open) rather than
+# silent, and condition 2 lets the user end it in one keystroke by copying anything at all.
+#
+# A SECOND CLICK DURING A LEASE IS REFUSED, NOT QUEUED. Queueing is what destroys the backup: the
+# second click's snapshot would capture button one's payload as "the user's clipboard". Refusal
+# keeps the one true backup intact, and it is visible - the user is told why.
+#
+# THE LEASE DOES NOT SURVIVE A PANEL RESTART, DELIBERATELY. Persisting it would mean writing the
+# user's clipboard - which may be exactly the image or password this bug leaks - to disk, where it
+# would outlive the only process that could ever put it back. That is a worse leak than the one
+# being fixed. So a lease lost to a crash leaves the button's own text on the clipboard: the
+# fail-safe direction, because the data stranded there is ours and not theirs.
+$script:clipLease = $null
+$script:leaseNagAt = Get-Date '2000-01-01'
+$script:leaseSweptAt = Get-Date '2000-01-01'
+
+# THE ONE DECISION, and it is pure so it can be tested without a clipboard anywhere near it.
+# Both the end of a send and the per-tick sweep ask exactly this question.
+#   $pasteSent     - did we actually synthesise ^v? If not, no read can be pending (condition 4).
+#   $confirmed     - has our text been OBSERVED in the composer? Proof of the read (condition 1).
+#   $clipboardOurs - is our payload still what the clipboard holds? (condition 2, inverted).
+#   $targetAlive   - does the process we pasted into still exist? (condition 3, inverted).
+# ORDER IS LOAD-BEARING: 'Drop' is tested first, because once the clipboard belongs to someone
+# else, restoring a stale backup over it is a write we have no right to make - even on the
+# confirmed path, where the restore would otherwise be unconditional.
+# The verdict, as a BOOLEAN, for the clipboard decision only. It is a function rather than an
+# inline comparison at the call site for two reasons the test suite enforces: no assignment may
+# carry the 'Confirmed' literal (a second variable standing in for the verdict is how a weaker
+# route to it was introduced once), and the fail-closed region is located by the FIRST
+# occurrence of the positive dominator's own header text, so a second copy of that header - even
+# an inline one in the finally, even one inside a comment - would silently move the region the
+# suite scans for stray keystrokes. There must be exactly one, and it is the submit gate.
+# -ceq: -eq is case-insensitive, and a state spelled 'confirmed' must not license a restore.
+function Test-PasteConfirmed([string]$pasteState) {
+    return ($pasteState -ceq 'Confirmed')
+}
+
+function Get-ClipboardLeaseAction([bool]$pasteSent, [bool]$confirmed, [bool]$clipboardOurs, [bool]$targetAlive) {
+    if (-not $clipboardOurs) { return 'Drop' }
+    if ($confirmed)          { return 'Restore' }
+    if (-not $pasteSent)     { return 'Restore' }
+    if (-not $targetAlive)   { return 'Restore' }
+    return 'Hold'
+}
+
+# Apply that decision. $restore is a CALLBACK, not a clipboard write, so the whole lifecycle is
+# testable without touching the real clipboard - which is the very resource this bug is about.
+# It is invoked with the backup and AT MOST ONCE per lease: the $lease.Restored latch is what
+# stops a Confirmed restore and a later sweep from both firing, and stops a restore from ever
+# racing the refusal that protects the backup.
+function Resolve-ClipboardLease($lease, [bool]$confirmed, [bool]$clipboardOurs, [bool]$targetAlive, [scriptblock]$restore) {
+    if (-not $lease) { return 'None' }
+    $action = Get-ClipboardLeaseAction ([bool]$lease.PasteSent) $confirmed $clipboardOurs $targetAlive
+    if ($action -ceq 'Restore' -and -not $lease.Restored) {
+        $lease.Restored = $true
+        if ($restore) { & $restore $lease.Backup }
+    }
+    # -cne, not -ne: -eq/-ne are case-insensitive in PowerShell, and this decides whether the
+    # user's clipboard stays hostage.
+    if ($action -cne 'Hold') { $script:clipLease = $null } else { $script:clipLease = $lease }
+    return $action
+}
+
+# THE COMMAND PALETTE SWALLOWS THE FIRST ENTER.
+# A payload that starts with "/" opens the app's command palette as it lands. The first Enter then
+# picks the highlighted palette entry instead of submitting, so the text stays in the composer and
+# the button reads as one that did nothing.
+#
+# The obvious fix - "press Enter again if the composer emptied" - is BOTH INVERTED AND UNSAFE. It
+# is inverted because in the swallowed case the composer does NOT empty; emptying is what SUCCESS
+# looks like. And it is unsafe because "empty" says nothing about WHERE the caret is, so a second
+# blind Enter can submit a different chat's draft.
+#
+# The only condition that licenses a second press is POSITIVE EVIDENCE THAT THE FIRST ONE DID
+# NOTHING: the composer still holds baseline+payload, judged by the very same comparator that
+# returned 'Confirmed' in the first place. That single fact rules out every way a retry could
+# double-send:
+#   - the first Enter DID submit -> the composer now reads as its placeholder, not as our text ->
+#     no retry;
+#   - the palette replaced our text with some other command -> not our text -> no retry;
+#   - the user typed after the paste -> not our text any more -> no retry;
+#   - the composer became unreadable -> we know nothing -> no retry (fail closed).
+#
+# It must hold for the WHOLE budget, not merely at one instant: a submit is asynchronous too, and
+# sampling once immediately after the keystroke would see the pre-submit state and retry into a
+# message that was already on its way. So this returns $true only if every sample across the budget
+# still showed our text.
+#
+# The keystroke itself is NOT duplicated. There is exactly one SendWait('{ENTER}') call site in
+# this file and the retry re-enters it through a loop, so the two-keystroke ceiling is unchanged -
+# and the caller re-verifies the target and the focused composer before the second pass, so the
+# second press is bound by the same dominators as the first.
+function Wait-EnterSwallowed($el, $baseline, [string]$payload, [int]$timeoutMs = 400) {
+    if ($null -eq $baseline) { return $false }   # unknown baseline => the delta is unknowable
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-ComposerText $el
+        if ($null -eq $now) { return $false }
+        if (-not (Test-PasteLanded ([string]$baseline) $payload ([string]$now))) { return $false }
+        Start-Sleep -Milliseconds 25
+    }
+    return $true
+}
+
+# A SECOND CLICK DURING A LEASE IS REFUSED, NOT QUEUED, AND THAT IS A CORRECTNESS RULE RATHER
+# THAN POLITENESS. What is on the clipboard while a lease is open is the PREVIOUS button's
+# payload. A second send would snapshot that as "the user's clipboard", make it the backup, and
+# restore it later - so the user's real clipboard would be discarded silently and permanently,
+# with no way back. Refusing is what keeps the one true backup intact.
+#
+# A CALL, not an inline `if`, so the rule can be exercised directly: the test drives it with a
+# lease in place and asserts both that the click is refused and that the backup object it is
+# holding is the same object afterwards.
+# Returns $true when the click must be abandoned.
+function Test-SendBlockedByLease {
+    if (-not $script:clipLease) { return $false }
+    Write-CkLog 'Click refused: a clipboard lease from the previous send is still open'
+    Show-SendWarning (L 'sendLeaseOpen')
+    return $true
+}
+
+# An open lease is a COST - the user's clipboard is not theirs again yet - so it is repeated
+# rather than announced once and forgotten. The interval is longer than the tip's own 8s lifetime
+# so the warning pulses back into view instead of being permanently pinned, which is what people
+# stop seeing. Pure, so the cadence is testable without a clock or a window.
+function Test-LeaseNagDue([datetime]$lastNag, [datetime]$now, [int]$intervalSec = 9) {
+    return (($now - $lastNag).TotalSeconds -ge $intervalSec)
+}
+
+# The per-tick sweep: re-ask the three release conditions against the world as it is now. This is
+# what replaces the deadline the old `finally` used - the lease ends on evidence, whenever that
+# evidence arrives, and not before.
+function Update-ClipboardLease {
+    $lease = $script:clipLease
+    if (-not $lease) { return 'None' }
+    # (2) Is our payload still what the clipboard holds? Asked FIRST because a 'Drop' must not
+    # depend on anything we might fail to read below.
+    $clipOurs = $true
+    try {
+        $seqNow = [CkWin]::GetClipboardSequenceNumber()
+        $clipOurs = ($null -eq $lease.Seq -or $seqNow -eq $lease.Seq)
+    } catch {}
+    # (1) Has our text landed since? THE proof that the app has performed its read. Same
+    # comparator as the original verification - a later confirmation is not a weaker one.
+    $confirmed = $false
+    if ($null -ne $lease.Baseline) {
+        try {
+            $seen = Get-ComposerText $lease.Composer
+            if ($null -ne $seen) {
+                $confirmed = Test-PasteLanded ([string]$lease.Baseline) ([string]$lease.Payload) ([string]$seen)
+            }
+        } catch {}
+    }
+    # (3) Is the process we pasted into still there? A process that has exited has no message
+    # queue, so the pending read can never happen. On any doubt we assume it IS alive and hold.
+    $alive = $true
+    try { $alive = [bool](Get-Process -Id $lease.Pid -ErrorAction SilentlyContinue) } catch {}
+    $act = Resolve-ClipboardLease $lease $confirmed $clipOurs $alive `
+        { param($b) try { [System.Windows.Forms.Clipboard]::SetDataObject($b, $true) } catch {} }
+    # -CaseSensitive: -eq is case-insensitive in PowerShell and these labels decide a clipboard write.
+    switch -CaseSensitive ($act) {
+        'Restore' {
+            Write-CkLog 'Clipboard lease released; the previous clipboard has been restored'
+            Show-SendWarning (L 'clipBack')
+        }
+        'Drop' {
+            Write-CkLog 'Clipboard lease dropped: something else took the clipboard, so the old contents were NOT put back'
+            Show-SendWarning (L 'clipDropped')
+        }
+        'Hold' {
+            if (Test-LeaseNagDue $script:leaseNagAt (Get-Date)) {
+                $script:leaseNagAt = Get-Date
+                Show-SendWarning (L 'clipHeld')
+            }
+        }
+    }
+    return $act
 }
 
 $script:toggleState = @{}   # in-memory on/off state for toggle buttons (per panel run)
@@ -4194,6 +4452,9 @@ function Invoke-PillClick($btn) {
     # at the group instead of the button that actually failed.
     if ($btn.Tag -and $btn.Tag.__isGroup) { Show-GroupFlyout $btn $true; return }
     $script:lastClickedBtn = $btn     # so an abandoned send can warn next to the button clicked
+    # REFUSED, NOT QUEUED, while a lease is open - see Test-SendBlockedByLease. Deliberately
+    # BEFORE the confirm-arming and the toggle logic: a refused click must change nothing at all.
+    if (Test-SendBlockedByLease) { return }
     # Shift-click = insert the text but do NOT press Enter, so it can be edited or extended
     # first. Read it up front: Shift may be released during the focus + paste round-trip.
     $holdShift = ([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) -ne 0
@@ -4280,7 +4541,12 @@ function Invoke-PillClick($btn) {
                     return
                 }
             }
-            if (-not (Wait-ComposerFocus $composerEl)) {
+            # -Reassert, and the long budget, are the FIRST-CLICK fix: see Wait-ComposerFocus.
+            # The SetFocus above is a single request, and on a cold activation - Claude not yet
+            # foreground - Chromium drops it while the window is still coming forward. Watching
+            # alone then burns the whole budget and the send is abandoned, which is why the first
+            # click of a session so often did nothing.
+            if (-not (Wait-ComposerFocus $composerEl 2500 -Reassert)) {
                 Write-CkLog 'Send aborted: focus never landed in this pane composer'
                 return
             }
@@ -4311,6 +4577,12 @@ function Invoke-PillClick($btn) {
             # fell to the Mismatch branch, which told the user to inspect a composer that
             # nothing had been written to.
             $pasteState = 'NotAttempted'
+            # Tracked SEPARATELY from $pasteState, and that separation is the point. A throw
+            # AFTER SendWait('^v') - Wait-PasteLanded touching a dead UIA element, say - leaves
+            # $pasteState at 'NotAttempted' while a read is genuinely queued. Restoring on the
+            # strength of the state alone would then hand the user's clipboard to that pending
+            # read: the original bug, through the exception path. This records what WE did.
+            $pasteSent = $false
             $backup = $null; $snapOk = $false
             try {
                 $old = [System.Windows.Forms.Clipboard]::GetDataObject()
@@ -4337,6 +4609,7 @@ function Invoke-PillClick($btn) {
                 [System.Windows.Forms.Clipboard]::SetDataObject($dobj, $true)
                 $seqAfterSet = [CkWin]::GetClipboardSequenceNumber()
                 [System.Windows.Forms.SendKeys]::SendWait('^v')
+                $pasteSent = $true   # a read is now QUEUED; see the lease note above
                 # Do not restore the clipboard until the payload is OBSERVED in the composer.
                 # The finally block below runs straight after this, so this wait is the only
                 # thing standing between our paste and the user's clipboard going back.
@@ -4349,15 +4622,52 @@ function Invoke-PillClick($btn) {
             } catch {
                 Write-CkLog "Clipboard unavailable; nothing was pasted or sent: $($_.Exception.Message)"
             } finally {
-                # M1: restore the full prior clipboard - but only if nothing else wrote to it
-                # meanwhile, or we would clobber another app's copy with stale content. If the
-                # snapshot itself failed we leave our text rather than guess.
+                # THE LEASE, not a timer. This block used to restore the user's clipboard the
+                # instant Wait-PasteLanded returned, confirmed or not - and an unconfirmed return
+                # means the app's asynchronous read has NOT happened yet, so the restore fed their
+                # own data to the pending paste. That is the live leak. See the long note above
+                # Get-ClipboardLeaseAction for why only a Confirmed observation licenses a restore
+                # and why no length of delay can substitute for it.
+                #
+                # If the snapshot itself failed there is nothing to restore and nothing to hold:
+                # our text simply stays on the clipboard, as before.
                 if ($snapOk) {
+                    # M1: still true, and now the FIRST thing asked. If another app wrote to the
+                    # clipboard meanwhile, ours is gone and the backup is stale - restoring it
+                    # would clobber their copy, so the lease is dropped instead.
                     $seqNow = [CkWin]::GetClipboardSequenceNumber()
-                    if ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet) {
-                        try { [System.Windows.Forms.Clipboard]::SetDataObject($backup, $true) } catch {}
-                    } else {
+                    $clipOurs = ($null -eq $seqAfterSet -or $seqNow -eq $seqAfterSet)
+                    $lease = @{
+                        Backup    = $backup
+                        Seq       = $seqAfterSet
+                        Composer  = $composerEl
+                        Baseline  = $baseline
+                        Payload   = $textToSend
+                        Pid       = $script:targetPid
+                        PasteSent = $pasteSent
+                        OpenedAt  = Get-Date
+                        Restored  = $false
+                    }
+                    # A CALL, not `$x = ($pasteState -ceq 'Confirmed')` and not an inline `if`.
+                    # The suite forbids any assignment carrying that literal - a second variable
+                    # standing in for the verdict is exactly how the old `$pasted = ...` shape
+                    # let a weaker route to "confirmed" be introduced - and it locates the
+                    # fail-closed region by the first occurrence of the dominator's header text,
+                    # which an inline copy here would silently move. The submit dominator below
+                    # still reads $pasteState directly; this reaches only the clipboard.
+                    $act = Resolve-ClipboardLease $lease (Test-PasteConfirmed $pasteState) $clipOurs $true `
+                        { param($b) try { [System.Windows.Forms.Clipboard]::SetDataObject($b, $true) } catch {} }
+                    if ($act -ceq 'Drop') {
                         Write-CkLog 'Clipboard changed by another app mid-send; left it alone'
+                    } elseif ($act -ceq 'Hold') {
+                        # Deliberately loud. An open lease means the user's clipboard is not
+                        # theirs again yet, and that cost must be visible rather than silent.
+                        # The nag clock starts NOW rather than firing here: the fail-closed branch
+                        # below is about to show its own warning for this same click, and two tips
+                        # in the same instant means the second silently replaces the first. The
+                        # tick takes over once that one has had its say (see Test-LeaseNagDue).
+                        Write-CkLog 'Paste unconfirmed; HOLDING the clipboard lease until the paste is observed or the app is gone'
+                        $script:leaseNagAt = Get-Date
                     }
                 }
             }
@@ -4422,11 +4732,40 @@ function Invoke-PillClick($btn) {
                     # can be hopped by moving the keystroke above it, and that exact mutation
                     # once passed the whole suite while a Mismatch pressed Enter. Enter lives
                     # INSIDE the focus check and nowhere else.
-                    if (Wait-ComposerFocus $composerEl 250) {
-                        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-                    } else {
-                        Write-CkLog 'Focus left the composer before Enter; pasted text left unsent'
-                        Show-SendWarning (L 'sendFocusLost')
+                    #
+                    # THE LOOP IS THE COMMAND-PALETTE RETRY, and it is a loop precisely so that
+                    # the retry cannot become a second keystroke in the source. There is still
+                    # exactly one SendWait('{ENTER}') call site in this file; a second pass
+                    # re-enters it, which means it re-enters BOTH dominators too - the focus
+                    # re-check runs again before the second press, so the retry cannot land in a
+                    # chat we have not just re-verified. At most two passes, ever.
+                    $enterPresses = 0
+                    $pressAgain = $true
+                    while ($pressAgain -and $enterPresses -lt 2) {
+                        $pressAgain = $false
+                        if (Wait-ComposerFocus $composerEl 250) {
+                            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                            $enterPresses++
+                            # Retry ONLY on positive evidence that the press did nothing: the
+                            # composer still holds baseline+payload throughout the settle budget,
+                            # judged by the comparator that returned 'Confirmed'. Anything else -
+                            # submitted, replaced, edited, unreadable - stops here. Re-check the
+                            # foreground too: a retry is a fresh keystroke and gets a fresh gate.
+                            if ($enterPresses -lt 2 -and
+                                (Wait-EnterSwallowed $composerEl $baseline $textToSend) -and
+                                (Test-TargetForeground)) {
+                                Write-CkLog 'The first Enter was swallowed (command palette); pressing once more'
+                                $pressAgain = $true
+                            }
+                        } else {
+                            # Only for the FIRST press. Losing focus before a RETRY is not a
+                            # failure to report - the text is already where it belongs and the
+                            # user has moved on.
+                            if ($enterPresses -eq 0) {
+                                Write-CkLog 'Focus left the composer before Enter; pasted text left unsent'
+                                Show-SendWarning (L 'sendFocusLost')
+                            }
+                        }
                     }
                 }
                 return
@@ -4824,6 +5163,17 @@ $timer.add_Tick({
                 [WinHook]::TargetPid = $p   # scope object-event noise to Claude's process
                 [WinHook]::Touch()          # a freshly (re)found window needs a full pass
             }
+        }
+        # THE CLIPBOARD LEASE SWEEP. Deliberately ABOVE the $show gate: a lease can only be
+        # released by evidence, and two of the three kinds of evidence - the app exiting, and
+        # something else taking the clipboard - arrive exactly when the panel is hidden because
+        # Claude was minimised or closed. Gating this on visibility would strand the user's
+        # clipboard for as long as they kept Claude out of the way.
+        # $script:, not $leaseSweptAt: a bare assignment inside this timer scriptblock creates a
+        # LOCAL that vanishes on the next tick, so the throttle would never throttle.
+        if ($script:clipLease -and ((Get-Date) - $script:leaseSweptAt).TotalMilliseconds -ge 250) {
+            $script:leaseSweptAt = Get-Date
+            try { Update-ClipboardLease } catch {}
         }
         # Show whenever Claude is on-screen (not minimized), even if it is not the active window -
         # so the strips stay available and you can click a button from another window; the click
