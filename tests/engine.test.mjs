@@ -5,7 +5,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, utimesSync, chmodSync } from 'node:fs';
 import { tmpdir, uptime as osUptime } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -843,29 +843,22 @@ test('an unreadable arm flag with its request LOCKED still voids the request', o
   assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'the request it sat on is void');
 });
 
-test('an unreadable revocation list fails closed, and asking again clears it', () => {
-  const id = 'sRevokedUnreadable';
-  assert.equal(toggle('toggle request-on', id).code, 0);
-  mkdirSync(join(flagDir(), `${id}.revoked`));                 // cannot be read as a list
-  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
-  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'every request counts as revoked');
-  assert.equal(toggle('toggle request-on', id).code, 0);       // the user asks again
-  assert.ok(!exists(id, 'revoked'), 'request-on clears the obsolete list');
-  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m);
-});
 
 test('when consent cannot be voided at all, the aged arm is KEPT and every path refuses', onWindows, async () => {
-  // Nothing in the flag directory can be changed: the revocation list cannot be written (a
-  // directory squats on its name) and the request is locked. The arm must then stay on disk so
-  // the hook, status and toggle on keep finding it and keep refusing, rather than vanish and leave
-  // a request with nothing beside it to say it is void.
+  // The directory refuses new files (a deny ACE for this user) and the request is locked: no
+  // revocation marker can be created and the request cannot be removed. The arm must then stay on
+  // disk so the hook, status and toggle on keep finding it and keep refusing, rather than vanish
+  // and leave a request with nothing beside it to say it is void.
   const id = 'sNothingWritable';
   arm(id);
   age(id, { wall: 13 * HOUR });
-  mkdirSync(join(flagDir(), `${id}.revoked`));
+  const who = `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ''}${process.env.USERNAME}`;
+  const deny = spawnSync('icacls', [flagDir(), '/deny', `${who}:(WD,AD)`], { encoding: 'utf8' });
+  assert.equal(deny.status, 0, `could not set up the deny ACE: ${deny.stdout} ${deny.stderr}`);
   const lock = holdOpen(join(flagDir(), `${id}.request`), 'Read');
   try {
     await lock.held;
+    assert.throws(() => writeFileSync(join(flagDir(), 'probe.txt'), 'x'), 'the directory really refuses new files');
     const { out } = stop({ session_id: id });
     assert.doesNotMatch(out, /would start PC shutdown/);
     assert.match(out, /could not be changed/);
@@ -875,28 +868,13 @@ test('when consent cannot be voided at all, the aged arm is KEPT and every path 
     assert.ok(exists(id, 'json'), 'and still kept after status and toggle on');
   } finally {
     await lock.release();
+    spawnSync('icacls', [flagDir(), '/remove:d', who], { encoding: 'utf8' });
   }
 });
 
 // ---------------------------------------------------------------------------
 // Round-4 review cases.
 // ---------------------------------------------------------------------------
-test('a full revocation list never evicts the token being revoked', () => {
-  // The token being revoked can already sit at the FRONT of a full list (revoked once before).
-  // Truncation drops the oldest, so it was evicted - un-revoked - by the call that reported it
-  // revoked, and a request a lock had kept on disk came back to life.
-  const id = 'sRevokeFull';
-  assert.equal(toggle('toggle request-on', id).code, 0);
-  const T = createHash('sha256').update(readFileSync(join(flagDir(), `${id}.request`))).digest('hex').slice(0, 32);
-  const others = Array.from({ length: 31 }, (_, i) => `old${i}`);
-  writeFileSync(join(flagDir(), `${id}.revoked`), `${[T, ...others].join('\n')}\n`);
-  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 1, req: 'a'.repeat(32) }));
-  toggle('toggle off', id);                                    // revokes the arm's token AND T
-  const list = readFileSync(join(flagDir(), `${id}.revoked`), 'utf8').split('\n').filter(Boolean);
-  assert.ok(list.includes(T), 'the request token is still revoked');
-  assert.ok(list.includes('a'.repeat(32)), 'and so is the arm token');
-  assert.ok(list.length <= 32);
-});
 
 test('the fire path consumes a LOCKED arm by revocation, so it cannot fire again later', onWindows, async () => {
   // The old consume threw on a locked arm before deleting anything: no fire now, and the surviving
@@ -914,20 +892,6 @@ test('the fire path consumes a LOCKED arm by revocation, so it cannot fire again
   assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
 });
 
-test('an unreadable revocation list cannot make a NEWER request look like an aged arm\'s own', () => {
-  const id = 'sAgedNewerUnreadable';
-  arm(id);
-  age(id, { wall: 13 * HOUR });
-  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
-  toggle('toggle request-off', id);
-  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);
-  toggle('toggle request-on', id);                            // newer consent
-  mkdirSync(join(flagDir(), `${id}.revoked`));                 // and the list becomes unreadable
-  toggle('toggle status', id);
-  assert.ok(exists(id, 'request'), 'the newer request is not revoked or deleted with the aged arm');
-  assert.ok(!exists(id, 'json'), 'the aged arm goes');
-});
-
 test('an unusable arm that names an OLDER request leaves a newer request alone', () => {
   const id = 'sBadArmNewerReq';
   assert.equal(toggle('toggle request-on', id).code, 0);       // newer consent
@@ -937,22 +901,6 @@ test('an unusable arm that names an OLDER request leaves a newer request alone',
   assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m, 'the newer request still authorises an arm');
 });
 
-test('request-on that cannot clear an unreadable revocation list says NOT usable', onWindows, async () => {
-  const id = 'sRequestUnusable';
-  const dir = join(flagDir(), `${id}.revoked`);
-  mkdirSync(dir);                                              // unreadable as a list...
-  writeFileSync(join(dir, 'held'), 'x');
-  const lock = holdOpen(join(dir, 'held'), 'None');            // ...and undeletable
-  let r;
-  try {
-    await lock.held;
-    r = toggle('toggle request-on', id);
-  } finally {
-    await lock.release();
-  }
-  assert.notEqual(r.code, 0, 'never a success-shaped message for a request that cannot be armed');
-  assert.match(r.err, /NOT usable/);
-});
 
 test('toggle off whose `shutdown -a` fails does NOT say disarmed', () => {
   // A countdown may be running. SystemRoot points the engine's shutdown.exe at a missing file.
@@ -985,4 +933,48 @@ test('status reports a stale machine switch as off, the way the hook reads it', 
   const old = Date.now() / 1000 - 13 * 3600;
   utimesSync(f, old, old);
   assert.match(toggle('toggle status', 'sStatusStaleMachine').out, /Machine-wide switch: off\./);
+});
+
+test('an arm whose request is gone/unreadable AND which cannot be deleted is revoked, so it never fires later', onWindows, async () => {
+  // The token-mismatch path used to delete the arm, best effort, and say "disarmed". With the
+  // request locked against reading and the arm locked against deletion, both survived; once the
+  // locks cleared they matched again and fired at some later, unrelated turn end.
+  const id = 'sMismatchLocked';
+  arm(id);
+  const reqLock = holdOpen(join(flagDir(), `${id}.request`), 'None');
+  const armLock = holdOpen(join(flagDir(), `${id}.json`), 'Read');
+  try {
+    await reqLock.held;
+    await armLock.held;
+    const { out } = stop({ session_id: id });
+    assert.doesNotMatch(out, /would start PC shutdown/);
+    assert.match(out, /now disarmed/, 'disarmed is said only once it is proven (revoked)');
+  } finally {
+    await armLock.release();
+    await reqLock.release();
+  }
+  assert.ok(exists(id, 'json') && exists(id, 'request'), 'both files survived the locks');
+  assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/, 'and still never fire');
+  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'nor can the request be re-armed');
+});
+
+test('request-on clears only THIS chat\'s revocation markers', () => {
+  const a = 'sClr';
+  const b = 'sClr.b';                                          // an id that starts with the first
+  for (const id of [a, b]) { arm(id); toggle('toggle off', id); }
+  const markers = (id) => readdirSync(flagDir()).filter((n) => new RegExp(`^${id.replace(/\./g, '\\.')}\\.[0-9a-f]{32}\\.revoked$`).test(n));
+  assert.ok(markers(a).length > 0 && markers(b).length > 0, 'both chats have revocation markers');
+  assert.equal(toggle('toggle request-on', a).code, 0);
+  assert.equal(markers(a).length, 0, 'the obsolete markers of this chat are cleared');
+  assert.ok(markers(b).length > 0, 'the other chat keeps its markers');
+});
+
+test('a hand-written arm token never becomes part of a path', () => {
+  // `req` comes from a file. Revocation names a marker after a token, so only real tokens may.
+  const id = 'sEvilToken';
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 0, req: '../../evil', armedAt: Date.now(), armedUp: upNow() }));
+  assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
+  assert.ok(!readdirSync(HOME).some((n) => n.includes('evil')), 'nothing written outside the flag directory');
+  assert.ok(!readdirSync(flagDir()).some((n) => n.includes('evil')), 'nor inside it');
 });

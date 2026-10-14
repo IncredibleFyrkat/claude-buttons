@@ -14,7 +14,7 @@
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
 import {
-  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, lstatSync, appendFileSync, renameSync,
+  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, lstatSync, readdirSync, appendFileSync, renameSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -157,40 +157,43 @@ const requestToken = (id) => {
 // REVOCATION. Deleting a file is not a reliable way to withdraw consent on Windows: antivirus, an
 // indexer or a backup agent can hold the request open so the delete fails, and the request then
 // looks live again the moment the lock clears - with nothing left on disk to say it is void. So
-// consent is withdrawn by TOKEN first: the void token goes into <session>.revoked, and a request
-// whose token is listed there can never authorise or keep an arm, whether or not its file can be
-// removed. `request-on` writes a fresh nonce, so asking again is never blocked by an old entry.
-const revokedPath = (id) => join(FLAG_DIR, `${id}.revoked`);
-const REVOKED_KEEP = 32;
-// The revoked tokens, or null if the list exists but cannot be read - every request then counts
-// as revoked, because failing to honour consent is the recoverable direction.
-const readRevoked = (id) => {
-  try { return readFileSync(revokedPath(id), 'utf8').split('\n').filter(Boolean); }
-  catch (e) { return e.code === 'ENOENT' ? [] : null; }
+// consent is withdrawn by TOKEN first, and a request whose token is revoked can never authorise
+// or keep an arm, whether or not its file can be removed. `request-on` writes a fresh nonce, so
+// asking again is never blocked by an old revocation.
+//
+// One marker FILE per revoked token (<session>.<token>.revoked), not a shared list: creating a new
+// file cannot be blocked by a lock some other process holds on an existing one, so a revocation
+// never has to rewrite a path anyone else may be holding. Only a directory that refuses new files
+// altogether can stop it.
+//
+// Tokens are 32 lowercase hex (requestToken). Anything else - a hand-written arm's `req` - can
+// never equal a request token, so it is void by construction and never becomes part of a path.
+const TOKEN_RE = /^[0-9a-f]{32}$/;
+const revokedMarker = (id, tok) => join(FLAG_DIR, `${id}.${tok}.revoked`);
+// PROOF of revocation: the marker exists. Used where "revoked" must be shown, not assumed.
+const markerProven = (id, tok) => { try { lstatSync(revokedMarker(id, tok)); return true; } catch { return false; } };
+// For HONOURING consent: anything but a clean "no such marker" counts as revoked, because failing
+// to honour consent is the recoverable direction.
+const isRevoked = (id, tok) => {
+  try { lstatSync(revokedMarker(id, tok)); return true; } catch (e) { return e.code !== 'ENOENT'; }
 };
-// True only if every given token is now provably on the revoked list (writeFlagAtomic reads back).
+// True only if every given token is now provably void (its marker exists, written and read back,
+// or it cannot be a request token at all). False if none was given.
 const revokeTokens = (id, tokens) => {
-  const add = tokens.filter((t) => typeof t === 'string' && t.length > 0);
-  if (add.length === 0) return false;
-  const have = readRevoked(id);
-  if (have === null) return false;
-  // The tokens being revoked go LAST, even when already listed: truncation drops the OLDEST, and
-  // one already near the front would otherwise be evicted - un-revoked - by the very call that
-  // reports it revoked.
-  const addSet = new Set(add);
-  const all = [...have.filter((t) => !addSet.has(t)), ...addSet].slice(-REVOKED_KEEP);
-  if (![...addSet].every((t) => all.includes(t))) return false;
-  try {
-    mkdirSync(FLAG_DIR, { recursive: true });
-    return writeFlagAtomic(revokedPath(id), `${all.join('\n')}\n`);
-  } catch { return false; }
+  const given = tokens.filter((t) => typeof t === 'string');
+  if (given.length === 0) return false;
+  let ok = true;
+  for (const t of given) {
+    if (!TOKEN_RE.test(t) || markerProven(id, t)) continue;
+    try { mkdirSync(FLAG_DIR, { recursive: true }); } catch {}
+    if (!writeFlagAtomic(revokedMarker(id, t), 'revoked\n')) ok = false;
+  }
+  return ok;
 };
 // The token of the request on disk, if it is readable AND not revoked; else null.
 const liveRequestToken = (id) => {
   const t = requestToken(id);
-  if (t === null) return null;
-  const revoked = readRevoked(id);
-  return revoked !== null && !revoked.includes(t) ? t : null;
+  return t !== null && !isRevoked(id, t) ? t : null;
 };
 // True only if the path is provably absent afterwards. A failed delete, or a probe that fails for
 // any reason other than "does not exist" (access denied, a filter driver), counts as STILL THERE.
@@ -216,8 +219,7 @@ const withdrawConsent = (id, armToken) => {
 // button (which mirrors *.request) stops showing it. Never touches a live request.
 const dropRevokedRequest = (id) => {
   const t = requestToken(id);
-  const revoked = readRevoked(id);
-  if (t !== null && revoked !== null && revoked.includes(t)) removeVerified(requestPath(id));
+  if (t !== null && markerProven(id, t)) removeVerified(requestPath(id));
 };
 // The flag's recorded token matches a request that is STILL on disk right now and not revoked.
 // Fails closed on every unknown: no request, unreadable request, a revoked request, no token in
@@ -504,19 +506,21 @@ if (mode === 'toggle') {
       );
       process.exit(1);
     }
-    // The new request overwrote the old one, so every revoked token now names a request that no
-    // longer exists. Clear the list (best effort): it also un-sticks a list that became unreadable,
-    // which would otherwise refuse every request. Only AFTER a verified write - if the write had
-    // failed, the old request would still be on disk and its revocation must stand.
-    removeVerified(revokedPath(id));
-    // Recorded is not enough: it must be USABLE. A revocation list that could neither be read nor
-    // removed makes every request count as revoked, and "recorded" would then be a promise that
-    // `toggle on` refuses to keep.
+    // The new request overwrote the old one, so this chat's revocation markers now name requests
+    // that no longer exist: clear them (best effort) so they do not pile up. Only AFTER a verified
+    // write - had it failed, the old request would still be on disk and its revocation must stand.
+    // Matched exactly, so a session whose id merely starts with this one's keeps its markers.
+    try {
+      const mine = new RegExp(`^${id.replace(/\./g, '\\.')}\\.[0-9a-f]{32}\\.revoked$`);
+      for (const n of readdirSync(FLAG_DIR)) if (mine.test(n)) removeVerified(join(FLAG_DIR, n));
+    } catch {}
+    // Recorded is not enough: it must be USABLE. If its token's marker cannot be probed cleanly,
+    // the request counts as revoked, and "recorded" would be a promise `toggle on` refuses to keep.
     const expected = createHash('sha256').update(reqBytes).digest('hex').slice(0, 32);
     if (liveRequestToken(id) !== expected) {
-      logLine(`REQUEST for session ${id} recorded but NOT usable: revocation list could not be cleared`);
+      logLine(`REQUEST for session ${id} recorded but NOT usable: its revocation state could not be read`);
       console.error(
-        'NOT usable: the standing shutdown request was written, but the revocation list beside it could not be read or cleared, ' +
+        'NOT usable: the standing shutdown request was written, but its revocation state could not be read, ' +
           'so this chat still cannot be armed. Something is holding files in ~/.claude/shutdown-on-done (antivirus, a backup agent?) - try again.',
       );
       process.exit(1);
@@ -584,7 +588,9 @@ if (mode === 'toggle') {
       : existsSync(flagPath(id)) ? 'Not armed for this chat (a leftover arm has no live request; it will not fire).'
       : 'Not armed for this chat.';
     // ACTIVE only for a request that can actually authorise an arm: the skill re-arms on ACTIVE.
-    const req = liveRequestToken(id) !== null ? 'Standing request: ACTIVE.'
+    const req = aged && !aged.superseded && !aged.voided
+      ? 'Standing request: EXPIRED (its files could not be changed; it will not be honoured).'
+      : liveRequestToken(id) !== null ? 'Standing request: ACTIVE.'
       : existsSync(requestPath(id)) ? 'Standing request: EXPIRED (withdrawn, expired or unreadable; it will not be honoured).'
       : 'Standing request: none.';
     // machineArmedFresh: a stale switch is ignored (and cleared) by the hook, so it is not ARMED.
@@ -697,17 +703,27 @@ if (ageProblem) {
 // a dead arm quietly persists to detonate later. Every run either confirms live consent or
 // disarms.
 if (!requestStillLive(parsed, id)) {
-  // Only the ARM is dropped. The request marker is deliberately left alone: if the mismatch is
+  // Only the ARM is dropped. The request file is deliberately left alone: if the mismatch is
   // because the user has since made a NEW standing request, deleting it would withdraw consent
-  // they just gave and darken the panel's power button, which mirrors *.request. Removing the
-  // arm is what makes this state safe; removing the request would only make the UI lie again,
-  // in the other direction.
-  try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
-  logLine(`arm flag for session ${id} has no live standing request; disarmed WITHOUT shutting down`);
+  // they just gave and darken the panel's power button, which mirrors *.request.
+  //
+  // The arm's own token is REVOKED before the arm is deleted. Deleting alone is not enough: the
+  // request may be only temporarily unreadable (a lock without read sharing) while the arm is held
+  // against deletion - both survive, and once the locks clear they match again and fire at some
+  // later, unrelated turn end. Revoking the arm's token can never touch a newer request (that has
+  // its own nonce); it voids only the request this arm was granted under, which is either gone
+  // already or no longer to be honoured by this arm. "Disarmed" is said only once that is proven.
+  const armTok = typeof parsed.req === 'string' ? parsed.req : undefined;
+  const revoked = armTok !== undefined && revokeTokens(id, [armTok]);
+  const armGone = removeVerified(flagPath(id));
+  const armSafe = armGone || revoked || armTok === undefined || !TOKEN_RE.test(armTok);
+  logLine(`arm flag for session ${id} has no live standing request; ${armSafe ? 'disarmed' : 'could NOT be disarmed'} WITHOUT shutting down`);
   emit({
-    systemMessage:
-      'Shutdown-on-done: this chat was armed, but the standing shutdown request that authorised it is gone ' +
-      '(or belongs to a later request), so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
+    systemMessage: armSafe
+      ? 'Shutdown-on-done: this chat was armed, but the standing shutdown request that authorised it is gone ' +
+        '(or belongs to a later request), so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.'
+      : 'Shutdown-on-done: this chat was armed without a live standing request, so the PC was NOT shut down - but its arm ' +
+        'could not be removed or revoked (something is holding files in ~/.claude/shutdown-on-done). Run `/shutdown-on-done off`.',
   });
   process.exit(0);
 }
