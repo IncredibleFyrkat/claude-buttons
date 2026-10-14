@@ -186,10 +186,19 @@ const revokeTokens = (id, tokens) => {
   }
   return ok;
 };
-// The token of the request on disk, if it is readable AND not revoked; else null.
+// THE SESSION HOLD (<session>.withdrawn): for a withdrawal that cannot name a token - the request
+// is unreadable right now, so its token is unknown, and it cannot be removed either. While the hold
+// exists EVERY request on disk for this chat is void; only a verified fresh `request-on` clears it.
+// Written only when a withdrawal cannot otherwise be proven, so it is rare.
+const holdPath = (id) => join(FLAG_DIR, `${id}.withdrawn`);
+const isHeld = (id) => {
+  try { lstatSync(holdPath(id)); return true; } catch (e) { return e.code !== 'ENOENT'; }
+};
+const holdProven = (id) => { try { lstatSync(holdPath(id)); return true; } catch { return false; } };
+// The token of the request on disk, if it is readable, not held and not revoked; else null.
 const liveRequestToken = (id) => {
   const t = requestToken(id);
-  return t !== null && !isRevoked(id, t) ? t : null;
+  return t !== null && !isHeld(id) && !isRevoked(id, t) ? t : null;
 };
 // True only if the path is provably absent afterwards. A failed delete, or a probe that fails for
 // any reason other than "does not exist" (access denied, a filter driver), counts as STILL THERE.
@@ -211,7 +220,16 @@ const withdrawConsent = (id, armToken, extraTokens = []) => {
   const voidTok = (t) => typeof t === 'string' && (!TOKEN_RE.test(t) || markerProven(id, t));
   const requestGone = removeVerified(requestPath(id));
   const armGone = removeVerified(flagPath(id));
-  const requestVoid = requestGone || (reqTok !== null && voidTok(reqTok));
+  let requestVoid = requestGone || (reqTok !== null && voidTok(reqTok));
+  if (!requestVoid) {
+    // The request survives and its token could not be revoked (unknown, or the marker would not
+    // write): hold the whole chat instead, so it is void whatever its token turns out to be.
+    if (!holdProven(id)) {
+      try { mkdirSync(FLAG_DIR, { recursive: true }); } catch {}
+      writeFlagAtomic(holdPath(id), 'withdrawn\n');
+    }
+    requestVoid = holdProven(id);
+  }
   return { requestVoid, armSafe: armGone || voidTok(armToken) || requestVoid };
 };
 // A revoked request left behind by a lock is removed whenever it can be, so the panel's power
@@ -528,6 +546,8 @@ if (mode === 'toggle') {
       const mine = new RegExp(`^${id.replace(/\./g, '\\.')}\\.[0-9a-f]{32}\\.revoked$`);
       for (const n of readdirSync(FLAG_DIR)) if (mine.test(n)) removeVerified(join(FLAG_DIR, n));
     } catch {}
+    // ...and the session hold: this verified new request is the fresh consent it was waiting for.
+    removeVerified(holdPath(id));
     // Recorded is not enough: it must be USABLE. If its token's marker cannot be probed cleanly,
     // the request counts as revoked, and "recorded" would be a promise `toggle on` refuses to keep.
     const expected = createHash('sha256').update(reqBytes).digest('hex').slice(0, 32);
@@ -677,12 +697,17 @@ if (skip === null) {
   // consent (request-on writes a fresh nonce), so only the bad arm goes.
   const badTok = typeof parsed?.req === 'string' ? parsed.req : undefined;
   const onDisk = requestToken(id);
-  if (badTok !== undefined && onDisk !== null && onDisk !== badTok) removeVerified(flagPath(id));
-  else withdrawConsent(id, badTok);
-  logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
+  // A different, readable request is newer consent and the bad arm cannot match it, so removing
+  // the arm is all that is needed and it is safe even if the removal fails.
+  const safe = badTok !== undefined && onDisk !== null && onDisk !== badTok
+    ? (removeVerified(flagPath(id)), true)
+    : withdrawConsent(id, badTok).armSafe;
+  logLine(`flag unreadable/invalid for session ${id}; ${safe ? 'disarmed' : 'could NOT be disarmed'} WITHOUT shutting down`);
   emit({
-    systemMessage:
-      'Shutdown-on-done: the arm flag was unreadable, so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
+    systemMessage: safe
+      ? 'Shutdown-on-done: the arm flag was unreadable, so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.'
+      : 'Shutdown-on-done: the arm flag was unreadable, so the PC was NOT shut down - but the arm could not be removed or revoked, ' +
+        'so it may STILL shut the PC down once it can be read. Something is holding files in ~/.claude/shutdown-on-done; run `/shutdown-on-done off`.',
   });
   process.exit(0);
 }

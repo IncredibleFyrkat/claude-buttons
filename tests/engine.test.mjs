@@ -808,7 +808,9 @@ for (const verb of ['toggle off', 'toggle request-off']) {
     assert.match(toggle('toggle status', id).out, /Standing request: none\./);
   });
 
-  test(`${verb} with the request LOCKED (share None) says it is NOT fully cleared`, onWindows, async () => {
+  test(`${verb} with the request LOCKED (share None) still voids it, through the session hold`, onWindows, async () => {
+    // Its token cannot be read and it cannot be removed, so it cannot be revoked by token: the
+    // chat is HELD instead (every request on disk void until a fresh request-on), which is proof.
     const id = `sLockedOffNone-${verb.split(' ')[1]}`;
     arm(id);
     const lock = holdOpen(join(flagDir(), `${id}.request`), 'None');
@@ -819,10 +821,10 @@ for (const verb of ['toggle off', 'toggle request-off']) {
     } finally {
       await lock.release();
     }
-    // Its token cannot be read, so it cannot be proven void: the disarm must not look successful.
-    assert.notEqual(r.code, 0);
-    assert.match(r.err, /NOT fully cleared/);
-    // The arm was revoked by its own token, which is this request's: once readable it is void.
+    assert.equal(r.code, 0, `the withdrawal is proven by the hold: ${r.err}`);
+    assert.ok(exists(id, 'withdrawn'), 'the chat is held');
+    assert.ok(exists(id, 'request'), 'the request did survive the lock');
+    assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
     assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m);
     assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
   });
@@ -1042,3 +1044,72 @@ test('toggle off with the ARM locked unreadable still disarms: the void request 
   assert.ok(exists(id, 'json'), 'the arm file did survive the lock');
   assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
 });
+
+// Round-7 review: the arm AND its request both held unreadable (share None). The unreadable-flag
+// path can learn neither token, so nothing can be revoked by token and neither file removed. It
+// used to say "disarmed" anyway; once the locks cleared both files matched and fired.
+test('arm and request both locked unreadable: the chat is held, so nothing fires once they clear', onWindows, async () => {
+  const id = 'sBothUnreadable';
+  arm(id);
+  const a = holdOpen(join(flagDir(), `${id}.json`), 'None');
+  const b = holdOpen(join(flagDir(), `${id}.request`), 'None');
+  let out;
+  try {
+    await a.held; await b.held;
+    out = stop({ session_id: id }).out;
+  } finally {
+    await a.release(); await b.release();
+  }
+  assert.match(out, /now disarmed/, 'proven by the session hold');
+  assert.ok(exists(id, 'json') && exists(id, 'request'), 'both files survived the locks');
+  neverFires(id);
+  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'no arm under a held chat');
+  // Asking again is the way out: a verified fresh request clears the hold.
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  assert.ok(!exists(id, 'withdrawn'), 'the hold is cleared by the fresh request');
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m);
+  assert.match(stop({ session_id: id }).out, /would start PC shutdown/);
+});
+
+test('...and when even the hold cannot be written, it says so instead of "disarmed"', onWindows, async () => {
+  const id = 'sBothUnreadableNoHold';
+  arm(id);
+  const who = `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ''}${process.env.USERNAME}`;
+  const a = holdOpen(join(flagDir(), `${id}.json`), 'None');
+  const b = holdOpen(join(flagDir(), `${id}.request`), 'None');
+  let out;
+  try {
+    await a.held; await b.held;
+    const deny = spawnSync('icacls', [flagDir(), '/deny', `${who}:(WD,AD)`], { encoding: 'utf8' });
+    assert.equal(deny.status, 0, `could not set up the deny ACE: ${deny.stdout} ${deny.stderr}`);
+    out = stop({ session_id: id }).out;
+  } finally {
+    spawnSync('icacls', [flagDir(), '/remove:d', who], { encoding: 'utf8' });
+    await a.release(); await b.release();
+  }
+  assert.doesNotMatch(out, /now disarmed/, 'never a success-shaped message for an arm that may still fire');
+  assert.match(out, /may STILL/);
+});
+
+for (const verb of ['toggle off', 'toggle request-off']) {
+  test(`${verb} that cannot prove the withdrawal at all says NOT fully cleared and exits 1`, onWindows, async () => {
+    // Request unreadable and undeletable, and the directory refuses new files: no marker, no hold.
+    const id = `sOffUnprovable-${verb.split(' ')[1]}`;
+    arm(id);
+    const who = `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ''}${process.env.USERNAME}`;
+    const lock = holdOpen(join(flagDir(), `${id}.request`), 'None');
+    let r;
+    try {
+      await lock.held;
+      const deny = spawnSync('icacls', [flagDir(), '/deny', `${who}:(WD,AD)`], { encoding: 'utf8' });
+      assert.equal(deny.status, 0, `could not set up the deny ACE: ${deny.stdout} ${deny.stderr}`);
+      r = toggle(verb, id);
+    } finally {
+      spawnSync('icacls', [flagDir(), '/remove:d', who], { encoding: 'utf8' });
+      await lock.release();
+    }
+    assert.notEqual(r.code, 0);
+    assert.match(r.err, /NOT fully cleared/);
+  });
+}
