@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.11.1 — 2026-10-14
+
+**Every strip vanished after a Claude update.** Reported from a second machine by another
+Claude session working for the same user, with the diagnosis already done: the app now exposes
+the chat composer as an **Edit** control instead of a **Group** — same accessible name
+(`Prompt`), different role. The panel's lookup AND-ed `ControlType = Group` into its query, so
+it matched nothing, found no composer to dock to, and hid every strip. Reproduced here before
+anything was changed: one element named `Prompt`, an Edit; the old condition matched 0.
+
+It was silent. The log said `BOUNDS measured=0/1 rects=0 rooms=/` once a minute — **66,705
+times** on this machine — and never why.
+
+- The composer is now found by **name**, and its control type is filtered afterwards against a
+  new knob, `uiaComposerType` (default `"Group,Edit"`, comma-separated; `"*"` accepts any type).
+  The type is now self-healable from `buttons.json` the same way the name already was, so the
+  next change of role does not have to wait for a release. A blank value, or one that parses to
+  nothing, falls back to the default — never to "any", which a typo should not switch on.
+- When the composer is found under its name but rejected for its type, the log now **says so**,
+  names the type it saw, and points at the knob. Once per distinct type, not every tick.
+- **Finding the composer was not enough.** With only the type fixed, the strips were seen once
+  and then hid again. The Edit spans only the text line, which starts *after* the "+" button
+  that now sits inside the input box; the control row below starts at the box edge. The row
+  search was keyed to the composer element's own left edge, so it rejected every row button
+  (measured: Edit at x=1696, "+" at 1640, the row's first control at 1643, tolerance 12 px),
+  found no row to anchor to, and treated that as a dialog covering the chat. The box edge is now
+  derived from the buttons inside the box on the composer's own line - and it does not depend on
+  that "+" being in the tree, since one read without it would have hidden the strips again. The
+  search is bounded by the composer's own pane (on both axes, so a staggered grid cannot lend it
+  another row's edge) and by any composer beside it, so a neighbour's controls cannot anchor it.
+  A Group composer IS the box, so for the old layout nothing changes.
+- Editing `uiaComposerName` or `uiaComposerType` in `buttons.json` now takes effect on the next
+  config reload instead of the next restart. Without that, following the new log line's advice
+  did nothing until the panel was restarted. Found by both reviewers.
+- The composer height floor drops from 20 to 12 px. The new Edit is a single line: 34 px here,
+  23 px on the reporting machine — close enough to 20 that a lower monitor scale would have hid
+  the strips again somewhere else. Width ≥ 200 remains the real guard against stray nodes.
+- `uiaComposerType` ships in `buttons.default.json` and is in both READMEs' troubleshooting
+  sections as the second knob to try after `uiaComposerName`.
+
+Tests: 543 panel (60 new), 105 installer, engine — all passing. Every new guard was mutation-
+checked and fails the suite when reverted: the `Group`-only query, `Edit` missing from the code or
+shipped default, the knob missing from `buttons.default.json`, an allow-all filter, blank meaning
+"any", a height floor past 23, the row anchor keyed to the element again or depending on the "+",
+the pane bound or neighbour bound removed, the knobs read only at startup, the warning marked
+sent before its write. A no-op control change passes.
+
+**Known limit:** this fixes the change we have seen. If the app renames the composer *and*
+changes its role at once, both knobs need setting, and the log line above only helps with the
+second.
+
 ## 1.11.0 — 2026-07-20
 
 **Your clipboard could end up in a chat.** Reported by

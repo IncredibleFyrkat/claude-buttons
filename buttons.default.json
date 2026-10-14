@@ -4,6 +4,7 @@
     "targetTitle": "Claude",
     "targetProcess": "claude",
     "uiaComposerName": "Prompt",
+    "uiaComposerType": "Group,Edit",
     "uiaPaneMatch": " pane$",
     "zoneTop": 45,
     "zoneBottom": 55,

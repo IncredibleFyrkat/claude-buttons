@@ -169,6 +169,7 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `targetProcess` | `"claude"` | Process name that must own the window. |
 | `uiaPaneMatch` | `" pane$"` | Regex; every Group whose accessibility name matches is treated as a chat pane (matches `Primary pane`, `Secondary pane`…). |
 | `uiaComposerName` | `"Prompt"` | Accessibility name of the chat composer the strip docks to. **This is the knob to try first if a Claude update breaks the strip** — docking matches this name. |
+| `uiaComposerType` | `"Group,Edit"` | Control types the composer may be exposed as, comma-separated. The app changed it from a Group to an Edit in October 2026, which hid every strip until this became a knob. `"*"` accepts any type. **Second knob to try** if the strip vanishes after an update. |
 | `zoneTop` / `zoneBottom` | `45` / `55` | Logical-px zones where the chat title tab / bottom button row live. |
 | `fallbackRow` | `33` | Strip center above the window bottom when the button row can't be measured. |
 | `stripGap` | `10` | Gap (px) between the app's own buttons and the strip. |
@@ -206,7 +207,7 @@ Per-button fields:
 
 ## Troubleshooting
 
-- **Strip sits slightly off, or vanishes, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json`. **Start with `uiaComposerName`** (default `"Prompt"`): the strip docks by matching the composer's accessibility name, so a rename there is the most likely breakage and hides every strip. Then `uiaPaneMatch` (split/grid panes), then the geometry values `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `vNudge`, `reservedW`. Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
+- **Strip sits slightly off, or vanishes, after a Claude app update** → the app's UI names/layout changed. Check `%LOCALAPPDATA%\claude-buttons.log`, then adjust the app-dependent values in `buttons.json`. **Start with `uiaComposerName`** (default `"Prompt"`): the strip docks by matching the composer's accessibility name, so a rename there is the most likely breakage and hides every strip. If the name is still right, check `uiaComposerType`: the app has changed the composer's control *type* before (Group → Edit), which breaks docking just as completely. Then `uiaPaneMatch` (split/grid panes), then the geometry values `zoneTop`, `zoneBottom`, `fallbackRow`, `stripGap`, `vNudge`, `reservedW`. Asking Claude to "probe the app's UIA tree and update these" is the quickest fix.
 - **App not in English?** Accessibility names like `Prompt` and `… pane` may be localized — set `uiaComposerName` and `uiaPaneMatch` to the localized names in `buttons.json`.
 - **`/pin` says unknown command, or does nothing** → restart the Claude app once so the skill loads; the skill writes to the file named in `%USERPROFILE%\.claude\claude-buttons-path.txt`.
 - **Nothing appears** → the strip only shows when the Claude window is the foreground window.

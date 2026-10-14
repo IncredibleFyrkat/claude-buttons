@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.0'
+$CB_VERSION = '1.11.1'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -816,12 +816,21 @@ function SW([double]$v) { [int][Math]::Round($v * $script:winScale) }    # posit
 $script:logPath = Join-Path $env:LOCALAPPDATA 'claude-buttons.log'
 $script:lastLogMsg = ''
 $script:lastLogAt = Get-Date '2000-01-01'
-function Write-CkLog([string]$msg) {
+# -PassThru returns $true only when the line actually reached the file. It is opt-in because a
+# PowerShell function's return value goes to the pipeline: the hundreds of existing callers use
+# Write-CkLog as a statement, and a bare $true from every one of them would leak into the return
+# value of whatever function they sit in. -ErrorAction Stop turns a failed write into something
+# the catch can see - without it Add-Content's error is non-terminating and the try never knew.
+function Write-CkLog([string]$msg, [switch]$PassThru) {
     try {
-        if ($script:lastLogMsg -eq $msg -and ((Get-Date) - $script:lastLogAt).TotalSeconds -lt 60) { return }
+        if ($script:lastLogMsg -eq $msg -and ((Get-Date) - $script:lastLogAt).TotalSeconds -lt 60) {
+            if ($PassThru) { return $false }
+            return
+        }
+        Add-Content -Path $script:logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8 -ErrorAction Stop
         $script:lastLogMsg = $msg; $script:lastLogAt = Get-Date
-        Add-Content -Path $script:logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8
-    } catch {}
+        if ($PassThru) { return $true }
+    } catch { if ($PassThru) { return $false } }
 }
 
 # ---------- Config ----------
@@ -998,8 +1007,52 @@ $script:uiaPaneMatch = ' pane$'
 if ($script:config.uiaPaneMatch) { $script:uiaPaneMatch = [string]$script:config.uiaPaneMatch }
 # Accessible name of the chat composer. Overridable like every other app-dependent name, so a
 # rename or localization on Claude's side can be self-healed from buttons.json.
-$script:uiaComposerName = 'Prompt'
-if ($script:config.uiaComposerName) { $script:uiaComposerName = [string]$script:config.uiaComposerName }
+# (Applied by Set-ComposerConfig below, at startup AND on every config reload.)
+# Control types the composer may be exposed as. The app shipped it as a Group until October 2026,
+# then as an Edit - same accessible name, different role. A hardcoded Group matched nothing, so
+# Get-Composers returned 0, every strip hid itself, and the only symptom was the log repeating
+# "measured=0" (66705 times on this machine before anyone noticed). The type is therefore a knob
+# like the name - uiaComposerType in buttons.json, a comma-separated list - so the next such
+# change can be self-healed from the config rather than waiting for a release. '*' accepts any
+# type and relies on the name plus the geometry filter alone: the escape hatch if the app moves to
+# a third role. Missing, blank, or a list that parses to nothing (", ,") falls back to the default
+# - never to "any", which a typo should not be able to switch on.
+function ConvertTo-ComposerTypes([string]$raw) {
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @('Group', 'Edit') }
+    if ($raw.Trim() -eq '*') { return @() }
+    $list = @($raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($list.Count -eq 0) { return @('Group', 'Edit') }
+    return $list
+}
+# Empty $allowed means "any type". The comparison is case-insensitive on purpose: a config that
+# says "edit" means Edit. ProgrammaticName is "ControlType.Edit", so strip the prefix first.
+function Test-ComposerTypeAllowed([string]$programmaticName, $allowed) {
+    $set = @($allowed)
+    if ($set.Count -eq 0) { return $true }
+    $t = $programmaticName -replace '^ControlType\.', ''
+    return ($set -contains $t)
+}
+# Derives the composer lookup from the config. Called at startup and again whenever buttons.json
+# is reloaded: both knobs exist so a broken dock can be self-healed by editing the file, and the
+# log line in Get-Composers tells the user to do exactly that - a value read only at startup
+# would make that advice a lie until the panel was restarted. Returns $true when anything changed,
+# so the caller can re-arm the warning and force a fresh UIA pass instead of waiting out the
+# stability backoff.
+function Set-ComposerConfig($cfg) {
+    $name = 'Prompt'
+    if ($cfg -and $cfg.uiaComposerName) { $name = [string]$cfg.uiaComposerName }
+    $rawType = ''
+    if ($cfg -and $cfg.uiaComposerType) { $rawType = [string]$cfg.uiaComposerType }
+    $types = @(ConvertTo-ComposerTypes $rawType)
+    $changed = ($name -cne [string]$script:uiaComposerName) -or
+               ((@($types) -join ',') -cne (@($script:uiaComposerTypes) -join ',')) -or
+               ($null -eq $script:uiaComposerTypes)
+    $script:uiaComposerName = $name
+    $script:uiaComposerTypes = $types
+    return [bool]$changed
+}
+$script:uiaComposerName = $null; $script:uiaComposerTypes = $null
+[void](Set-ComposerConfig $script:config)
 # Side-strip button size, in logical px, scaled for the monitor like everything else.
 # The control row is 27 to match the app's own bottom-bar buttons. The side strips sat at the
 # same 27, which reads as too big beside the app's smaller in-chat icons (measured: mostly 20x20,
@@ -2047,6 +2100,77 @@ function Enable-WebA11y {
 
 # The chat composers: keyboard-focusable Groups named "Prompt", one per pane. Their positions
 # ARE the pane layout (works for any split/grid), and each is the focus target for sending.
+# Left edge of the composer's visible BOX, given the composer element and the button rects.
+# The composer used to be a Group spanning the whole rounded input box. Since October 2026 it is
+# an Edit spanning only the text line, which starts AFTER the "+" (Add) button inside the box.
+# The control row below starts at the box edge, so a row search keyed to the Edit's own X
+# rejected every row button, Anchored came out false, and every strip hid as if a dialog were
+# open - measured: Edit X=1696, Add X=1640, row's "Bypass permissions" X=1643.
+# So: a button whose centre lies on the composer's OWN line, just left of it, is inside the box,
+# and the leftmost such button is the box edge.
+#
+# Review round 3 found the two ways that alone fails, and both are handled here:
+# - It must not DEPEND on that button. If "+" is missing from one UIA read, or a narrow layout
+#   drops it, the edge would fall back to the Edit's X and the strips would hide again. So an
+#   Edit (any non-Group) composer with no measurable in-box button still searches $maxInset to
+#   its left. A Group composer IS the box, so it keeps its own X - the old behaviour exactly,
+#   which matters on older app builds where that wider search could reach the sidebar.
+# - It must not reach into a NEIGHBOUR. $floor is the composer's own pane edge and the right edge
+#   of any composer beside it on the same row (Get-ComposerFloor); nothing left of it counts.
+function Get-RowSearchLeft($cx, $cy, $ch, $btnRects, $maxInset, $floor, [bool]$isGroup) {
+    # FIRST, before any scan. Round 5: checking this only after the scan let an unrelated
+    # same-line button left of a Group move its edge - so "unchanged" was not actually true.
+    if ($isGroup) { return [double]$cx }
+    $lo = [double]$cx - [double]$maxInset
+    if ($null -ne $floor -and [double]$floor -gt $lo) { $lo = [double]$floor }
+    $left = $null
+    foreach ($r in @($btnRects)) {
+        if ($null -eq $r) { continue }
+        $mid = [double]$r.Y + [double]$r.H / 2
+        if ($mid -ge $cy -and $mid -le ($cy + $ch) -and [double]$r.X -lt $cx -and [double]$r.X -ge $lo) {
+            if ($null -eq $left -or [double]$r.X -lt $left) { $left = [double]$r.X }
+        }
+    }
+    if ($null -ne $left) { return $left }
+    return [double][Math]::Min([double]$cx, $lo)
+}
+
+# Leftmost X the row search may use for composer $c: the left edge of the pane that contains it,
+# raised to the right edge of any composer beside it on the SAME row (vertical spans overlap).
+# Stacked panes do not overlap vertically, so they never limit each other. $null = no bound known.
+# Lower X bound for the control-row filter: 12 px of tolerance left of the search edge, but never
+# past the floor. Round 4: the tolerance alone crossed a hard floor, so a neighbour's control
+# starting within 12 px left of it could anchor this pane's strip.
+function Get-RowFilterLow($left, $floor) {
+    $lowX = [double]$left - 12
+    if ($null -ne $floor -and [double]$floor -gt $lowX) { $lowX = [double]$floor }
+    return $lowX
+}
+
+function Get-ComposerFloor($c, $composers, $paneBounds) {
+    $floor = $null
+    # BOTH axes. Round 4: an X-only test let a pane from another ROW of a staggered 2x2 grid
+    # supply the floor, which then rejected this pane's real row and hid its strip.
+    $midX = [double]$c.X + [double]$c.W / 2
+    $midY = [double]$c.Y + [double]$c.H / 2
+    foreach ($pb in @($paneBounds)) {
+        if ($null -eq $pb) { continue }
+        if ($midX -ge [double]$pb.X -and $midX -le ([double]$pb.X + [double]$pb.W) -and
+            $midY -ge [double]$pb.Y -and $midY -le ([double]$pb.Y + [double]$pb.H)) {
+            if ($null -eq $floor -or [double]$pb.X -gt $floor) { $floor = [double]$pb.X }
+        }
+    }
+    foreach ($o in @($composers)) {
+        if ($null -eq $o -or [object]::ReferenceEquals($o, $c)) { continue }
+        $overlap = ([double]$o.Y -lt ([double]$c.Y + [double]$c.H)) -and (([double]$o.Y + [double]$o.H) -gt [double]$c.Y)
+        $oR = [double]$o.X + [double]$o.W
+        if ($overlap -and $oR -le [double]$c.X) {
+            if ($null -eq $floor -or $oR -gt $floor) { $floor = $oR }
+        }
+    }
+    return $floor
+}
+
 function Get-Composers($root) {
     $out = @()
     try {
@@ -2056,14 +2180,39 @@ function Get-Composers($root) {
         # container rather than an input, so cap at 60% of the window height.
         $maxH = 700
         try { $rb = $root.Current.BoundingRectangle; if ($rb.Height -gt 100) { $maxH = [int]($rb.Height * 0.6) } } catch {}
-        $grpT  = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group)
+        # Query on the NAME alone and filter the control type below, instead of AND-ing a
+        # ControlType condition into the query itself. Two reasons. The type is now configurable,
+        # and OrCondition needs at least two conditions - a single configured type could not build
+        # one. And a query that names the type is a query that returns nothing the day the app
+        # changes it, which is exactly the failure this is fixing.
         $nameC = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $script:uiaComposerName)
-        $cond  = New-Object System.Windows.Automation.AndCondition($grpT, $nameC)
-        $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameC)
+        $rejectedTypes = @()
         foreach ($e in $els) {
+            $ctPn = [string]$e.Current.ControlType.ProgrammaticName
+            if (-not (Test-ComposerTypeAllowed $ctPn $script:uiaComposerTypes)) { $rejectedTypes += ($ctPn -replace '^ControlType\.', ''); continue }
             $b = $e.Current.BoundingRectangle
-            if ($b.Width -lt 200 -or $b.Height -lt 20 -or $b.Height -gt $maxH) { continue }
-            $out += [pscustomobject]@{ El = $e; X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height }
+            # Height floor was 20. The Edit the app now exposes measured 34 here and 23 on a second
+            # machine; at a lower monitor scale that 23 would fall under 20 and hide the strips
+            # again, on someone else's desk, with the same silent symptom. Width >= 200 is the real
+            # guard against decorative nodes, so the floor only has to exclude hairlines.
+            if ($b.Width -lt 200 -or $b.Height -lt 12 -or $b.Height -gt $maxH) { continue }
+            $out += [pscustomobject]@{ El = $e; X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height
+                                       Type = ($ctPn -replace '^ControlType\.', '') }
+        }
+        # Say WHY nothing docked when the cause is knowable. The October 2026 outage logged
+        # "measured=0" tens of thousands of times without a word about the cause, though the
+        # composer was right there under its usual name, merely as a different control type.
+        # Logged once per distinct type set, not every tick, so the log stays readable.
+        if ($out.Count -eq 0 -and $rejectedTypes.Count -gt 0) {
+            $seen = (@($rejectedTypes | Sort-Object -Unique) -join ',')
+            # Marked as warned only once the line is confirmed written: a transient I/O failure
+            # on the first attempt must not silence this diagnostic for the rest of the run.
+            if ($script:composerTypeWarned -ne $seen) {
+                $okLog = Write-CkLog ("COMPOSER '{0}' found as {1}, but uiaComposerType allows only {2} - add the type to uiaComposerType in buttons.json, or set it to '*'" -f `
+                    $script:uiaComposerName, $seen, (@($script:uiaComposerTypes) -join ',')) -PassThru
+                if ($okLog) { $script:composerTypeWarned = $seen }
+            }
         }
     } catch {}
     return @($out)
@@ -2118,14 +2267,23 @@ function Update-UiaInfo {
             # just below the input) so we dock the strip AFTER that left cluster, on that row -
             # exactly where it sat before, but per pane.
             $allBtns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+            $btnRects = @(foreach ($b in $allBtns) {
+                $bb = $b.Cached.BoundingRectangle
+                @{ X = [double]$bb.X; Y = [double]$bb.Y; W = [double]$bb.Width; H = [double]$bb.Height }
+            })
             foreach ($c in $composers) {
                 $cBottom = $c.Y + $c.H
+                # The row starts at the input BOX's edge, which for an Edit composer lies left of
+                # the element itself - see Get-RowSearchLeft and Get-ComposerFloor.
+                $cFloor = Get-ComposerFloor $c $composers $script:paneBounds
+                $boxL = Get-RowSearchLeft $c.X $c.Y $c.H $btnRects (SW 80) $cFloor ($c.Type -eq 'Group')
+                $rowLo = Get-RowFilterLow $boxL $cFloor
                 # Collect the control-row buttons just below this composer (its left half).
                 $rowBtns = @()
                 foreach ($b in $allBtns) {
                     $bb = $b.Cached.BoundingRectangle
                     $bcy = $bb.Y + $bb.Height / 2
-                    if ($bcy -gt $cBottom -and $bcy -lt ($cBottom + (SW 64)) -and $bb.X -ge ($c.X - 12) -and $bb.X -lt ($c.X + $c.W * 0.6)) {
+                    if ($bcy -gt $cBottom -and $bcy -lt ($cBottom + (SW 64)) -and $bb.X -ge $rowLo -and $bb.X -lt ($c.X + $c.W * 0.6)) {
                         $rowBtns += [pscustomobject]@{ X = [double]$bb.X; R = [double]($bb.X + $bb.Width); CY = $bcy }
                     }
                 }
@@ -5248,7 +5406,14 @@ $timer.add_Tick({
         $healing = $script:cfgHealUntil -and ((Get-Date) -lt $script:cfgHealUntil)
         if ($wt -and ($wt -ne $script:cfgTime -or $healing)) {
             $new = Read-FreshConfig
-            if ($new) { $script:config = $new; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true }
+            if ($new) {
+                $script:config = $new; $script:cfgTime = $wt; $script:cfgHealUntil = $null; $dirty = $true
+                # A changed composer name/type takes effect now, not at the next restart.
+                if (Set-ComposerConfig $script:config) {
+                    $script:composerTypeWarned = $null
+                    $script:uiaLast = Get-Date '2000-01-01'; $script:uiaStable = 0
+                }
+            }
         }
         if ($script:cfgHealUntil -and (Get-Date) -ge $script:cfgHealUntil) { $script:cfgHealUntil = $null }  # give up healing
         if (Read-ActiveSession) { $dirty = $true }

@@ -2979,6 +2979,203 @@ Set-WidthFixture '{"buttons":[{"label":"A very long button label indeed","text":
 Check 'the compact (short-label) measurement is narrower than the full one' `
     ((Get-StripWidth $true) -lt (Get-StripWidth $false))
 
+# --- Composer control type (October 2026 outage) ---
+# The app changed the composer from a Group to an Edit with the same accessible name. The query
+# AND-ed ControlType=Group into its condition, matched nothing, and every strip hid itself; the
+# only trace was "measured=0" in the log, 66705 times on one machine. The type is now a knob and
+# is filtered after a name-only query. These pin the parsing, the filter, and the query shape.
+$typeFnsMissing = @()
+foreach ($fn in @('ConvertTo-ComposerTypes', 'Test-ComposerTypeAllowed', 'Set-ComposerConfig', 'Write-CkLog', 'Get-RowSearchLeft', 'Get-ComposerFloor', 'Get-RowFilterLow')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text } else { $typeFnsMissing += $fn }
+}
+Check ("the composer-type functions were found in the source" + $(if ($typeFnsMissing) { ": MISSING $($typeFnsMissing -join ', ')" } else { '' })) `
+    ($typeFnsMissing.Count -eq 0)
+
+$tDef = @(ConvertTo-ComposerTypes '')
+Check 'a missing uiaComposerType defaults to Group AND Edit' (($tDef.Count -eq 2) -and ($tDef -contains 'Group') -and ($tDef -contains 'Edit'))
+Check 'a whitespace-only uiaComposerType falls back to the default, not to "any"' (@(ConvertTo-ComposerTypes '   ').Count -eq 2)
+Check 'a list that parses to nothing (", ,") falls back to the default, not to "any"' (@(ConvertTo-ComposerTypes ', ,').Count -eq 2)
+Check '"*" means any type (an empty allow-list)' (@(ConvertTo-ComposerTypes '*').Count -eq 0)
+$tOne = @(ConvertTo-ComposerTypes 'Edit')
+Check 'a single configured type survives as a one-element list' (($tOne.Count -eq 1) -and ($tOne[0] -ceq 'Edit'))
+$tTrim = @(ConvertTo-ComposerTypes ' Group , Edit ')
+Check 'configured types are trimmed' (($tTrim.Count -eq 2) -and ($tTrim[0] -ceq 'Group') -and ($tTrim[1] -ceq 'Edit'))
+
+Check 'the default accepts the Edit the app exposes now' (Test-ComposerTypeAllowed 'ControlType.Edit' $tDef)
+Check 'the default still accepts the Group it exposed before' (Test-ComposerTypeAllowed 'ControlType.Group' $tDef)
+Check 'the default rejects a Text node of the same name' (-not (Test-ComposerTypeAllowed 'ControlType.Text' $tDef))
+Check 'an Edit-only list rejects a Group' (-not (Test-ComposerTypeAllowed 'ControlType.Group' $tOne))
+Check 'an empty allow-list accepts any type' (Test-ComposerTypeAllowed 'ControlType.Document' @())
+Check 'a lower-case configured type still matches' (Test-ComposerTypeAllowed 'ControlType.Edit' @('edit'))
+
+# The value that actually ships. Pure-function tests above use '' for "missing"; a fresh install
+# reads buttons.default.json, and changing that to "Group" would bring the outage straight back.
+$tShipped = @(ConvertTo-ComposerTypes ([string]$defJson.uiaComposerType))
+Check 'the SHIPPED default uiaComposerType admits both Group and Edit' (($tShipped -contains 'Group') -and ($tShipped -contains 'Edit'))
+# A missing key would ALSO parse to the default above ($null -> '' -> default) and hide the knob
+# from the very users the README sends looking for it. Pin presence and the exact raw value.
+Check 'uiaComposerType is PRESENT in buttons.default.json with the exact value "Group,Edit"' `
+    ([bool]$defJson.PSObject.Properties['uiaComposerType'] -and ([string]$defJson.uiaComposerType -ceq 'Group,Edit'))
+
+# --- Row anchor for an Edit composer (Get-RowSearchLeft / Get-ComposerFloor) ---
+# Fixing the type found the composer but the strips still hid: the Edit spans only the text
+# line, starting after the in-box "+" button, while the control row starts at the box edge. The
+# row search keyed to the Edit's X rejected every row button, Anchored went false, and the panel
+# hid everything as if a dialog were open. Rects below are the ones measured in the live app.
+# A pure model of the production row filter, so the END-TO-END outcome is tested, not just a
+# helper's return value: does the row's first control fall inside the search window?
+function Test-RowAnchors($left, $rowX, $floor = $null) { return ([double]$rowX -ge (Get-RowFilterLow $left $floor)) }
+$editC = @{ X = 1696; Y = 1963; W = 1181; H = 34 }
+$liveBtns = @(
+    @{ X = 1640; Y = 1957; W = 47;  H = 47 },   # Add - inside the box, on the composer's line
+    @{ X = 2771; Y = 1957; W = 47;  H = 47 },   # Stop
+    @{ X = 2830; Y = 1957; W = 47;  H = 47 },   # mic
+    @{ X = 1643; Y = 2029; W = 219; H = 46 },   # Bypass permissions - the row below
+    @{ X = 2646; Y = 2029; W = 108; H = 46 }    # Model
+)
+$livePane = @(@{ X = 690; W = 3150; Y = 59; H = 2029 })   # "Primary pane", measured
+$liveFloor = Get-ComposerFloor $editC @($editC) $livePane
+Check "the live composer's floor is its own pane's left edge ($liveFloor)" ($liveFloor -eq 690)
+$leftLive = Get-RowSearchLeft $editC.X $editC.Y $editC.H $liveBtns 120 $liveFloor $false
+Check "an Edit composer's row search starts at the in-box button on its own line ($leftLive)" ($leftLive -eq 1640)
+Check '...and the live row anchors (the strips can dock)' (Test-RowAnchors $leftLive 1643)
+
+# Both round-3 reviewers: the anchor must not DEPEND on the "+" being in the tree.
+$noAdd = @($liveBtns | Where-Object { $_.X -ne 1640 })
+$leftNoAdd = Get-RowSearchLeft $editC.X $editC.Y $editC.H $noAdd 120 $liveFloor $false
+Check "with the in-box button MISSING the Edit still searches left of itself ($leftNoAdd)" ($leftNoAdd -lt 1643)
+Check '...so the live row STILL anchors without it' (Test-RowAnchors $leftNoAdd 1643)
+
+# A Group composer IS the box: old behaviour exactly, so an older app build's wider margin
+# (where a search reaching left could hit the sidebar) is untouched.
+$leftGroup = Get-RowSearchLeft 1640 1940 80 @(@{ X = 1643; Y = 2029; W = 219; H = 46 }) 120 $null $true
+Check "a Group composer with no in-box button keeps its own X ($leftGroup)" ($leftGroup -eq 1640)
+# Round 5, both reviewers: the Group check ran AFTER the scan, so an unrelated button on the
+# Group's own line, left of it (a sidebar or margin control), still moved the edge. That test
+# above only had a button BELOW the Group, so it could not see it.
+$leftGroupSame = Get-RowSearchLeft 1640 1940 80 @(@{ X = 1580; Y = 1950; W = 47; H = 47 }) 120 $null $true
+Check "a Group composer ignores a same-line button to its left - old behaviour exactly ($leftGroupSame)" ($leftGroupSame -eq 1640)
+
+# Round-3 reviewer A: a neighbouring pane must not be reachable. Two composers side by side,
+# the left one's mic within 80 logical px of the right one, and the right pane's own row absent.
+$cL = [pscustomobject]@{ X = 900;  Y = 1963; W = 680; H = 34 }
+$cR = [pscustomobject]@{ X = 1696; Y = 1963; W = 680; H = 34 }
+$floorR = Get-ComposerFloor $cR @($cL, $cR) @()
+Check "the right pane's floor is the left composer's right edge ($floorR)" ($floorR -eq 1580)
+$leftNb = Get-RowSearchLeft $cR.X $cR.Y $cR.H @(@{ X = 1560; Y = 1957; W = 47; H = 47 }) 120 $floorR $false
+Check "a neighbour's control left of the floor is never taken as this box's edge ($leftNb)" ($leftNb -ge 1580)
+Check "...and the neighbour's row (x=1530) cannot anchor this pane's strip" (-not (Test-RowAnchors $leftNb 1530 $floorR))
+# Round 4, reviewer B: the 12 px tolerance must not cross the floor. A neighbour control starting
+# INSIDE that band (floor 1580, control at 1572) could otherwise anchor this pane's strip.
+Check 'a neighbour control inside the 12 px band left of the floor cannot anchor' (-not (Test-RowAnchors 1580 1572 1580))
+Check '...while the tolerance still applies where there is no floor' (Test-RowAnchors 1640 1630 $null)
+Check 'the row filter bound is never below the floor' ((Get-RowFilterLow 1585 1580) -eq 1580)
+# Round 4, both reviewers: pane containment on BOTH axes. Staggered 2x2 grid: the top row splits
+# at X=1200, the bottom row at X=1000. The bottom-right composer must take ITS pane's edge (1000),
+# not the top-right pane's (1200) - that larger floor rejected the real row and hid the strip.
+$grid = @(@{ X = 0; W = 1200; Y = 0; H = 1000 }, @{ X = 1200; W = 1800; Y = 0; H = 1000 },
+          @{ X = 0; W = 1000; Y = 1000; H = 1000 }, @{ X = 1000; W = 2000; Y = 1000; H = 1000 })
+$cBR = [pscustomobject]@{ X = 1060; Y = 1900; W = 900; H = 34 }
+$floorBR = Get-ComposerFloor $cBR @($cBR) $grid
+Check "in a staggered grid the floor comes from the composer's OWN pane ($floorBR)" ($floorBR -eq 1000)
+$leftBR = Get-RowSearchLeft $cBR.X $cBR.Y $cBR.H @(@{ X = 1005; Y = 1893; W = 47; H = 47 }) 120 $floorBR $false
+Check '...so its real row (starting at 1005) still anchors' (Test-RowAnchors $leftBR 1005 $floorBR)
+# Stacked panes do not share a row, so they must not bound each other.
+$cTop = [pscustomobject]@{ X = 300; Y = 900; W = 1200; H = 34 }
+$cBot = [pscustomobject]@{ X = 1696; Y = 1963; W = 680; H = 34 }
+Check 'a composer on another ROW (stacked layout) does not limit the floor' ($null -eq (Get-ComposerFloor $cBot @($cTop, $cBot) @()))
+Check 'a button on the ROW below is never mistaken for the box edge' `
+    ((Get-RowSearchLeft 1696 1963 34 @(@{ X = 1600; Y = 2029; W = 219; H = 46 }) 120 690 $true) -eq 1696)
+Check 'no buttons and no bound: an Edit still searches its full inset' ((Get-RowSearchLeft 1696 1963 34 @() 120 $null $false) -eq 1576)
+
+# Wiring: the row search must use the derived edge, and the composer type must reach it.
+$uiaNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-UiaInfo' }, $true)
+$uiaText = if ($uiaNode) { $uiaNode.Body.Extent.Text } else { '' }
+Check 'Update-UiaInfo bounds the search with Get-ComposerFloor' ($uiaText -match '\$cFloor\s*=\s*Get-ComposerFloor \$c \$composers \$script:paneBounds')
+Check '...derives the edge with Get-RowSearchLeft, passing the floor and whether it is a Group' `
+    ($uiaText -match '\$boxL\s*=\s*Get-RowSearchLeft \$c\.X \$c\.Y \$c\.H \$btnRects \(SW 80\) \$cFloor \(\$c\.Type -eq ''Group''\)')
+Check '...the filter bound comes from Get-RowFilterLow, which respects the floor' ($uiaText -match '\$rowLo\s*=\s*Get-RowFilterLow \$boxL \$cFloor')
+Check '...and the control-row filter is keyed to it, not to the composer element''s X' `
+    (($uiaText -match '\$bb\.X -ge \$rowLo -and') -and ($uiaText -notmatch '\$bb\.X -ge \(\$c\.X - 12\)') -and ($uiaText -notmatch '\$bb\.X -ge \(\$boxL - 12\)'))
+$gcNodeT = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-Composers' }, $true)
+Check 'Get-Composers reports each composer''s control type' ($gcNodeT -and $gcNodeT.Body.Extent.Text -match 'Type\s*=\s*\(\$ctPn -replace')
+
+# --- Set-ComposerConfig: startup AND reload ---
+# Both reviewers of 1.11.1 found the same hole: the knobs were read once at startup, so editing
+# buttons.json as the new log line advises did nothing until a restart.
+$script:uiaComposerName = $null; $script:uiaComposerTypes = $null
+$chg0 = Set-ComposerConfig ([pscustomobject]@{})
+Check 'Set-ComposerConfig on an empty config applies the defaults (name Prompt, types Group+Edit)' `
+    (($script:uiaComposerName -ceq 'Prompt') -and (@($script:uiaComposerTypes).Count -eq 2))
+Check '...and reports that as a change from the unset state' ($chg0 -eq $true)
+Check 'applying the same config again reports NO change (no needless UIA reset every reload)' `
+    ((Set-ComposerConfig ([pscustomobject]@{})) -eq $false)
+$chg1 = Set-ComposerConfig ([pscustomobject]@{ uiaComposerType = '*' })
+Check 'a reload that sets uiaComposerType to "*" takes effect and reports a change' (($chg1 -eq $true) -and (@($script:uiaComposerTypes).Count -eq 0))
+$chg2 = Set-ComposerConfig ([pscustomobject]@{ uiaComposerType = '*'; uiaComposerName = 'Prompt input' })
+Check 'a reload that renames the composer takes effect and reports a change' (($chg2 -eq $true) -and ($script:uiaComposerName -ceq 'Prompt input'))
+[void](Set-ComposerConfig ([pscustomobject]@{ uiaComposerType = 'Edit' }))
+Check 'a single-type reload stays a list, never a bare string' ((@($script:uiaComposerTypes).Count -eq 1) -and ($script:uiaComposerTypes -is [array]))
+# Wiring: startup and the reload path must both go through it. Deleting either call leaves the
+# pure-function tests green while the product reverts to startup-only or to $null - and
+# @($null) is a one-element list that rejects every type, i.e. the outage again.
+$scCalls = [regex]::Matches(($srcText -replace '(?m)^\s*#.*$', ''), 'Set-ComposerConfig\s+\$script:config').Count
+Check "Set-ComposerConfig is called at startup AND on reload ($scCalls call sites)" ($scCalls -ge 2)
+$reloadM = [regex]::Match($srcText, '(?s)\$new = Read-FreshConfig.{0,900}')
+Check 'the config-reload branch re-applies the composer config' ($reloadM.Success -and ($reloadM.Value -match 'Set-ComposerConfig\s+\$script:config'))
+Check '...and on a change it re-arms the warning and forces an immediate UIA pass' `
+    ($reloadM.Success -and ($reloadM.Value -match 'composerTypeWarned\s*=\s*\$null') -and ($reloadM.Value -match 'uiaStable\s*=\s*0'))
+# Both halves of "immediate": uiaStable alone resets the backoff level, but without uiaLast going
+# back to the sentinel the next pass still waits out the current interval (up to 5 s).
+Check '...including resetting uiaLast to the sentinel, so the pass runs on the next tick' `
+    ($reloadM.Success -and ($reloadM.Value -match "uiaLast\s*=\s*Get-Date '2000-01-01'"))
+
+# --- Write-CkLog -PassThru ---
+$savedLogPath = $script:logPath; $savedLastMsg = $script:lastLogMsg
+$tmpLog = Join-Path ([IO.Path]::GetTempPath()) ("cb-log-test-" + [guid]::NewGuid().ToString('N') + '.log')
+$script:logPath = $tmpLog; $script:lastLogMsg = $null
+$plain = @(Write-CkLog 'plain statement call')
+Check 'Write-CkLog without -PassThru emits NOTHING (existing callers must not leak $true)' ($plain.Count -eq 0)
+Check 'Write-CkLog -PassThru returns $true when the line was written' ((Write-CkLog 'confirmed line' -PassThru) -eq $true)
+Check '...and the line is really in the file' ((Get-Content $tmpLog -Raw) -match 'confirmed line')
+$script:logPath = Join-Path $tmpLog 'no\such\dir\x.log'; $script:lastLogMsg = $null
+# Under 'Continue', deliberately: panel and tests both set 'Stop' globally, which made the
+# explicit -ErrorAction Stop look redundant - a mutant removing it survived. The function must
+# not depend on a preference set 1000 lines away, so prove it holds without it.
+$eapSaved = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+try { $wFail = Write-CkLog 'unwritable' -PassThru } finally { $ErrorActionPreference = $eapSaved }
+Check 'Write-CkLog -PassThru returns $false when the write fails (even under ErrorAction Continue)' ($wFail -eq $false)
+# A failed write must not be recorded for dedup, or the retry is suppressed for 60 s and the
+# warning that depends on it is lost. Point back at a writable file: the SAME line must go through.
+Check 'a failed write leaves the dedup state untouched' ($script:lastLogMsg -ne 'unwritable')
+$script:logPath = $tmpLog
+Check '...so the identical line can be written immediately afterwards' ((Write-CkLog 'unwritable' -PassThru) -eq $true)
+Remove-Item $tmpLog -ErrorAction SilentlyContinue
+$script:logPath = $savedLogPath; $script:lastLogMsg = $savedLastMsg
+$gcNodeW = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-Composers' }, $true)
+Check 'the type warning is marked sent only after a CONFIRMED write' `
+    ($gcNodeW -and ($gcNodeW.Body.Extent.Text -match '(?s)-PassThru.{0,80}if \(\$okLog\) \{ \$script:composerTypeWarned = \$seen \}'))
+
+# Query shape: the outage was a ControlType condition baked into the FindAll. If one comes back,
+# a future type change silently empties the result again, whatever the knob says.
+$gcNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-Composers' }, $true)
+$gcText = if ($gcNode) { $gcNode.Body.Extent.Text } else { '' }
+Check 'Get-Composers was found' ([bool]$gcNode)
+Check 'Get-Composers does not put a ControlType into its UIA query' ($gcText -notmatch 'ControlTypeProperty')
+Check 'Get-Composers filters the type through Test-ComposerTypeAllowed' ($gcText -match 'Test-ComposerTypeAllowed')
+# Absence of a ControlType is not enough: a TrueCondition or an unrelated property would pass
+# that check while docking to arbitrary nodes. Pin the positive shape - a NameProperty condition
+# built from the knob, and that SAME variable handed to FindAll.
+Check 'Get-Composers builds its condition from NameProperty and the uiaComposerName knob' `
+    ($gcText -match '\$nameC\s*=\s*New-Object System\.Windows\.Automation\.PropertyCondition\(\[System\.Windows\.Automation\.AutomationElement\]::NameProperty,\s*\$script:uiaComposerName\)')
+Check '...and passes exactly that condition to FindAll' ($gcText -match '\$root\.FindAll\(\[System\.Windows\.Automation\.TreeScope\]::Descendants,\s*\$nameC\)')
+# Height floor: the Edit measured 23 px tall on a second machine. A floor at or above that hides
+# the strips there, on someone else's desk, with the same silent symptom.
+$floorM = [regex]::Match($gcText, '\$b\.Height\s+-lt\s+(\d+)')
+Check ("the composer height floor admits the 23 px Edit measured in the field" + $(if ($floorM.Success) { " (floor $($floorM.Groups[1].Value))" } else { ' (floor not found)' })) `
+    ($floorM.Success -and ([int]$floorM.Groups[1].Value -lt 23))
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }
