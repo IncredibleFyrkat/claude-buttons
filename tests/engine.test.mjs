@@ -347,6 +347,7 @@ test('toggle on fails LOUDLY when the arm flag cannot be written (never says Arm
   assert.notEqual(r.code, 0, 'must exit non-zero when nothing was written');
   assert.doesNotMatch(r.out, /^Armed/m, 'must not claim the chat is armed');
   assert.match(r.err, /NOT armed/, 'must say plainly that nothing was armed');
+  assert.doesNotMatch(r.err, /may STILL/, 'the request is withdrawn, so no arm on disk can fire');
   // ...and the disk must agree: a later turn-end must not fire off a half-written arm.
   const fired = stop({ session_id: id });
   assert.doesNotMatch(fired.out, /would start PC shutdown/, 'a failed arm must not fire later');
@@ -977,4 +978,67 @@ test('a hand-written arm token never becomes part of a path', () => {
   assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
   assert.ok(!readdirSync(HOME).some((n) => n.includes('evil')), 'nothing written outside the flag directory');
   assert.ok(!readdirSync(flagDir()).some((n) => n.includes('evil')), 'nor inside it');
+});
+
+// ---------------------------------------------------------------------------
+// Round-6 review: a write that failed must not leave an older arm or request live behind a
+// "disarmed" / "NOT armed" / "NOT recorded" message. Both files are held by second processes
+// (share Read: readable, so consent verifies; neither rewritable nor deletable).
+// ---------------------------------------------------------------------------
+async function withBothLocked(id, fn) {
+  const a = holdOpen(join(flagDir(), `${id}.json`), 'Read');
+  const b = holdOpen(join(flagDir(), `${id}.request`), 'Read');
+  try { await a.held; await b.held; return fn(); } finally { await a.release(); await b.release(); }
+}
+const neverFires = (id) => {
+  for (let i = 0; i < 3; i++) {
+    assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/, `turn end ${i + 1} after the locks cleared`);
+  }
+};
+
+test('a countdown whose decrement cannot be written is DISARMED for real', onWindows, async () => {
+  const id = 'sCountdownLocked';
+  arm(id, { thisTurn: false });                                // skip 1
+  const out = await withBothLocked(id, () => stop({ session_id: id }).out);
+  assert.match(out, /DISARMED/);
+  neverFires(id);                                              // the intact skip-1 arm used to fire here
+});
+
+test('toggle on that cannot replace a locked older arm says NOT armed - and it is true', onWindows, async () => {
+  const id = 'sRearmLocked';
+  arm(id, { thisTurn: false });                                // an older, live arm
+  const r = await withBothLocked(id, () => toggle('toggle on --this-turn', id));
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /NOT armed/);
+  assert.doesNotMatch(r.err, /may STILL/, 'withdrawn by revocation, so it is proven safe');
+  neverFires(id);                                              // the older arm used to survive and fire
+});
+
+test('request-on that cannot replace a locked request says NOT recorded - and nothing stands', onWindows, async () => {
+  const id = 'sRerequestLocked';
+  arm(id);                                                     // previous request + a this-turn arm
+  const r = await withBothLocked(id, () => toggle('toggle request-on', id));
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /NOT recorded/);
+  assert.doesNotMatch(r.err, /may STILL/);
+  neverFires(id);                                              // the previous request + arm used to fire
+  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+});
+
+test('toggle off with the ARM locked unreadable still disarms: the void request leaves it nothing to fire under', onWindows, async () => {
+  // The arm can be neither read (so its token is unknown) nor removed. Its request is revoked and
+  // removed, and an arm fires only under the request on disk - so it is safe, and saying so is true.
+  const id = 'sOffArmUnreadable';
+  arm(id);
+  const lock = holdOpen(join(flagDir(), `${id}.json`), 'None');
+  let r;
+  try {
+    await lock.held;
+    r = toggle('toggle off', id);
+  } finally {
+    await lock.release();
+  }
+  assert.equal(r.code, 0, `the disarm is proven, so it is reported as done: ${r.err}`);
+  assert.ok(exists(id, 'json'), 'the arm file did survive the lock');
+  assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
 });

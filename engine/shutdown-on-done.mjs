@@ -122,10 +122,6 @@ const writeFlagAtomic = (p, data) => {
   }
 };
 
-// Best-effort removal of a flag whose write we could not complete. Fail-closed means the user
-// must not be left with a half-written arm we then describe as absent.
-const discardFlag = (p) => { try { rmSync(p, { force: true, recursive: true }); } catch {} };
-
 // A session id becomes a FILENAME, and the fire path calls rmSync(force, recursive) on the
 // result - so `../../x` escaped FLAG_DIR and deleted an arbitrary file or directory tree.
 // Claude Code mints UUIDs, so no attacker channel was found, but a hook that deletes paths
@@ -203,17 +199,20 @@ const removeVerified = (p) => {
 };
 // Withdraw consent: revoke the arm's token and the current request's, then remove the request and
 // the arm. requestVoid = no request on disk can authorise an arm any more (the current request's
-// token is revoked, or the request is provably gone). armSafe = the arm is gone or its token is
-// revoked, so it can never fire. Used by `toggle off`, `request-off` and the unreadable-flag path.
-const withdrawConsent = (id, armToken) => {
+// token is provably revoked, or the request is provably gone). armSafe = no arm on disk can ever
+// fire: the arm is gone, or its own token is void, or the request is void - an arm fires only
+// under the request on disk, and the next request carries a new nonce no existing arm can match.
+// `extraTokens` are revoked too (request-on: the token of a write that may have half-landed).
+// Used by every path that withdraws: `toggle off`, `request-off`, the unreadable-flag and
+// token-mismatch paths, the fire path, and every write that failed.
+const withdrawConsent = (id, armToken, extraTokens = []) => {
   const reqTok = requestToken(id);
-  const revoked = revokeTokens(id, [armToken, reqTok]);
+  revokeTokens(id, [armToken, reqTok, ...extraTokens]);
+  const voidTok = (t) => typeof t === 'string' && (!TOKEN_RE.test(t) || markerProven(id, t));
   const requestGone = removeVerified(requestPath(id));
   const armGone = removeVerified(flagPath(id));
-  return {
-    requestVoid: requestGone || (revoked && reqTok !== null),
-    armSafe: armGone || (revoked && typeof armToken === 'string'),
-  };
+  const requestVoid = requestGone || (reqTok !== null && voidTok(reqTok));
+  return { requestVoid, armSafe: armGone || voidTok(armToken) || requestVoid };
 };
 // A revoked request left behind by a lock is removed whenever it can be, so the panel's power
 // button (which mirrors *.request) stops showing it. Never touches a live request.
@@ -469,11 +468,18 @@ if (mode === 'toggle') {
       );
     } catch { armed = false; }
     if (!armed) {
-      discardFlag(flagPath(id));   // never leave a half-written arm behind a "not armed" message
-      logLine(`ARM FAILED for session ${id}: flag could not be written; NOT armed`);
+      // "NOT armed" must be true of the DISK, not only of this attempt: an older arm the write
+      // could not replace (a lock on the flag) would still fire under the live request. So the
+      // request is withdrawn - revoked first - which leaves no arm on disk able to fire; arming
+      // again takes `request-on`.
+      const w = withdrawConsent(id, readArmToken(id));
+      logLine(`ARM FAILED for session ${id}: flag could not be written; NOT armed (arm safe ${w.armSafe})`);
       console.error(
-        'NOT armed: the arm flag could not be written to disk, so nothing was recorded and the PC will NOT shut down. ' +
-          'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then try again.',
+        w.armSafe
+          ? 'NOT armed: the arm flag could not be written to disk, so the PC will NOT shut down, and this chat\'s standing request was withdrawn. ' +
+              'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then ask again.'
+          : 'NOT armed: the arm flag could not be written - but an earlier arm for this chat could not be removed or revoked either, ' +
+              'so it may STILL shut the PC down. Something is holding files in ~/.claude/shutdown-on-done; run `toggle off`.',
       );
       process.exit(1);
     }
@@ -498,11 +504,19 @@ if (mode === 'toggle') {
       recorded = writeFlagAtomic(requestPath(id), reqBytes);
     } catch { recorded = false; }
     if (!recorded) {
-      discardFlag(requestPath(id));
-      logLine(`REQUEST FAILED for session ${id}: marker could not be written; nothing recorded`);
+      // "No shutdown request" must be true of the disk: a previous request the write could not
+      // replace (a lock) would still stand, with any arm under it. Withdraw everything that could
+      // be live - the previous request, its arm, and the token of this write in case it landed
+      // without verifying - revoking first.
+      const newTok = reqBytes ? createHash('sha256').update(reqBytes).digest('hex').slice(0, 32) : undefined;
+      const w = withdrawConsent(id, readArmToken(id), newTok ? [newTok] : []);
+      logLine(`REQUEST FAILED for session ${id}: marker could not be written; nothing recorded (request void ${w.requestVoid}, arm safe ${w.armSafe})`);
       console.error(
-        'NOT recorded: the standing shutdown request could not be written to disk, so this chat has no shutdown request and cannot be armed. ' +
-          'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then try again.',
+        w.requestVoid && w.armSafe
+          ? 'NOT recorded: the standing shutdown request could not be written to disk, so this chat has no shutdown request and cannot be armed. ' +
+              'Check that ~/.claude/shutdown-on-done is writable (antivirus, permissions, disk space), then try again.'
+          : 'NOT recorded - and an earlier request or arm for this chat could not be removed or revoked, so it may STILL be in force. ' +
+              'Something is holding files in ~/.claude/shutdown-on-done; run `toggle off`.',
       );
       process.exit(1);
     }
@@ -716,6 +730,7 @@ if (!requestStillLive(parsed, id)) {
   const armTok = typeof parsed.req === 'string' ? parsed.req : undefined;
   const revoked = armTok !== undefined && revokeTokens(id, [armTok]);
   const armGone = removeVerified(flagPath(id));
+  // No usable token at all: requestStillLive can never pass for this arm, so it cannot fire.
   const armSafe = armGone || revoked || armTok === undefined || !TOKEN_RE.test(armTok);
   logLine(`arm flag for session ${id} has no live standing request; ${armSafe ? 'disarmed' : 'could NOT be disarmed'} WITHOUT shutting down`);
   emit({
@@ -749,12 +764,15 @@ if (skip > 0) {
   // arm that then sits for a day is still caught by the age check on the turn it would have fired.
   const next = { skip: skip - 1, consumedInTurn: true, req: parsed.req, armedAt: parsed.armedAt, armedUp: parsed.armedUp };
   if (!writeFlagAtomic(flagPath(id), JSON.stringify(next))) {
-    discardFlag(flagPath(id));
-    discardFlag(requestPath(id));
-    logLine(`countdown write FAILED for session ${id}; disarmed WITHOUT shutting down`);
+    // Withdrawn by revocation first: the flag that could not be rewritten probably cannot be
+    // deleted either, and the undecremented arm would otherwise fire once the lock clears.
+    const w = withdrawConsent(id, parsed.req);
+    logLine(`countdown write FAILED for session ${id}; ${w.armSafe ? 'disarmed' : 'could NOT be disarmed'} WITHOUT shutting down`);
     emit({
-      systemMessage:
-        'Shutdown-on-done: the countdown could not be written to disk, so this chat has been DISARMED and the PC will NOT shut down. Re-arm if you still want it.',
+      systemMessage: w.armSafe
+        ? 'Shutdown-on-done: the countdown could not be written to disk, so this chat has been DISARMED and the PC will NOT shut down. Re-arm if you still want it.'
+        : 'Shutdown-on-done: the countdown could not be written, and the arm could not be removed or revoked either, so it may STILL ' +
+          'shut the PC down at a later turn end. Something is holding files in ~/.claude/shutdown-on-done; run `/shutdown-on-done off`.',
     });
     process.exit(0);
   }
