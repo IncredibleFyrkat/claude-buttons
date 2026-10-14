@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync
 import { tmpdir, uptime as osUptime } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const ENGINE = join(dirname(fileURLToPath(import.meta.url)), '..', 'engine', 'shutdown-on-done.mjs');
 let HOME;                         // per-run throwaway USERPROFILE
@@ -875,4 +876,113 @@ test('when consent cannot be voided at all, the aged arm is KEPT and every path 
   } finally {
     await lock.release();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Round-4 review cases.
+// ---------------------------------------------------------------------------
+test('a full revocation list never evicts the token being revoked', () => {
+  // The token being revoked can already sit at the FRONT of a full list (revoked once before).
+  // Truncation drops the oldest, so it was evicted - un-revoked - by the call that reported it
+  // revoked, and a request a lock had kept on disk came back to life.
+  const id = 'sRevokeFull';
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  const T = createHash('sha256').update(readFileSync(join(flagDir(), `${id}.request`))).digest('hex').slice(0, 32);
+  const others = Array.from({ length: 31 }, (_, i) => `old${i}`);
+  writeFileSync(join(flagDir(), `${id}.revoked`), `${[T, ...others].join('\n')}\n`);
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 1, req: 'a'.repeat(32) }));
+  toggle('toggle off', id);                                    // revokes the arm's token AND T
+  const list = readFileSync(join(flagDir(), `${id}.revoked`), 'utf8').split('\n').filter(Boolean);
+  assert.ok(list.includes(T), 'the request token is still revoked');
+  assert.ok(list.includes('a'.repeat(32)), 'and so is the arm token');
+  assert.ok(list.length <= 32);
+});
+
+test('the fire path consumes a LOCKED arm by revocation, so it cannot fire again later', onWindows, async () => {
+  // The old consume threw on a locked arm before deleting anything: no fire now, and the surviving
+  // skip-0 arm fired at the next, unrelated turn end - a power-off moved to a moment nobody chose.
+  const id = 'sFireLocked';
+  arm(id);
+  const lock = holdOpen(join(flagDir(), `${id}.json`), 'Read');
+  try {
+    await lock.held;
+    assert.match(stop({ session_id: id }).out, /would start PC shutdown/, 'consumed by revocation, so it fires now');
+  } finally {
+    await lock.release();
+  }
+  assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/, 'and the surviving file never fires again');
+  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+});
+
+test('an unreadable revocation list cannot make a NEWER request look like an aged arm\'s own', () => {
+  const id = 'sAgedNewerUnreadable';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  toggle('toggle request-off', id);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);
+  toggle('toggle request-on', id);                            // newer consent
+  mkdirSync(join(flagDir(), `${id}.revoked`));                 // and the list becomes unreadable
+  toggle('toggle status', id);
+  assert.ok(exists(id, 'request'), 'the newer request is not revoked or deleted with the aged arm');
+  assert.ok(!exists(id, 'json'), 'the aged arm goes');
+});
+
+test('an unusable arm that names an OLDER request leaves a newer request alone', () => {
+  const id = 'sBadArmNewerReq';
+  assert.equal(toggle('toggle request-on', id).code, 0);       // newer consent
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify({ skip: 'bad', req: 'b'.repeat(32) }));
+  assert.match(stop({ session_id: id }).out, /unreadable/);
+  assert.ok(!exists(id, 'json'), 'the bad arm is consumed');
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m, 'the newer request still authorises an arm');
+});
+
+test('request-on that cannot clear an unreadable revocation list says NOT usable', onWindows, async () => {
+  const id = 'sRequestUnusable';
+  const dir = join(flagDir(), `${id}.revoked`);
+  mkdirSync(dir);                                              // unreadable as a list...
+  writeFileSync(join(dir, 'held'), 'x');
+  const lock = holdOpen(join(dir, 'held'), 'None');            // ...and undeletable
+  let r;
+  try {
+    await lock.held;
+    r = toggle('toggle request-on', id);
+  } finally {
+    await lock.release();
+  }
+  assert.notEqual(r.code, 0, 'never a success-shaped message for a request that cannot be armed');
+  assert.match(r.err, /NOT usable/);
+});
+
+test('toggle off whose `shutdown -a` fails does NOT say disarmed', () => {
+  // A countdown may be running. SystemRoot points the engine's shutdown.exe at a missing file.
+  const id = 'sAbortFails';
+  arm(id);
+  // Windows env names are case-insensitive but a spread object is not: drop every spelling first.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^systemroot$/i.test(k)));
+  const r = spawnSync('node', [ENGINE, 'toggle', 'off'], {
+    env: { ...env, USERPROFILE: HOME, HOME, CLAUDE_CODE_SESSION_ID: id, SystemRoot: join(HOME, 'no-such-windows') },
+    encoding: 'utf8',
+  });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /shutdown -a. failed/);
+  assert.doesNotMatch(r.stdout, /Disarmed/);
+  assert.ok(!exists(id, 'json'), 'the chat itself is still disarmed');
+});
+
+test('status does not call an arm with an unusable countdown "Armed"', () => {
+  const id = 'sStatusBadSkip';
+  arm(id);
+  const o = readFlag(id);
+  o.skip = 'bad';
+  writeFileSync(join(flagDir(), `${id}.json`), JSON.stringify(o));
+  assert.match(toggle('toggle status', id).out, /^Not armed for this chat \(a leftover arm/);
+});
+
+test('status reports a stale machine switch as off, the way the hook reads it', () => {
+  const f = join(flagDir(), 'MACHINE-ARMED');
+  writeFileSync(f, '');
+  const old = Date.now() / 1000 - 13 * 3600;
+  utimesSync(f, old, old);
+  assert.match(toggle('toggle status', 'sStatusStaleMachine').out, /Machine-wide switch: off\./);
 });

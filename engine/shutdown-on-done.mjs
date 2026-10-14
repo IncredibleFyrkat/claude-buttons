@@ -174,7 +174,12 @@ const revokeTokens = (id, tokens) => {
   if (add.length === 0) return false;
   const have = readRevoked(id);
   if (have === null) return false;
-  const all = [...new Set([...have, ...add])].slice(-REVOKED_KEEP);
+  // The tokens being revoked go LAST, even when already listed: truncation drops the OLDEST, and
+  // one already near the front would otherwise be evicted - un-revoked - by the very call that
+  // reports it revoked.
+  const addSet = new Set(add);
+  const all = [...have.filter((t) => !addSet.has(t)), ...addSet].slice(-REVOKED_KEEP);
+  if (![...addSet].every((t) => all.includes(t))) return false;
   try {
     mkdirSync(FLAG_DIR, { recursive: true });
     return writeFlagAtomic(revokedPath(id), `${all.join('\n')}\n`);
@@ -281,8 +286,11 @@ const armAgeProblem = (parsedFlag) => {
 // of a chat's request is that chat's agent, which is not running while its own Stop hook is.)
 const settleAgedArm = (id, parsedFlag, problem) => {
   const armTok = typeof parsedFlag?.req === 'string' ? parsedFlag.req : undefined;
-  const live = liveRequestToken(id);
-  const superseded = armTok !== undefined && live !== null && live !== armTok;
+  // The RAW token: whether the request on disk is this arm's is a question of identity, not of
+  // whether it is still usable - an unreadable revocation list must not make a newer request look
+  // like the aged arm's own and get it revoked and deleted.
+  const onDisk = requestToken(id);
+  const superseded = armTok !== undefined && onDisk !== null && onDisk !== armTok;
   if (superseded) {
     const armGone = removeVerified(flagPath(id));
     logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down (a newer request stands)`);
@@ -309,6 +317,13 @@ const settleAgedArmIfAny = (id) => {
   const problem = armAgeProblem(parsedFlag);
   return problem ? settleAgedArm(id, parsedFlag, problem) : null;
 };
+// The countdown field of a parsed arm flag, or null when it is not a usable one. `skip: 0` is the
+// fire sentinel, so nothing but a non-negative integer may count (see the Stop hook).
+const validSkip = (f) =>
+  f && typeof f === 'object' && !Array.isArray(f) &&
+  typeof f.skip === 'number' && Number.isInteger(f.skip) && f.skip >= 0
+    ? f.skip
+    : null;
 // The arm's consent token, if the flag can be read and carries one.
 const readArmToken = (id) => {
   try {
@@ -471,12 +486,14 @@ if (mode === 'toggle') {
     // was reported as recorded produces both a false confirmation and a UI that contradicts
     // the disk. Nothing downstream may act as if the key exists.
     let recorded = false;
+    let reqBytes = '';
     try {
       mkdirSync(FLAG_DIR, { recursive: true });
       // Timestamp + a per-request nonce. The nonce is what makes the consent token identify THIS
       // request rather than "a request": withdraw and re-request inside the same millisecond and
       // the token still changes, so an arm granted under the old request cannot ride the new one.
-      recorded = writeFlagAtomic(requestPath(id), `${new Date().toISOString()} ${randomUUID()}`);
+      reqBytes = `${new Date().toISOString()} ${randomUUID()}`;
+      recorded = writeFlagAtomic(requestPath(id), reqBytes);
     } catch { recorded = false; }
     if (!recorded) {
       discardFlag(requestPath(id));
@@ -492,6 +509,18 @@ if (mode === 'toggle') {
     // which would otherwise refuse every request. Only AFTER a verified write - if the write had
     // failed, the old request would still be on disk and its revocation must stand.
     removeVerified(revokedPath(id));
+    // Recorded is not enough: it must be USABLE. A revocation list that could neither be read nor
+    // removed makes every request count as revoked, and "recorded" would then be a promise that
+    // `toggle on` refuses to keep.
+    const expected = createHash('sha256').update(reqBytes).digest('hex').slice(0, 32);
+    if (liveRequestToken(id) !== expected) {
+      logLine(`REQUEST for session ${id} recorded but NOT usable: revocation list could not be cleared`);
+      console.error(
+        'NOT usable: the standing shutdown request was written, but the revocation list beside it could not be read or cleared, ' +
+          'so this chat still cannot be armed. Something is holding files in ~/.claude/shutdown-on-done (antivirus, a backup agent?) - try again.',
+      );
+      process.exit(1);
+    }
     console.log('Standing shutdown request recorded for this chat.');
   } else if (action === 'request-off') {
     // Withdrawing the request must also drop any arm it authorised. The panel's toggle
@@ -522,9 +551,19 @@ if (mode === 'toggle') {
     const w = withdrawConsent(id, readArmToken(id));
     const machineGone = removeVerified(MACHINE_FLAG);
     const abort = spawnSync(SHUTDOWN_EXE, ['-a'], { stdio: 'pipe' });
-    if (!w.requestVoid || !w.armSafe || !machineGone) {
-      logLine(`OFF incomplete for session ${id} (request void ${w.requestVoid}, arm safe ${w.armSafe}, switch gone ${machineGone})`);
-      console.error(withdrawFailure(w, machineGone));
+    // 0 = a countdown was aborted; 1116 = there was none. Anything else (including a spawn that
+    // failed outright) means a countdown may still be running, and saying "disarmed" would be the
+    // one lie this verb must never tell.
+    const abortOk = abort.status === 0 || abort.status === 1116;
+    if (!w.requestVoid || !w.armSafe || !machineGone || !abortOk) {
+      logLine(`OFF incomplete for session ${id} (request void ${w.requestVoid}, arm safe ${w.armSafe}, switch gone ${machineGone}, abort ${abort.status})`);
+      console.error(
+        abortOk
+          ? withdrawFailure(w, machineGone)
+          : 'NOT fully cleared: a shutdown countdown may still be running and `shutdown -a` failed ' +
+              `(${abort.error ? String(abort.error) : `exit ${abort.status}`}). Run \`shutdown -a\` yourself NOW.` +
+              (w.requestVoid && w.armSafe && machineGone ? '' : ` Also: ${withdrawFailure(w, machineGone)}`),
+      );
       process.exit(1);
     }
     console.log(
@@ -541,14 +580,15 @@ if (mode === 'toggle') {
     try { flagNow = JSON.parse(readFileSync(flagPath(id), 'utf8')); } catch {}
     const chat = aged && !aged.superseded
       ? `Not armed for this chat (its arm ${aged.problem[1]}, so it was disarmed and its request expired).`
-      : flagNow !== null && requestStillLive(flagNow, id) ? 'Armed for this chat.'
+      : validSkip(flagNow) !== null && requestStillLive(flagNow, id) ? 'Armed for this chat.'
       : existsSync(flagPath(id)) ? 'Not armed for this chat (a leftover arm has no live request; it will not fire).'
       : 'Not armed for this chat.';
     // ACTIVE only for a request that can actually authorise an arm: the skill re-arms on ACTIVE.
     const req = liveRequestToken(id) !== null ? 'Standing request: ACTIVE.'
       : existsSync(requestPath(id)) ? 'Standing request: EXPIRED (withdrawn, expired or unreadable; it will not be honoured).'
       : 'Standing request: none.';
-    const machine = existsSync(MACHINE_FLAG) ? 'Machine-wide switch: ARMED.' : 'Machine-wide switch: off.';
+    // machineArmedFresh: a stale switch is ignored (and cleared) by the hook, so it is not ARMED.
+    const machine = machineArmedFresh() ? 'Machine-wide switch: ARMED.' : 'Machine-wide switch: off.';
     console.log(`${chat} ${req} ${machine}`);
   }
   process.exit(0);
@@ -604,11 +644,7 @@ try {
 } catch {
   parsed = null;
 }
-const skip =
-  parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
-  typeof parsed.skip === 'number' && Number.isInteger(parsed.skip) && parsed.skip >= 0
-    ? parsed.skip
-    : null;
+const skip = validSkip(parsed);
 
 if (skip === null) {
   // Consume the bad flag so it cannot repeat, and tell the user plainly - silently
@@ -617,7 +653,12 @@ if (skip === null) {
   // was emitted, so every turn crashed with a raw stack trace and the bad flag survived.
   // withdrawConsent revokes before it deletes and guards every step, so a lock on the request
   // cannot leave it standing as live consent once the unreadable flag is gone.
-  withdrawConsent(id, typeof parsed?.req === 'string' ? parsed.req : undefined);
+  // A bad arm that still names its request, under a DIFFERENT readable one: that request is newer
+  // consent (request-on writes a fresh nonce), so only the bad arm goes.
+  const badTok = typeof parsed?.req === 'string' ? parsed.req : undefined;
+  const onDisk = requestToken(id);
+  if (badTok !== undefined && onDisk !== null && onDisk !== badTok) removeVerified(flagPath(id));
+  else withdrawConsent(id, badTok);
   logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
   emit({
     systemMessage:
@@ -717,12 +758,16 @@ if (skip > 0) {
 // an arbitrary later turn. That is the exact harm this file's own comments call out as the
 // worst outcome. If the flags cannot be consumed we must NOT fire: firing without consuming
 // them could repeat after a reboot, which is worse than a shutdown that did not happen.
-try {
-  rmSync(flagPath(id), { force: true });
-  rmSync(requestPath(id), { force: true });
-  rmSync(MACHINE_FLAG, { force: true });
-} catch (e) {
-  logLine(`could not consume flags for session ${id} (${e.code ?? e}); NOT shutting down`);
+//
+// Consumed through withdrawConsent, like every other withdrawal: the arm's token is REVOKED before
+// the files go, so an arm or request a lock keeps on disk can never fire again (the old code threw
+// on a locked arm before deleting anything, and the surviving skip-0 arm fired at the next,
+// unrelated turn end). Fire only when that is PROVEN: the request void, the arm gone or revoked,
+// and the machine switch gone.
+const consumed = withdrawConsent(id, parsed.req);
+const machineConsumed = removeVerified(MACHINE_FLAG);
+if (!consumed.requestVoid || !consumed.armSafe || !machineConsumed) {
+  logLine(`could not consume flags for session ${id} (request void ${consumed.requestVoid}, arm safe ${consumed.armSafe}, switch gone ${machineConsumed}); NOT shutting down`);
   emit({
     systemMessage:
       'Shutdown-on-done: the arm flag could not be cleared, so the PC was NOT shut down ' +
