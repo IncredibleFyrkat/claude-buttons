@@ -6,7 +6,7 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync, chmodSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime as osUptime } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -484,32 +484,43 @@ test('a STALE machine switch does not satisfy the arm gate', () => {
 // NOW; it says nothing about WHEN. The fire path deletes the request, so a request still standing
 // is one that never fired - and yesterday's arm passed the token check intact. A "next turn" arm
 // not consumed until the user replied a day later powered the PC off then, in a session they
-// believed was live. The arm is now stamped (armedAt) and bounded to 12h like the machine switch.
+// believed was live. An arm is now stamped with the wall clock (armedAt) AND the machine's uptime
+// (armedUp) and bounded to 12h like the machine switch.
 //
-// restamp() rewrites ONLY armedAt on an arm the engine itself wrote, keeping its consent token,
-// so each case below isolates the age gate from the token gate.
+// age() rewrites ONLY the two stamps on an arm the engine itself wrote, keeping its consent token,
+// so each case below isolates the age check from the token check. Both stamps are set relative to
+// "now" on this machine, as the engine reads them.
 // ---------------------------------------------------------------------------
 const HOUR = 3600 * 1000;
-function restamp(id, armedAt) {
+const upNow = () => Math.round(osUptime() * 1000);
+function age(id, { wall, up = wall }) {   // how long ago, per clock, the arm was made (ms)
   const f = join(flagDir(), `${id}.json`);
   const o = JSON.parse(readFileSync(f, 'utf8'));
-  if (armedAt === undefined) delete o.armedAt; else o.armedAt = armedAt;
+  o.armedAt = Date.now() - wall;
+  o.armedUp = upNow() - up;
+  writeFileSync(f, JSON.stringify(o));
+}
+function setStamps(id, fields) {           // write arbitrary stamp values (fail-closed cases)
+  const f = join(flagDir(), `${id}.json`);
+  const o = JSON.parse(readFileSync(f, 'utf8'));
+  for (const [k, v] of Object.entries(fields)) { if (v === undefined) delete o[k]; else o[k] = v; }
   writeFileSync(f, JSON.stringify(o));
 }
 const readFlag = (id) => JSON.parse(readFileSync(join(flagDir(), `${id}.json`), 'utf8'));
 
-test('toggle on stamps the arm with the time it was armed', () => {
+test('toggle on stamps the arm with the wall clock AND the uptime it was armed at', () => {
   const t0 = Date.now();
+  const u0 = upNow();
   arm('sStamp');
-  const { armedAt } = readFlag('sStamp');
-  assert.equal(typeof armedAt, 'number');
+  const { armedAt, armedUp } = readFlag('sStamp');
   assert.ok(armedAt >= t0 && armedAt <= Date.now(), `armedAt ${armedAt} is the arm time`);
+  assert.ok(armedUp >= u0 - 1000 && armedUp <= upNow() + 1000, `armedUp ${armedUp} is the uptime at arming`);
 });
 
 test('an arm older than 12h does NOT fire, and clears both markers', () => {
   const id = 'sAgedFire';
   arm(id);                                   // skip 0, live request, valid token
-  restamp(id, Date.now() - 13 * HOUR);
+  age(id, { wall: 13 * HOUR });
   const { out, code } = stop({ session_id: id });
   assert.equal(code, 0);
   assert.doesNotMatch(out, /would start PC shutdown/, 'a day-old arm must not power the PC off');
@@ -526,7 +537,7 @@ test('an arm older than 12h does NOT fire, and clears both markers', () => {
 test('a stale NEXT-turn arm is cleared, not decremented toward firing (the reported case)', () => {
   const id = 'sAgedNext';
   arm(id, { thisTurn: false });              // skip 1
-  restamp(id, Date.now() - 25 * HOUR);       // the user replied a day later
+  age(id, { wall: 25 * HOUR });              // the user replied a day later
   const first = stop({ session_id: id });
   assert.doesNotMatch(first.out, /Shutdown-on-done armed:/, 'must not promise a countdown');
   assert.match(first.out, /more than 12h old/);
@@ -538,21 +549,95 @@ test('a stale NEXT-turn arm is cleared, not decremented toward firing (the repor
 test('an arm just under 12h old still fires (the bound must not kill the feature)', () => {
   const id = 'sElevenHours';
   arm(id);
-  restamp(id, Date.now() - 11 * HOUR);
+  age(id, { wall: 11 * HOUR });
   const { out } = stop({ session_id: id });
   assert.match(out, /would start PC shutdown/);
 });
 
-for (const [name, value] of [
-  ['no armedAt (an arm written by an older build)', undefined],
-  ['a string armedAt', String(Date.now())],
-  ['a null armedAt', null],
-  ['an armedAt an hour in the future', Date.now() + HOUR],
+// The reviewer's sequence: an arm survives (the app closed before its Stop hook ran), the chat is
+// resumed the next day, and the skill tells the agent to check `toggle status` and re-arm while
+// the request is ACTIVE. Arming over the old flag would stamp yesterday's request as fresh and
+// fire at the end of THIS response - so status and `toggle on` must expire it too.
+test('a stale arm is expired by toggle status, so the skill cannot see an ACTIVE request', () => {
+  const id = 'sAgedStatus';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  const st = toggle('toggle status', id);
+  assert.match(st.out, /Not armed for this chat \(its arm was more than 12h old/);
+  assert.match(st.out, /Standing request: none\./, 'the skill keys re-arming on ACTIVE');
+  const re = toggle('toggle on --this-turn', id);
+  assert.match(re.out, /Refused: no standing shutdown request/);
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/);
+});
+
+test('a stale arm cannot be renewed by arming over it (toggle on expires it first)', () => {
+  const id = 'sAgedRenew';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  const re = toggle('toggle on --this-turn', id);
+  assert.match(re.out, /Refused: no standing shutdown request for this chat \(its previous arm was more than 12h old/);
+  assert.ok(!existsSync(join(flagDir(), `${id}.request`)), 'its request went with it');
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/, 'and the turn end does not fire');
+});
+
+test('a FRESH arm is still re-armable and status still reports it (the checks are age-only)', () => {
+  const id = 'sFreshRenew';
+  arm(id, { thisTurn: false });
+  age(id, { wall: 2 * HOUR });
+  assert.match(toggle('toggle status', id).out, /^Armed for this chat\. Standing request: ACTIVE\./);
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/);
+  assert.match(stop({ session_id: id }).out, /would start PC shutdown/);
+});
+
+// The wall clock alone can lie. Set back two hours after arming, a 13h-old arm reads 11h old.
+test('a clock set BACK after arming cannot make an old arm look young', () => {
+  const id = 'sClockBack';
+  arm(id);
+  age(id, { wall: 11 * HOUR, up: 13 * HOUR });
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/);
+  assert.match(out, /clock was changed/);
+});
+
+test('within the clock tolerance the OLDER of the two ages still counts', () => {
+  const id = 'sClockOlder';
+  arm(id);
+  age(id, { wall: 12 * HOUR - 60 * 1000, up: 12 * HOUR + 60 * 1000 });   // 2 min apart
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/);
+  assert.match(out, /more than 12h old/);
+});
+
+test('an arm made before the PC last restarted does not fire', () => {
+  const id = 'sRebooted';
+  arm(id);
+  age(id, { wall: 1 * HOUR, up: -1 * HOUR });   // uptime is now LOWER than when it was armed
+  const { out } = stop({ session_id: id });
+  assert.doesNotMatch(out, /would start PC shutdown/);
+  assert.match(out, /before the PC last restarted/);
+});
+
+test('ordinary clock correction (a minute either way) still fires', () => {
+  for (const [id, wall] of [['sSkewAhead', -60 * 1000], ['sSkewBehind', 2 * HOUR + 60 * 1000]]) {
+    arm(id);
+    age(id, { wall, up: wall < 0 ? 0 : 2 * HOUR });
+    assert.match(stop({ session_id: id }).out, /would start PC shutdown/, id);
+  }
+});
+
+for (const [name, fields] of [
+  ['no stamps (an arm written by an older build)', { armedAt: undefined, armedUp: undefined }],
+  ['no uptime stamp', { armedUp: undefined }],
+  ['a string armedAt', { armedAt: String(Date.now()) }],
+  ['a null armedUp', { armedUp: null }],
+  ['an armedAt an hour in the future', { armedAt: Date.now() + HOUR }],
 ]) {
   test(`an arm with ${name} fails CLOSED: cleared, not fired`, () => {
     const id = `sUndated-${name.replace(/\W/g, '').slice(0, 40)}`;
     arm(id);
-    restamp(id, value);
+    setStamps(id, fields);
     const { out, code } = stop({ session_id: id });
     assert.equal(code, 0);
     assert.doesNotMatch(out, /would start PC shutdown/, 'an arm that cannot be aged must not fire');
@@ -561,44 +646,37 @@ for (const [name, value] of [
   });
 }
 
-test('an arm stamped a minute ahead (ordinary clock correction) still fires', () => {
-  const id = 'sSkewOk';
-  arm(id);
-  restamp(id, Date.now() + 60 * 1000);
-  const { out } = stop({ session_id: id });
-  assert.match(out, /would start PC shutdown/);
-});
-
-test('the countdown decrement keeps the ORIGINAL arm time (age is not reset)', () => {
-  // Refreshing the stamp at the decrement would make a skip-1 arm that then sits for a day look
+test('the countdown decrement keeps the ORIGINAL arm stamps (age is not reset)', () => {
+  // Refreshing a stamp at the decrement would make a skip-1 arm that then sits for a day look
   // brand new on the turn it fires - the exact path the bound exists to catch.
   const id = 'sKeepStamp';
   arm(id, { thisTurn: false });
-  const original = Date.now() - 2 * HOUR;
-  restamp(id, original);
+  age(id, { wall: 2 * HOUR });
+  const before = readFlag(id);
   const { out } = stop({ session_id: id });
   assert.match(out, /Shutdown-on-done armed:/);
   const after = readFlag(id);
   assert.equal(after.skip, 0, 'decremented');
-  assert.equal(after.armedAt, original, 'armedAt carried through unchanged');
+  assert.equal(after.armedAt, before.armedAt, 'armedAt carried through unchanged');
+  assert.equal(after.armedUp, before.armedUp, 'armedUp carried through unchanged');
 });
 
-test('the age gate also runs on a same-turn re-entry (no window for a stale arm to survive)', () => {
+test('the age check also runs on a same-turn re-entry (no window for a stale arm to survive)', () => {
   const id = 'sAgedReentry';
   arm(id, { thisTurn: false });
   stop({ session_id: id });                  // decrement: skip 0, consumedInTurn
-  restamp(id, Date.now() - 13 * HOUR);
+  age(id, { wall: 13 * HOUR });
   const { out } = stop({ session_id: id, stop_hook_active: true });
   assert.match(out, /more than 12h old/);
   assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'cleared on the re-entry, not left armed');
 });
 
 test('a stale arm under a NEWER request drops the arm but never the newer request', () => {
-  // The token check must run before the age gate: the age gate deletes the request, which is only
+  // The token check must run before the age check: expiring deletes the request, which is only
   // safe once the request is proven to be the one that authorised this arm.
   const id = 'sAgedOldToken';
   arm(id);
-  restamp(id, Date.now() - 13 * HOUR);
+  age(id, { wall: 13 * HOUR });
   const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
   toggle('toggle request-off', id);
   writeFileSync(join(flagDir(), `${id}.json`), flagBytes);   // the arm survives the withdrawal
@@ -607,4 +685,17 @@ test('a stale arm under a NEWER request drops the arm but never the newer reques
   assert.doesNotMatch(out, /would start PC shutdown/);
   assert.ok(existsSync(join(flagDir(), `${id}.request`)), 'the newer standing request survives');
   assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'the stale arm does not');
+});
+
+test('status and toggle on leave a stale arm under a NEWER request to the Stop hook', () => {
+  // Same ordering rule for the toggle commands: they expire only an arm bound to the live request.
+  const id = 'sAgedOldTokenCmd';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  toggle('toggle request-off', id);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);
+  toggle('toggle request-on', id);
+  assert.match(toggle('toggle status', id).out, /Standing request: ACTIVE\./, 'the newer request is reported');
+  assert.ok(existsSync(join(flagDir(), `${id}.request`)), 'and not deleted by status');
 });

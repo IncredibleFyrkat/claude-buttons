@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, uptime } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,9 +44,9 @@ const MACHINE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 // powers the PC off in a session the user believes is live, so it is cleared instead. Only ever
 // makes the feature MORE conservative: it can prevent a power-off, never cause one.
 const ARM_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
-// How far in the FUTURE an arm stamp may lie and still be believed (ordinary clock correction).
-// Anything beyond is not an age we can trust - a stamp from a clock that was wrong, or one written
-// by hand - and an arm that cannot be aged must not be allowed to sit armed indefinitely.
+// How far the wall clock and the machine's uptime may disagree about an arm's age (ordinary clock
+// correction). Beyond that the wall clock was changed after the arm - set back, an arm reads
+// younger than it is - and an age we cannot trust must not keep a power-off armed.
 const ARM_CLOCK_SKEW_MS = 5 * 60 * 1000; // 5 minutes
 const LOG_FILE = join(FLAG_DIR, 'shutdown-on-done.log');
 const logLine = (msg) => {
@@ -161,6 +161,62 @@ const requestStillLive = (parsedFlag, id) => {
   const live = requestToken(id);
   return live !== null && typeof parsedFlag?.req === 'string' && parsedFlag.req === live;
 };
+
+// THE ARM'S AGE. The consent token proves an arm belongs to the request on disk NOW; it says
+// nothing about WHEN. The fire path deletes the request, so a request that is still there is one
+// that never fired - and an arm left over from yesterday passes the token check intact. Reported
+// by @RasmusKD: a next-turn arm consumed a day later fired then, in a session the user believed
+// was live. So an arm is bounded the way the machine switch is (ARM_MAX_AGE_MS).
+//
+// Two clocks, both stamped at `toggle on` and carried unchanged through the countdown decrement:
+// the wall clock (armedAt) and the machine's uptime (armedUp), which only moves forward within a
+// boot and keeps counting through sleep. In the JSON, not the file mtime: the decrement rewrites
+// the flag and an antivirus or backup touch bumps mtime, so mtime would read "just armed".
+//
+// Returns null for an arm that may still fire, else [log reason, user-facing reason]. Fails
+// CLOSED on every arm that cannot be aged: a missing or non-numeric stamp (an arm written by an
+// older build), uptime that went backwards (the PC restarted since - that sitting is over), or a
+// wall clock that disagrees with uptime (changed since the arm, which also covers a stamp in the
+// future). The older of the two ages counts, so neither clock alone can make an arm look young.
+const upMs = () => Math.round(uptime() * 1000);
+const armAgeProblem = (parsedFlag) => {
+  const at = parsedFlag?.armedAt;
+  const up = parsedFlag?.armedUp;
+  if (!Number.isFinite(at) || !Number.isFinite(up)) return ['has no usable arm time', 'could not be dated'];
+  const wallAge = Date.now() - at;
+  const upAge = upMs() - up;
+  if (upAge < 0) return ['predates the last restart', 'was made before the PC last restarted'];
+  if (Math.abs(wallAge - upAge) > ARM_CLOCK_SKEW_MS) {
+    return ['has a wall-clock age that disagrees with uptime', 'could not be dated reliably (the clock was changed after it was armed)'];
+  }
+  const age = Math.max(wallAge, upAge);
+  if (age > ARM_MAX_AGE_MS) return [`is ${Math.round(age / 3600000)}h old`, 'was more than 12h old'];
+  return null;
+};
+// Drop an arm that failed armAgeProblem() AND the standing request it was bound to. Call ONLY
+// once requestStillLive() has confirmed that binding, so the request deleted is the one that
+// authorised this arm rather than a newer one. The request must go: left standing, the agent could
+// renew the arm with the pre-authorised `toggle on` and re-arm yesterday's consent without asking;
+// with it gone, arming again needs `request-on`, i.e. the user's approval. Separate guards, so a
+// failed flag delete cannot stop the request delete; a flag that survives fails the check again.
+// (A request written between the token check and this delete would be lost too. The only writer
+// of a chat's request is that chat's agent, which is not running while its own Stop hook is, and
+// losing one only ever means NOT shutting down.)
+const expireArm = (id, problem) => {
+  try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
+  try { rmSync(requestPath(id), { force: true, recursive: true }); } catch {}
+  logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down`);
+};
+// The same check for the toggle commands, so an expired arm is never reported as live or renewed.
+// Acts only on an arm bound to the live request; anything else is left for the Stop hook.
+const expireAgedArm = (id) => {
+  let parsedFlag = null;
+  try { parsedFlag = JSON.parse(readFileSync(flagPath(id), 'utf8')); } catch { return null; }
+  if (!parsedFlag || typeof parsedFlag !== 'object' || !requestStillLive(parsedFlag, id)) return null;
+  const problem = armAgeProblem(parsedFlag);
+  if (problem) expireArm(id, problem);
+  return problem;
+};
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 
 // Whether the Stop hook is re-entering within the same user-visible turn. ONE normalizer used
@@ -236,9 +292,15 @@ if (mode === 'toggle') {
     // The physical-switch flow is unaffected in practice: a real external trigger writes to
     // the filesystem anyway, so it should write BOTH the marker and a `<session>.request`.
     // That keeps the two sides in different hands, which is the property that matters.
+    // An expired arm still on disk must not be renewed by arming over it: that would stamp
+    // yesterday's request with a fresh time and fire at the end of THIS response without the user
+    // being asked again. Expire it, with its request, first; the check below then refuses.
+    const expired = expireAgedArm(id);
     if (!existsSync(requestPath(id))) {
       console.log(
-        'Refused: no standing shutdown request for this chat. Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
+        'Refused: no standing shutdown request for this chat' +
+          (expired ? ` (its previous arm ${expired[1]}, so it was cleared together with its request)` : '') +
+          '. Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
       );
       logLine(`ARM refused for session ${id}: no standing request`);
       process.exit(0);
@@ -259,10 +321,11 @@ if (mode === 'toggle') {
     let armed = false;
     try {
       mkdirSync(FLAG_DIR, { recursive: true });
-      // armedAt is what the Stop hook ages the arm by (ARM_MAX_AGE_MS). It lives in the JSON, not
-      // in the file's mtime: the countdown decrement rewrites the flag, and an antivirus or backup
-      // touch bumps mtime, so mtime would read "just armed" on exactly the path the bound guards.
-      armed = writeFlagAtomic(flagPath(id), JSON.stringify({ skip: thisTurn ? 0 : 1, req, armedAt: Date.now() }));
+      // armedAt + armedUp: what the Stop hook ages the arm by (see armAgeProblem).
+      armed = writeFlagAtomic(
+        flagPath(id),
+        JSON.stringify({ skip: thisTurn ? 0 : 1, req, armedAt: Date.now(), armedUp: upMs() }),
+      );
     } catch { armed = false; }
     if (!armed) {
       discardFlag(flagPath(id));   // never leave a half-written arm behind a "not armed" message
@@ -329,7 +392,12 @@ if (mode === 'toggle') {
         : 'Disarmed this chat (+ machine switch): this chat will no longer shut down the PC.',
     );
   } else {
-    const chat = existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
+    // Expire an aged arm BEFORE reporting: the skill re-arms only on `Standing request: ACTIVE`,
+    // so reporting an expired arm's request as active would invite the very renewal refused above.
+    const expired = expireAgedArm(id);
+    const chat = expired
+      ? `Not armed for this chat (its arm ${expired[1]}, so it was cleared together with its request).`
+      : existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
     const req = existsSync(requestPath(id)) ? 'Standing request: ACTIVE.' : 'Standing request: none.';
     const machine = existsSync(MACHINE_FLAG) ? 'Machine-wide switch: ARMED.' : 'Machine-wide switch: off.';
     console.log(`${chat} ${req} ${machine}`);
@@ -437,35 +505,16 @@ if (!requestStillLive(parsed, id)) {
   process.exit(0);
 }
 
-// THE ARM'S AGE, also re-checked on every run. The consent token above proves the arm belongs to
-// the request that is on disk now; it says nothing about WHEN. The fire path deletes the request,
-// so a request that is still there is one that never fired - and an arm left over from yesterday
-// passes the token check intact. Bound it the way the machine switch is bounded (reported by
-// @RasmusKD: a next-turn arm consumed a day later fired then).
-//
-// Fails CLOSED on every arm that cannot be aged: no stamp (an arm from an older build), a stamp
-// that is not a finite number, or one further in the future than ordinary clock correction.
-// Placed before the same-turn exit and the skip branch, so a stale skip-1 arm is cleared rather
-// than decremented toward firing, and a re-entry is never a window in which it survives.
-const armedAt =
-  typeof parsed.armedAt === 'number' && Number.isFinite(parsed.armedAt) ? parsed.armedAt : null;
-const armAge = armedAt === null ? null : Date.now() - armedAt;
-if (armAge === null || armAge > ARM_MAX_AGE_MS || armAge < -ARM_CLOCK_SKEW_MS) {
-  // BOTH markers go. The token check just proved this request is the one that authorised the
-  // stale arm (so this deletes no newer consent), and leaving it would let the agent renew the
-  // arm with the pre-authorised `toggle on` - re-arming a day-old request without asking. With
-  // it gone, arming again needs `request-on`, i.e. the user's approval. Separate guards: a failed
-  // flag delete must not stop the request delete, and a flag that survives is caught here again.
-  try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
-  try { rmSync(requestPath(id), { force: true, recursive: true }); } catch {}
-  const [why, told] =
-    armAge === null ? ['has no usable arm time', 'could not be dated']
-      : armAge > ARM_MAX_AGE_MS ? [`is ${Math.round(armAge / 3600000)}h old`, 'was more than 12h old']
-      : ['is stamped in the future', 'carried a time in the future'];
-  logLine(`arm for session ${id} ${why}; disarmed WITHOUT shutting down`);
+// THE ARM'S AGE, re-checked on every run too (see armAgeProblem). AFTER the token check, because
+// expiring deletes the request and that is only safe once the request is proven to be this arm's.
+// BEFORE the same-turn exit and the skip branch, so a stale skip-1 arm is cleared rather than
+// decremented toward firing, and a re-entry is never a window in which it survives.
+const ageProblem = armAgeProblem(parsed);
+if (ageProblem) {
+  expireArm(id, ageProblem);
   emit({
     systemMessage:
-      `Shutdown-on-done: this chat's arm ${told}, so the PC was NOT shut down and this chat is now disarmed. ` +
+      `Shutdown-on-done: this chat's arm ${ageProblem[1]}, so the PC was NOT shut down and this chat is now disarmed. ` +
       'Ask for /shutdown-on-done again if you still want it.',
   });
   process.exit(0);
@@ -488,9 +537,10 @@ if (skip > 0) {
   // `req` is carried through the decrement. Dropping it would disarm the chat at the NEXT turn
   // end (the re-verification above fails closed on a missing token), silently killing the very
   // shutdown the message below promises - so the token must survive every rewrite of the flag.
-  // armedAt is carried too, unchanged: the age is measured from the ORIGINAL arm, so a skip-1 arm
-  // that then sits for a day is still caught by the age gate on the turn it would have fired.
-  if (!writeFlagAtomic(flagPath(id), JSON.stringify({ skip: skip - 1, consumedInTurn: true, req: parsed.req, armedAt }))) {
+  // The arm stamps are carried too, unchanged: the age counts from the ORIGINAL arm, so a skip-1
+  // arm that then sits for a day is still caught by the age check on the turn it would have fired.
+  const next = { skip: skip - 1, consumedInTurn: true, req: parsed.req, armedAt: parsed.armedAt, armedUp: parsed.armedUp };
+  if (!writeFlagAtomic(flagPath(id), JSON.stringify(next))) {
     discardFlag(flagPath(id));
     discardFlag(requestPath(id));
     logLine(`countdown write FAILED for session ${id}; disarmed WITHOUT shutting down`);
