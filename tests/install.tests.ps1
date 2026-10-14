@@ -255,6 +255,27 @@ Check 'the skill does not pre-authorise request-on either (SEC-01)' ($allowLine 
 Check 'the skill body still instructs the agent to run request-on (it just prompts)' `
     ((($skillLines -join "`n") -match 'toggle request-on'))
 
+# A fired shutdown FULFILS the request; it does not stand forever. The old bullet said "if the
+# session continues past the arming for any reason, re-arm" - and a chat resumed the morning
+# after a shutdown IS the session continuing, so the agent re-armed from conversation memory
+# the moment the user typed (reported by @RasmusKD). The guard is prose, so these pin that it
+# exists, that the re-arm is gated on what the engine says rather than on memory, and that the
+# unconditional wording cannot come back.
+$skillBody = ($skillLines -join "`n")
+$rearmLine = ($skillLines | Where-Object { $_ -match '^- If the session continues past the arming' } | Select-Object -First 1)
+Check 'the skill says a fired request is fulfilled, not standing' `
+    ($skillBody -match 'fulfilled by a single power-off')
+Check 'the skill forbids arming again after a fire unless the user asks again' `
+    (($skillBody -match 'Do not arm again') -and ($skillBody -match 'only if they explicitly ask again'))
+Check 'the fulfilled-request rule overrides the bullets' ($skillBody -match 'wins over every bullet below')
+Check 'the re-arm bullet still exists (a never-fired arm may still be renewed)' ($null -ne $rearmLine)
+Check 'the re-arm bullet is conditional on the shutdown NOT having fired' ($rearmLine -match 'did NOT fire')
+Check 'the re-arm bullet requires toggle status to report an ACTIVE request first' `
+    (($rearmLine -match 'toggle status') -and ($rearmLine -match 'Standing request: ACTIVE'))
+Check 'an aborted countdown is a cancellation, not a reason to re-arm' ($rearmLine -match 'cancellation, not a reason to re-arm')
+Check 'the old unconditional re-arm instruction is gone' `
+    ($skillBody -notmatch 'continues past the arming for any reason')
+
 # ---- buttons.json must be written under the PANEL'S shared lock (INST-02) ------------------
 # The panel serialises every config write under a named mutex and merges against a fresh read.
 # The installer wrote the same file with no lock at all, so an install concurrent with a panel
