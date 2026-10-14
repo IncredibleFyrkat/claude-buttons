@@ -14,7 +14,7 @@
 //
 // Set SHUTDOWN_ON_DONE_DRYRUN=1 to test the Stop path without touching the PC.
 import {
-  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, appendFileSync, renameSync,
+  readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, lstatSync, appendFileSync, renameSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -154,11 +154,72 @@ const requestToken = (id) => {
   try { return createHash('sha256').update(readFileSync(requestPath(id))).digest('hex').slice(0, 32); }
   catch { return null; }   // missing or unreadable == no live consent, which is the safe answer
 };
-// The flag's recorded token matches a request that is STILL on disk right now. Fails closed on
-// every unknown: no request, unreadable request, no token in the flag (an arm written by an older
-// build), a non-string token, or a mismatch. Not firing is always the recoverable direction.
+// REVOCATION. Deleting a file is not a reliable way to withdraw consent on Windows: antivirus, an
+// indexer or a backup agent can hold the request open so the delete fails, and the request then
+// looks live again the moment the lock clears - with nothing left on disk to say it is void. So
+// consent is withdrawn by TOKEN first: the void token goes into <session>.revoked, and a request
+// whose token is listed there can never authorise or keep an arm, whether or not its file can be
+// removed. `request-on` writes a fresh nonce, so asking again is never blocked by an old entry.
+const revokedPath = (id) => join(FLAG_DIR, `${id}.revoked`);
+const REVOKED_KEEP = 32;
+// The revoked tokens, or null if the list exists but cannot be read - every request then counts
+// as revoked, because failing to honour consent is the recoverable direction.
+const readRevoked = (id) => {
+  try { return readFileSync(revokedPath(id), 'utf8').split('\n').filter(Boolean); }
+  catch (e) { return e.code === 'ENOENT' ? [] : null; }
+};
+// True only if every given token is now provably on the revoked list (writeFlagAtomic reads back).
+const revokeTokens = (id, tokens) => {
+  const add = tokens.filter((t) => typeof t === 'string' && t.length > 0);
+  if (add.length === 0) return false;
+  const have = readRevoked(id);
+  if (have === null) return false;
+  const all = [...new Set([...have, ...add])].slice(-REVOKED_KEEP);
+  try {
+    mkdirSync(FLAG_DIR, { recursive: true });
+    return writeFlagAtomic(revokedPath(id), `${all.join('\n')}\n`);
+  } catch { return false; }
+};
+// The token of the request on disk, if it is readable AND not revoked; else null.
+const liveRequestToken = (id) => {
+  const t = requestToken(id);
+  if (t === null) return null;
+  const revoked = readRevoked(id);
+  return revoked !== null && !revoked.includes(t) ? t : null;
+};
+// True only if the path is provably absent afterwards. A failed delete, or a probe that fails for
+// any reason other than "does not exist" (access denied, a filter driver), counts as STILL THERE.
+const removeVerified = (p) => {
+  try { rmSync(p, { force: true, recursive: true }); } catch {}
+  try { lstatSync(p); return false; } catch (e) { return e.code === 'ENOENT'; }
+};
+// Withdraw consent: revoke the arm's token and the current request's, then remove the request and
+// the arm. requestVoid = no request on disk can authorise an arm any more (the current request's
+// token is revoked, or the request is provably gone). armSafe = the arm is gone or its token is
+// revoked, so it can never fire. Used by `toggle off`, `request-off` and the unreadable-flag path.
+const withdrawConsent = (id, armToken) => {
+  const reqTok = requestToken(id);
+  const revoked = revokeTokens(id, [armToken, reqTok]);
+  const requestGone = removeVerified(requestPath(id));
+  const armGone = removeVerified(flagPath(id));
+  return {
+    requestVoid: requestGone || (revoked && reqTok !== null),
+    armSafe: armGone || (revoked && typeof armToken === 'string'),
+  };
+};
+// A revoked request left behind by a lock is removed whenever it can be, so the panel's power
+// button (which mirrors *.request) stops showing it. Never touches a live request.
+const dropRevokedRequest = (id) => {
+  const t = requestToken(id);
+  const revoked = readRevoked(id);
+  if (t !== null && revoked !== null && revoked.includes(t)) removeVerified(requestPath(id));
+};
+// The flag's recorded token matches a request that is STILL on disk right now and not revoked.
+// Fails closed on every unknown: no request, unreadable request, a revoked request, no token in
+// the flag (an arm written by an older build), a non-string token, or a mismatch. Not firing is
+// always the recoverable direction.
 const requestStillLive = (parsedFlag, id) => {
-  const live = requestToken(id);
+  const live = liveRequestToken(id);
   return live !== null && typeof parsedFlag?.req === 'string' && parsedFlag.req === live;
 };
 
@@ -181,9 +242,9 @@ const requestStillLive = (parsedFlag, id) => {
 // Not a boot id: a restart is only caught once it shows in the clocks, so an arm made within a few
 // minutes of boot can outlive a quick restart. That arm is still bounded by the 12h ceiling.
 //
-// Once an arm fails this, it fails it on every later run too (uptime only grows within a boot, and
-// a restart or a clock change keeps the arm failing), so an aged arm can NEVER fire. That is what
-// lets settleAgedArm keep one on disk as a tombstone.
+// A failure here is NOT permanent: a clock put right again, or a quick restart once uptime passes
+// the stamp, can make a failed arm look in date. So a failed arm is never merely left on disk to
+// keep failing - settleAgedArm revokes its token, which no clock can undo.
 const upMs = () => Math.round(uptime() * 1000);
 const armAgeProblem = (parsedFlag) => {
   const at = parsedFlag?.armedAt;
@@ -201,38 +262,46 @@ const armAgeProblem = (parsedFlag) => {
 };
 // Settle an arm that failed armAgeProblem(). Its standing request is VOID: left standing, the
 // agent could renew the arm with the pre-authorised `toggle on` and re-arm yesterday's consent
-// without asking; with it gone, arming again needs `request-on`, i.e. the user's approval.
+// without asking; void, arming again needs `request-on`, i.e. the user's approval.
 //
-// Request FIRST, verified, and only then the arm. If the request cannot be removed (a Windows lock:
-// antivirus, an indexer, a backup agent), the aged arm stays on disk as a TOMBSTONE: it can never
-// fire, and while it exists every path - this hook, `toggle status`, `toggle on` - refuses and
-// retries, instead of seeing a live-looking request with nothing left to say it is void.
+// The arm's token is REVOKED first - that is what makes the request void, durably, whatever the
+// clocks do later and whether or not its file can be deleted. Then the request and the arm are
+// removed. The arm is removed only once the request is void; if neither the revocation could be
+// written nor the request removed (nothing in the flag directory can be changed), the arm is kept
+// so every path - this hook, `toggle status`, `toggle on` - keeps refusing while it fails.
 //
-// The one request that is NOT voided is a different, readable one: the arm's token does not match
-// it, so the user made it after this arm (request-on writes a new nonce each time). That consent
-// is theirs and newer; only the aged arm goes. An unreadable request, or an arm with no token,
-// cannot be told apart from the arm's own request, so it is voided - losing a request only ever
-// means NOT shutting down.
+// A different, readable, unrevoked request is NOT voided: the arm's token does not match it, so the
+// user made it after this arm (request-on writes a new nonce each time). That consent is theirs
+// and newer; only the aged arm goes. A request that cannot be read is revoked through the arm's
+// token if it is the arm's own (the only request older than an arm is its own), and otherwise
+// is newer consent; an arm with no token is treated as bound to whatever request is there.
 //
-// Returns { problem, voided, superseded }. voided = no request of this arm's is left on disk.
-// (A request written between the token read and the delete would be lost too. The only writer of a
-// chat's request is that chat's agent, which is not running while its own Stop hook is.)
+// Returns { problem, superseded, voided, armGone }.
+// (A request written between the token read and the revocation would be lost too. The only writer
+// of a chat's request is that chat's agent, which is not running while its own Stop hook is.)
 const settleAgedArm = (id, parsedFlag, problem) => {
-  const live = requestToken(id);
-  const superseded = live !== null && typeof parsedFlag?.req === 'string' && parsedFlag.req !== live;
-  if (!superseded) {
-    try { rmSync(requestPath(id), { force: true, recursive: true }); } catch {}
-    if (existsSync(requestPath(id))) {
-      logLine(`arm for session ${id} ${problem[0]}; its request could NOT be removed - arm kept as a tombstone, NOT shutting down`);
-      return { problem, voided: false, superseded };
-    }
+  const armTok = typeof parsedFlag?.req === 'string' ? parsedFlag.req : undefined;
+  const live = liveRequestToken(id);
+  const superseded = armTok !== undefined && live !== null && live !== armTok;
+  if (superseded) {
+    const armGone = removeVerified(flagPath(id));
+    logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down (a newer request stands)`);
+    return { problem, superseded, voided: true, armGone };
   }
-  try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
-  logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down${superseded ? ' (a newer request stands)' : ''}`);
-  return { problem, voided: true, superseded };
+  const reqTok = armTok === undefined ? requestToken(id) : armTok;
+  const revoked = revokeTokens(id, [reqTok]);
+  const requestGone = removeVerified(requestPath(id));
+  const voided = revoked || requestGone;
+  if (!voided) {
+    logLine(`arm for session ${id} ${problem[0]}; its request could NOT be revoked or removed - arm kept, NOT shutting down`);
+    return { problem, superseded, voided, armGone: false };
+  }
+  const armGone = removeVerified(flagPath(id));
+  logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down`);
+  return { problem, superseded, voided, armGone };
 };
 // The same for the toggle commands, so an aged arm is never reported as live or renewed. Returns
-// null when there is no arm or it is still in date; anything else is settleAgedArm's result.
+// null when there is no readable arm or it is still in date; anything else is settleAgedArm's.
 const settleAgedArmIfAny = (id) => {
   let parsedFlag = null;
   try { parsedFlag = JSON.parse(readFileSync(flagPath(id), 'utf8')); } catch { return null; }
@@ -240,6 +309,22 @@ const settleAgedArmIfAny = (id) => {
   const problem = armAgeProblem(parsedFlag);
   return problem ? settleAgedArm(id, parsedFlag, problem) : null;
 };
+// The arm's consent token, if the flag can be read and carries one.
+const readArmToken = (id) => {
+  try {
+    const f = JSON.parse(readFileSync(flagPath(id), 'utf8'));
+    return typeof f?.req === 'string' ? f.req : undefined;
+  } catch { return undefined; }
+};
+// What a withdrawal that did not fully land must say. Never a success-shaped message.
+const withdrawFailure = (w, machineGone) =>
+  'NOT fully cleared: ' +
+  [
+    !w.armSafe && 'this chat\'s arm could not be removed or revoked, so it may STILL shut the PC down',
+    !w.requestVoid && 'the standing request could not be removed or revoked',
+    !machineGone && 'the machine-wide switch could not be removed',
+  ].filter(Boolean).join('; ') +
+  '. Something is holding files in ~/.claude/shutdown-on-done (antivirus, a backup agent?) - run this again.';
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 
 // Whether the Stop hook is re-entering within the same user-visible turn. ONE normalizer used
@@ -320,11 +405,11 @@ if (mode === 'toggle') {
     // being asked again. Its request is void, so refuse - whether or not the cleanup managed to
     // remove it. Only a request the user made AFTER that arm (superseded) may be armed under.
     const aged = settleAgedArmIfAny(id);
+    dropRevokedRequest(id);
     if (aged && !aged.superseded) {
       console.log(
-        `Refused: no standing shutdown request for this chat (its previous arm ${aged.problem[1]}, so its request has expired` +
-          (aged.voided ? ' and was cleared' : '; it could not be removed yet and will not be honoured') +
-          '). Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
+        `Refused: no standing shutdown request for this chat (its previous arm ${aged.problem[1]}, so its request has expired). ` +
+          'Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
       );
       logLine(`ARM refused for session ${id}: previous arm ${aged.problem[0]}`);
       process.exit(0);
@@ -346,6 +431,14 @@ if (mode === 'toggle') {
       );
       logLine(`ARM refused for session ${id}: standing request unreadable`);
       process.exit(1);
+    }
+    if (liveRequestToken(id) !== req) {
+      console.log(
+        'Refused: the standing shutdown request for this chat has been withdrawn or has expired. ' +
+          'Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
+      );
+      logLine(`ARM refused for session ${id}: standing request revoked`);
+      process.exit(0);
     }
     // Fail CLOSED and LOUDLY. If the flag cannot be put on disk there is no arm, and saying
     // "Armed" would leave the user believing the PC will power off when the work finishes.
@@ -394,18 +487,28 @@ if (mode === 'toggle') {
       );
       process.exit(1);
     }
+    // The new request overwrote the old one, so every revoked token now names a request that no
+    // longer exists. Clear the list (best effort): it also un-sticks a list that became unreadable,
+    // which would otherwise refuse every request. Only AFTER a verified write - if the write had
+    // failed, the old request would still be on disk and its revocation must stand.
+    removeVerified(revokedPath(id));
     console.log('Standing shutdown request recorded for this chat.');
   } else if (action === 'request-off') {
     // Withdrawing the request must also drop any arm it authorised. The panel's toggle
     // watches *.request via stateGlob, so clearing only the marker made the power button
     // go dark while the chat stayed armed and the PC still shut down - the UI actively
     // asserting "not armed" about a machine that was.
-    rmSync(requestPath(id), { force: true });
-    rmSync(flagPath(id), { force: true });
+    // Revoked by token first (withdrawConsent), so a request a lock keeps on disk is still void.
+    const w = withdrawConsent(id, readArmToken(id));
     // ...and the machine switch, which `toggle off` already clears. Leaving it meant the
     // wake re-armed the chat at the next turn end, so the user read a withdrawal
     // confirmation and the PC still powered off.
-    rmSync(MACHINE_FLAG, { force: true });
+    const machineGone = removeVerified(MACHINE_FLAG);
+    if (!w.requestVoid || !w.armSafe || !machineGone) {
+      logLine(`REQUEST-OFF incomplete for session ${id} (request void ${w.requestVoid}, arm safe ${w.armSafe}, switch gone ${machineGone})`);
+      console.error(withdrawFailure(w, machineGone));
+      process.exit(1);
+    }
     console.log('Standing shutdown request cleared for this chat (and any arm it authorised).');
   } else if (action === 'off') {
     // Per-chat disarm: cancel THIS chat only. Arming is per-chat, so cancelling
@@ -413,10 +516,17 @@ if (mode === 'toggle') {
     // still wants armed. The global power button stays lit while any OTHER chat is
     // armed (its *.request glob still matches), which honestly signals "still armed
     // elsewhere" rather than going dark on a shutdown that is actually still coming.
-    rmSync(flagPath(id), { force: true });
-    rmSync(requestPath(id), { force: true });
-    rmSync(MACHINE_FLAG, { force: true });
+    // Revoked by token first (withdrawConsent), so a request a lock keeps on disk is still void.
+    // Every step is guarded and the countdown abort ALWAYS runs: a lock on one file used to throw
+    // here before `shutdown -a`, leaving a countdown the user had just cancelled still running.
+    const w = withdrawConsent(id, readArmToken(id));
+    const machineGone = removeVerified(MACHINE_FLAG);
     const abort = spawnSync(SHUTDOWN_EXE, ['-a'], { stdio: 'pipe' });
+    if (!w.requestVoid || !w.armSafe || !machineGone) {
+      logLine(`OFF incomplete for session ${id} (request void ${w.requestVoid}, arm safe ${w.armSafe}, switch gone ${machineGone})`);
+      console.error(withdrawFailure(w, machineGone));
+      process.exit(1);
+    }
     console.log(
       abort.status === 0
         ? 'Disarmed this chat (+ machine switch), and aborted a shutdown countdown that was already in flight.'
@@ -426,13 +536,18 @@ if (mode === 'toggle') {
     // Settle an aged arm BEFORE reporting: the skill re-arms only on `Standing request: ACTIVE`,
     // so reporting a void request as active would invite the very renewal `toggle on` refuses.
     const aged = settleAgedArmIfAny(id);
-    const agedHere = aged && !aged.superseded;
-    const chat = agedHere
-      ? `Not armed for this chat (its arm ${aged.problem[1]}, so ${aged.voided ? 'it was cleared together with its request' : 'its request has expired'}).`
-      : existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
-    const req = agedHere && !aged.voided
-      ? 'Standing request: EXPIRED (it could not be removed yet and will not be honoured).'
-      : existsSync(requestPath(id)) ? 'Standing request: ACTIVE.' : 'Standing request: none.';
+    dropRevokedRequest(id);
+    let flagNow = null;
+    try { flagNow = JSON.parse(readFileSync(flagPath(id), 'utf8')); } catch {}
+    const chat = aged && !aged.superseded
+      ? `Not armed for this chat (its arm ${aged.problem[1]}, so it was disarmed and its request expired).`
+      : flagNow !== null && requestStillLive(flagNow, id) ? 'Armed for this chat.'
+      : existsSync(flagPath(id)) ? 'Not armed for this chat (a leftover arm has no live request; it will not fire).'
+      : 'Not armed for this chat.';
+    // ACTIVE only for a request that can actually authorise an arm: the skill re-arms on ACTIVE.
+    const req = liveRequestToken(id) !== null ? 'Standing request: ACTIVE.'
+      : existsSync(requestPath(id)) ? 'Standing request: EXPIRED (withdrawn, expired or unreadable; it will not be honoured).'
+      : 'Standing request: none.';
     const machine = existsSync(MACHINE_FLAG) ? 'Machine-wide switch: ARMED.' : 'Machine-wide switch: off.';
     console.log(`${chat} ${req} ${machine}`);
   }
@@ -500,10 +615,9 @@ if (skip === null) {
   // disarming would be its own trap ("I armed it and nothing happened"). recursive+try:
   // a directory-shaped flag made rmSync throw here, killing the hook BEFORE the message
   // was emitted, so every turn crashed with a raw stack trace and the bad flag survived.
-  try {
-    rmSync(flagPath(id), { force: true, recursive: true });
-    rmSync(requestPath(id), { force: true, recursive: true });
-  } catch {}
+  // withdrawConsent revokes before it deletes and guards every step, so a lock on the request
+  // cannot leave it standing as live consent once the unreadable flag is gone.
+  withdrawConsent(id, typeof parsed?.req === 'string' ? parsed.req : undefined);
   logLine(`flag unreadable/invalid for session ${id}; disarmed WITHOUT shutting down`);
   emit({
     systemMessage:
@@ -514,17 +628,17 @@ if (skip === null) {
 
 // THE ARM'S AGE, re-checked on every run too (see armAgeProblem / settleAgedArm). Ahead of the
 // token check: settleAgedArm makes its own token comparison to decide which request it may void,
-// and an aged arm must stay a tombstone even when its request is unreadable - the token check
-// below would drop the arm and leave a void request looking live. Ahead of the same-turn exit and
-// the skip branch as well, so a stale skip-1 arm is settled rather than decremented toward firing,
-// and a re-entry is never a window in which it survives.
+// and must revoke an aged arm's request even when that request is unreadable right now - the token
+// check below would drop the arm and leave the request to look live once it can be read again.
+// Ahead of the same-turn exit and the skip branch as well, so a stale skip-1 arm is settled rather
+// than decremented toward firing, and a re-entry is never a window in which it survives.
 const ageProblem = armAgeProblem(parsed);
 if (ageProblem) {
   const settled = settleAgedArm(id, parsed, ageProblem);
   emit({
     systemMessage:
       `Shutdown-on-done: this chat's arm ${ageProblem[1]}, so the PC was NOT shut down and this chat is now disarmed` +
-      (settled.voided ? '' : ' (its request could not be removed yet; it will not be honoured)') +
+      (settled.voided ? '' : ' (its files could not be changed; it will keep being refused)') +
       '. Ask for /shutdown-on-done again if you still want it.',
   });
   process.exit(0);

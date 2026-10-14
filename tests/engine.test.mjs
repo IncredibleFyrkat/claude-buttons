@@ -718,11 +718,12 @@ test('toggle on under a NEWER request replaces a stale arm with a fresh one boun
   assert.match(stop({ session_id: id }).out, /would start PC shutdown/);
 });
 
-// THE REQUEST CANNOT BE REMOVED. Windows refuses to delete a file another process holds open
-// without delete sharing (antivirus, an indexer, a backup agent). Deleting the aged arm anyway
-// would leave a void request that looks live - status would say ACTIVE and `toggle on` would
-// re-arm it. The aged arm must stay as a tombstone until the request is really gone. Held here by
-// a real second process, so no hook inside the engine is needed.
+// WITHDRAWN CONSENT IS REVOKED BY TOKEN, NOT ONLY BY DELETING FILES. Windows refuses to delete a
+// file another process holds open without delete sharing (antivirus, an indexer, a backup agent),
+// and a request that survives its delete looks live again once the lock clears - status said
+// ACTIVE and `toggle on` re-armed it. Every withdrawal now records the void token in
+// <session>.revoked first. The locks here are held by a real second process, so no hook inside the
+// engine is needed.
 function holdOpen(path, share) {             // share: 'Read' (readable, not deletable) or 'None'
   const ps = spawn('powershell.exe', ['-NoProfile', '-Command',
     "$f = [IO.File]::Open($env:CB_HOLD, 'Open', 'Read', $env:CB_SHARE); [Console]::Out.WriteLine('held'); " +
@@ -735,33 +736,143 @@ function holdOpen(path, share) {             // share: 'Read' (readable, not del
   const release = () => new Promise((res) => { ps.on('exit', res); ps.stdin.end(); });
   return { held, release };
 }
+const onWindows = { skip: process.platform !== 'win32' && 'Windows file locking' };
+const exists = (id, ext) => existsSync(join(flagDir(), `${id}.${ext}`));
+
 for (const share of ['Read', 'None']) {
-  test(`a stale arm whose request is LOCKED (share ${share}) stays a tombstone: never ACTIVE, never renewed, never fired`,
-    { skip: process.platform !== 'win32' && 'Windows file locking' }, async () => {
-      const id = `sAgedLocked${share}`;
-      const reqFile = join(flagDir(), `${id}.request`);
-      arm(id);
-      age(id, { wall: 13 * HOUR });
-      const lock = holdOpen(reqFile, share);
-      try {
-        await lock.held;
-        const st = toggle('toggle status', id);
-        assert.doesNotMatch(st.out, /Standing request: ACTIVE/, 'a void request is never reported ACTIVE');
-        assert.match(st.out, /Standing request: EXPIRED/);
-        assert.ok(existsSync(join(flagDir(), `${id}.json`)), 'the aged arm is kept as the tombstone');
-        const before = readFlag(id);
-        const re = toggle('toggle on --this-turn', id);
-        assert.match(re.out, /^Refused/, 'toggle on refuses while the void request survives');
-        assert.equal(readFlag(id).armedAt, before.armedAt, 'no fresh arm was written');
-        const s1 = stop({ session_id: id });
-        assert.doesNotMatch(s1.out, /would start PC shutdown/);
-        assert.ok(existsSync(join(flagDir(), `${id}.json`)), 'the Stop hook keeps the tombstone too');
-      } finally {
-        await lock.release();
-      }
-      // Lock gone: the next look clears both, and the chat is plainly not armed.
-      const st2 = toggle('toggle status', id);
-      assert.match(st2.out, /Standing request: none\./);
-      assert.ok(!existsSync(reqFile) && !existsSync(join(flagDir(), `${id}.json`)), 'both removed once possible');
-    });
+  test(`a stale arm whose request is LOCKED (share ${share}): never ACTIVE, never renewed, never fired`, onWindows, async () => {
+    const id = `sAgedLocked${share}`;
+    arm(id);
+    age(id, { wall: 13 * HOUR });
+    const lock = holdOpen(join(flagDir(), `${id}.request`), share);
+    try {
+      await lock.held;
+      const st = toggle('toggle status', id);
+      assert.doesNotMatch(st.out, /Standing request: ACTIVE/, 'a void request is never reported ACTIVE');
+      assert.match(st.out, /Standing request: EXPIRED/);
+      assert.ok(exists(id, 'request'), 'the lock really did keep the request on disk');
+      const re = toggle('toggle on --this-turn', id);
+      assert.doesNotMatch(re.out, /^Armed/m, 'toggle on must not re-arm a void request');
+      assert.ok(!exists(id, 'json'), 'no fresh arm was written');
+      assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
+    } finally {
+      await lock.release();
+    }
+    // Lock gone: the void request is still void, and is cleared at the next look.
+    assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'still void once readable');
+    assert.match(toggle('toggle status', id).out, /Standing request: none\./);
+    assert.ok(!exists(id, 'request'), 'the revoked request is removed once it can be');
+  });
 }
+
+test('a clock put right again cannot revive an arm that was settled (revocation, not just deletion)', () => {
+  // An arm can fail the age check only transiently (a clock jump, a quick restart). If its files
+  // had survived the cleanup and the clock were then put right, it would look in date again. Its
+  // token is revoked, so it cannot fire. Simulated by restoring both files after the settle - what
+  // a failed delete leaves - with stamps that are perfectly in date.
+  const id = 'sRevived';
+  arm(id);
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  const reqBytes = readFileSync(join(flagDir(), `${id}.request`));
+  age(id, { wall: 1 * HOUR - 10 * 60 * 1000, up: 1 * HOUR });   // wall clock 10 min out
+  assert.match(stop({ session_id: id }).out, /clock was changed/);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);       // the arm "survived"
+  writeFileSync(join(flagDir(), `${id}.request`), reqBytes);     // and so did its request
+  assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/, 'a settled arm stays dead');
+  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m);
+  // Asking again is the way back: request-on is a new nonce, not on the revoked list.
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m);
+  assert.match(stop({ session_id: id }).out, /would start PC shutdown/);
+});
+
+for (const verb of ['toggle off', 'toggle request-off']) {
+  test(`${verb} with the request LOCKED (share Read) still voids it, and still disarms`, onWindows, async () => {
+    const id = `sLockedOff-${verb.split(' ')[1]}`;
+    arm(id);
+    const lock = holdOpen(join(flagDir(), `${id}.request`), 'Read');
+    let r;
+    try {
+      await lock.held;
+      r = toggle(verb, id);
+      assert.ok(!exists(id, 'json'), 'the arm is gone');
+      assert.match(toggle('toggle status', id).out, /Standing request: EXPIRED/, 'never ACTIVE');
+    } finally {
+      await lock.release();
+    }
+    assert.equal(r.code, 0, `revoked by token, so the withdrawal is complete: ${r.err}`);
+    assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'the withdrawn request cannot be re-armed');
+    assert.match(toggle('toggle status', id).out, /Standing request: none\./);
+  });
+
+  test(`${verb} with the request LOCKED (share None) says it is NOT fully cleared`, onWindows, async () => {
+    const id = `sLockedOffNone-${verb.split(' ')[1]}`;
+    arm(id);
+    const lock = holdOpen(join(flagDir(), `${id}.request`), 'None');
+    let r;
+    try {
+      await lock.held;
+      r = toggle(verb, id);
+    } finally {
+      await lock.release();
+    }
+    // Its token cannot be read, so it cannot be proven void: the disarm must not look successful.
+    assert.notEqual(r.code, 0);
+    assert.match(r.err, /NOT fully cleared/);
+    // The arm was revoked by its own token, which is this request's: once readable it is void.
+    assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m);
+    assert.doesNotMatch(stop({ session_id: id }).out, /would start PC shutdown/);
+  });
+}
+
+test('an unreadable arm flag with its request LOCKED still voids the request', onWindows, async () => {
+  const id = 'sCorruptLocked';
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  writeFileSync(join(flagDir(), `${id}.json`), '{"ski');     // a truncated arm
+  const lock = holdOpen(join(flagDir(), `${id}.request`), 'Read');
+  try {
+    await lock.held;
+    const { out } = stop({ session_id: id });
+    assert.match(out, /unreadable/);
+    assert.ok(!exists(id, 'json'), 'the bad flag is consumed');
+  } finally {
+    await lock.release();
+  }
+  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'the request it sat on is void');
+});
+
+test('an unreadable revocation list fails closed, and asking again clears it', () => {
+  const id = 'sRevokedUnreadable';
+  assert.equal(toggle('toggle request-on', id).code, 0);
+  mkdirSync(join(flagDir(), `${id}.revoked`));                 // cannot be read as a list
+  assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+  assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m, 'every request counts as revoked');
+  assert.equal(toggle('toggle request-on', id).code, 0);       // the user asks again
+  assert.ok(!exists(id, 'revoked'), 'request-on clears the obsolete list');
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/m);
+});
+
+test('when consent cannot be voided at all, the aged arm is KEPT and every path refuses', onWindows, async () => {
+  // Nothing in the flag directory can be changed: the revocation list cannot be written (a
+  // directory squats on its name) and the request is locked. The arm must then stay on disk so
+  // the hook, status and toggle on keep finding it and keep refusing, rather than vanish and leave
+  // a request with nothing beside it to say it is void.
+  const id = 'sNothingWritable';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  mkdirSync(join(flagDir(), `${id}.revoked`));
+  const lock = holdOpen(join(flagDir(), `${id}.request`), 'Read');
+  try {
+    await lock.held;
+    const { out } = stop({ session_id: id });
+    assert.doesNotMatch(out, /would start PC shutdown/);
+    assert.match(out, /could not be changed/);
+    assert.ok(exists(id, 'json'), 'the aged arm is kept');
+    assert.doesNotMatch(toggle('toggle status', id).out, /Standing request: ACTIVE/);
+    assert.doesNotMatch(toggle('toggle on --this-turn', id).out, /^Armed/m);
+    assert.ok(exists(id, 'json'), 'and still kept after status and toggle on');
+  } finally {
+    await lock.release();
+  }
+});
