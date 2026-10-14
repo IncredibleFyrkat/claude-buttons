@@ -4,7 +4,7 @@
 // Stop-hook fire path always runs under SHUTDOWN_ON_DONE_DRYRUN=1 so nothing shuts down.
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync, chmodSync } from 'node:fs';
 import { tmpdir, uptime as osUptime } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -610,7 +610,7 @@ test('within the clock tolerance the OLDER of the two ages still counts', () => 
   assert.match(out, /more than 12h old/);
 });
 
-test('an arm made before the PC last restarted does not fire', () => {
+test('an arm whose stored uptime exceeds the current uptime (a restart) fails closed', () => {
   const id = 'sRebooted';
   arm(id);
   age(id, { wall: 1 * HOUR, up: -1 * HOUR });   // uptime is now LOWER than when it was armed
@@ -687,8 +687,8 @@ test('a stale arm under a NEWER request drops the arm but never the newer reques
   assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'the stale arm does not');
 });
 
-test('status and toggle on leave a stale arm under a NEWER request to the Stop hook', () => {
-  // Same ordering rule for the toggle commands: they expire only an arm bound to the live request.
+test('toggle status drops a stale arm under a NEWER request but reports that request ACTIVE', () => {
+  // The newer request is consent the user gave AFTER the aged arm: it is not voided with it.
   const id = 'sAgedOldTokenCmd';
   arm(id);
   age(id, { wall: 13 * HOUR });
@@ -698,4 +698,70 @@ test('status and toggle on leave a stale arm under a NEWER request to the Stop h
   toggle('toggle request-on', id);
   assert.match(toggle('toggle status', id).out, /Standing request: ACTIVE\./, 'the newer request is reported');
   assert.ok(existsSync(join(flagDir(), `${id}.request`)), 'and not deleted by status');
+  assert.ok(!existsSync(join(flagDir(), `${id}.json`)), 'the aged arm is gone');
 });
+
+test('toggle on under a NEWER request replaces a stale arm with a fresh one bound to it', () => {
+  const id = 'sAgedOldTokenArm';
+  arm(id);
+  age(id, { wall: 13 * HOUR });
+  const flagBytes = readFileSync(join(flagDir(), `${id}.json`));
+  const oldReq = readFlag(id).req;
+  toggle('toggle request-off', id);
+  writeFileSync(join(flagDir(), `${id}.json`), flagBytes);
+  toggle('toggle request-on', id);                            // fresh consent, approved by the user
+  const t0 = Date.now();
+  assert.match(toggle('toggle on --this-turn', id).out, /^Armed/, 'the newer request may be armed under');
+  const f = readFlag(id);
+  assert.notEqual(f.req, oldReq, 'bound to the newer request');
+  assert.ok(f.armedAt >= t0, 'freshly stamped');
+  assert.match(stop({ session_id: id }).out, /would start PC shutdown/);
+});
+
+// THE REQUEST CANNOT BE REMOVED. Windows refuses to delete a file another process holds open
+// without delete sharing (antivirus, an indexer, a backup agent). Deleting the aged arm anyway
+// would leave a void request that looks live - status would say ACTIVE and `toggle on` would
+// re-arm it. The aged arm must stay as a tombstone until the request is really gone. Held here by
+// a real second process, so no hook inside the engine is needed.
+function holdOpen(path, share) {             // share: 'Read' (readable, not deletable) or 'None'
+  const ps = spawn('powershell.exe', ['-NoProfile', '-Command',
+    "$f = [IO.File]::Open($env:CB_HOLD, 'Open', 'Read', $env:CB_SHARE); [Console]::Out.WriteLine('held'); " +
+    '[Console]::Out.Flush(); [void][Console]::In.ReadLine(); $f.Close()'],
+    { env: { ...process.env, CB_HOLD: path, CB_SHARE: share }, stdio: ['pipe', 'pipe', 'inherit'] });
+  const held = new Promise((res, rej) => {
+    ps.stdout.on('data', (d) => { if (String(d).includes('held')) res(); });
+    ps.on('exit', (c) => rej(new Error(`holder exited ${c} before holding the file`)));
+  });
+  const release = () => new Promise((res) => { ps.on('exit', res); ps.stdin.end(); });
+  return { held, release };
+}
+for (const share of ['Read', 'None']) {
+  test(`a stale arm whose request is LOCKED (share ${share}) stays a tombstone: never ACTIVE, never renewed, never fired`,
+    { skip: process.platform !== 'win32' && 'Windows file locking' }, async () => {
+      const id = `sAgedLocked${share}`;
+      const reqFile = join(flagDir(), `${id}.request`);
+      arm(id);
+      age(id, { wall: 13 * HOUR });
+      const lock = holdOpen(reqFile, share);
+      try {
+        await lock.held;
+        const st = toggle('toggle status', id);
+        assert.doesNotMatch(st.out, /Standing request: ACTIVE/, 'a void request is never reported ACTIVE');
+        assert.match(st.out, /Standing request: EXPIRED/);
+        assert.ok(existsSync(join(flagDir(), `${id}.json`)), 'the aged arm is kept as the tombstone');
+        const before = readFlag(id);
+        const re = toggle('toggle on --this-turn', id);
+        assert.match(re.out, /^Refused/, 'toggle on refuses while the void request survives');
+        assert.equal(readFlag(id).armedAt, before.armedAt, 'no fresh arm was written');
+        const s1 = stop({ session_id: id });
+        assert.doesNotMatch(s1.out, /would start PC shutdown/);
+        assert.ok(existsSync(join(flagDir(), `${id}.json`)), 'the Stop hook keeps the tombstone too');
+      } finally {
+        await lock.release();
+      }
+      // Lock gone: the next look clears both, and the chat is plainly not armed.
+      const st2 = toggle('toggle status', id);
+      assert.match(st2.out, /Standing request: none\./);
+      assert.ok(!existsSync(reqFile) && !existsSync(join(flagDir(), `${id}.json`)), 'both removed once possible');
+    });
+}

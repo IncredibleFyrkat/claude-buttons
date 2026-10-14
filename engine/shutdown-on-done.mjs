@@ -175,9 +175,15 @@ const requestStillLive = (parsedFlag, id) => {
 //
 // Returns null for an arm that may still fire, else [log reason, user-facing reason]. Fails
 // CLOSED on every arm that cannot be aged: a missing or non-numeric stamp (an arm written by an
-// older build), uptime that went backwards (the PC restarted since - that sitting is over), or a
+// older build), uptime lower than at arming (the PC restarted since - that sitting is over), or a
 // wall clock that disagrees with uptime (changed since the arm, which also covers a stamp in the
 // future). The older of the two ages counts, so neither clock alone can make an arm look young.
+// Not a boot id: a restart is only caught once it shows in the clocks, so an arm made within a few
+// minutes of boot can outlive a quick restart. That arm is still bounded by the 12h ceiling.
+//
+// Once an arm fails this, it fails it on every later run too (uptime only grows within a boot, and
+// a restart or a clock change keeps the arm failing), so an aged arm can NEVER fire. That is what
+// lets settleAgedArm keep one on disk as a tombstone.
 const upMs = () => Math.round(uptime() * 1000);
 const armAgeProblem = (parsedFlag) => {
   const at = parsedFlag?.armedAt;
@@ -193,29 +199,46 @@ const armAgeProblem = (parsedFlag) => {
   if (age > ARM_MAX_AGE_MS) return [`is ${Math.round(age / 3600000)}h old`, 'was more than 12h old'];
   return null;
 };
-// Drop an arm that failed armAgeProblem() AND the standing request it was bound to. Call ONLY
-// once requestStillLive() has confirmed that binding, so the request deleted is the one that
-// authorised this arm rather than a newer one. The request must go: left standing, the agent could
-// renew the arm with the pre-authorised `toggle on` and re-arm yesterday's consent without asking;
-// with it gone, arming again needs `request-on`, i.e. the user's approval. Separate guards, so a
-// failed flag delete cannot stop the request delete; a flag that survives fails the check again.
-// (A request written between the token check and this delete would be lost too. The only writer
-// of a chat's request is that chat's agent, which is not running while its own Stop hook is, and
-// losing one only ever means NOT shutting down.)
-const expireArm = (id, problem) => {
+// Settle an arm that failed armAgeProblem(). Its standing request is VOID: left standing, the
+// agent could renew the arm with the pre-authorised `toggle on` and re-arm yesterday's consent
+// without asking; with it gone, arming again needs `request-on`, i.e. the user's approval.
+//
+// Request FIRST, verified, and only then the arm. If the request cannot be removed (a Windows lock:
+// antivirus, an indexer, a backup agent), the aged arm stays on disk as a TOMBSTONE: it can never
+// fire, and while it exists every path - this hook, `toggle status`, `toggle on` - refuses and
+// retries, instead of seeing a live-looking request with nothing left to say it is void.
+//
+// The one request that is NOT voided is a different, readable one: the arm's token does not match
+// it, so the user made it after this arm (request-on writes a new nonce each time). That consent
+// is theirs and newer; only the aged arm goes. An unreadable request, or an arm with no token,
+// cannot be told apart from the arm's own request, so it is voided - losing a request only ever
+// means NOT shutting down.
+//
+// Returns { problem, voided, superseded }. voided = no request of this arm's is left on disk.
+// (A request written between the token read and the delete would be lost too. The only writer of a
+// chat's request is that chat's agent, which is not running while its own Stop hook is.)
+const settleAgedArm = (id, parsedFlag, problem) => {
+  const live = requestToken(id);
+  const superseded = live !== null && typeof parsedFlag?.req === 'string' && parsedFlag.req !== live;
+  if (!superseded) {
+    try { rmSync(requestPath(id), { force: true, recursive: true }); } catch {}
+    if (existsSync(requestPath(id))) {
+      logLine(`arm for session ${id} ${problem[0]}; its request could NOT be removed - arm kept as a tombstone, NOT shutting down`);
+      return { problem, voided: false, superseded };
+    }
+  }
   try { rmSync(flagPath(id), { force: true, recursive: true }); } catch {}
-  try { rmSync(requestPath(id), { force: true, recursive: true }); } catch {}
-  logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down`);
+  logLine(`arm for session ${id} ${problem[0]}; disarmed WITHOUT shutting down${superseded ? ' (a newer request stands)' : ''}`);
+  return { problem, voided: true, superseded };
 };
-// The same check for the toggle commands, so an expired arm is never reported as live or renewed.
-// Acts only on an arm bound to the live request; anything else is left for the Stop hook.
-const expireAgedArm = (id) => {
+// The same for the toggle commands, so an aged arm is never reported as live or renewed. Returns
+// null when there is no arm or it is still in date; anything else is settleAgedArm's result.
+const settleAgedArmIfAny = (id) => {
   let parsedFlag = null;
   try { parsedFlag = JSON.parse(readFileSync(flagPath(id), 'utf8')); } catch { return null; }
-  if (!parsedFlag || typeof parsedFlag !== 'object' || !requestStillLive(parsedFlag, id)) return null;
+  if (!parsedFlag || typeof parsedFlag !== 'object' || Array.isArray(parsedFlag)) return null;
   const problem = armAgeProblem(parsedFlag);
-  if (problem) expireArm(id, problem);
-  return problem;
+  return problem ? settleAgedArm(id, parsedFlag, problem) : null;
 };
 const emit = (obj) => process.stdout.write(JSON.stringify(obj));
 
@@ -292,15 +315,23 @@ if (mode === 'toggle') {
     // The physical-switch flow is unaffected in practice: a real external trigger writes to
     // the filesystem anyway, so it should write BOTH the marker and a `<session>.request`.
     // That keeps the two sides in different hands, which is the property that matters.
-    // An expired arm still on disk must not be renewed by arming over it: that would stamp
+    // An aged arm still on disk must not be renewed by arming over it: that would stamp
     // yesterday's request with a fresh time and fire at the end of THIS response without the user
-    // being asked again. Expire it, with its request, first; the check below then refuses.
-    const expired = expireAgedArm(id);
+    // being asked again. Its request is void, so refuse - whether or not the cleanup managed to
+    // remove it. Only a request the user made AFTER that arm (superseded) may be armed under.
+    const aged = settleAgedArmIfAny(id);
+    if (aged && !aged.superseded) {
+      console.log(
+        `Refused: no standing shutdown request for this chat (its previous arm ${aged.problem[1]}, so its request has expired` +
+          (aged.voided ? ' and was cleared' : '; it could not be removed yet and will not be honoured') +
+          '). Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
+      );
+      logLine(`ARM refused for session ${id}: previous arm ${aged.problem[0]}`);
+      process.exit(0);
+    }
     if (!existsSync(requestPath(id))) {
       console.log(
-        'Refused: no standing shutdown request for this chat' +
-          (expired ? ` (its previous arm ${expired[1]}, so it was cleared together with its request)` : '') +
-          '. Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
+        'Refused: no standing shutdown request for this chat. Run `toggle request-on` first (the /shutdown-on-done skill does this, and it asks you to approve it).',
       );
       logLine(`ARM refused for session ${id}: no standing request`);
       process.exit(0);
@@ -392,13 +423,16 @@ if (mode === 'toggle') {
         : 'Disarmed this chat (+ machine switch): this chat will no longer shut down the PC.',
     );
   } else {
-    // Expire an aged arm BEFORE reporting: the skill re-arms only on `Standing request: ACTIVE`,
-    // so reporting an expired arm's request as active would invite the very renewal refused above.
-    const expired = expireAgedArm(id);
-    const chat = expired
-      ? `Not armed for this chat (its arm ${expired[1]}, so it was cleared together with its request).`
+    // Settle an aged arm BEFORE reporting: the skill re-arms only on `Standing request: ACTIVE`,
+    // so reporting a void request as active would invite the very renewal `toggle on` refuses.
+    const aged = settleAgedArmIfAny(id);
+    const agedHere = aged && !aged.superseded;
+    const chat = agedHere
+      ? `Not armed for this chat (its arm ${aged.problem[1]}, so ${aged.voided ? 'it was cleared together with its request' : 'its request has expired'}).`
       : existsSync(flagPath(id)) ? 'Armed for this chat.' : 'Not armed for this chat.';
-    const req = existsSync(requestPath(id)) ? 'Standing request: ACTIVE.' : 'Standing request: none.';
+    const req = agedHere && !aged.voided
+      ? 'Standing request: EXPIRED (it could not be removed yet and will not be honoured).'
+      : existsSync(requestPath(id)) ? 'Standing request: ACTIVE.' : 'Standing request: none.';
     const machine = existsSync(MACHINE_FLAG) ? 'Machine-wide switch: ARMED.' : 'Machine-wide switch: off.';
     console.log(`${chat} ${req} ${machine}`);
   }
@@ -478,6 +512,24 @@ if (skip === null) {
   process.exit(0);
 }
 
+// THE ARM'S AGE, re-checked on every run too (see armAgeProblem / settleAgedArm). Ahead of the
+// token check: settleAgedArm makes its own token comparison to decide which request it may void,
+// and an aged arm must stay a tombstone even when its request is unreadable - the token check
+// below would drop the arm and leave a void request looking live. Ahead of the same-turn exit and
+// the skip branch as well, so a stale skip-1 arm is settled rather than decremented toward firing,
+// and a re-entry is never a window in which it survives.
+const ageProblem = armAgeProblem(parsed);
+if (ageProblem) {
+  const settled = settleAgedArm(id, parsed, ageProblem);
+  emit({
+    systemMessage:
+      `Shutdown-on-done: this chat's arm ${ageProblem[1]}, so the PC was NOT shut down and this chat is now disarmed` +
+      (settled.voided ? '' : ' (its request could not be removed yet; it will not be honoured)') +
+      '. Ask for /shutdown-on-done again if you still want it.',
+  });
+  process.exit(0);
+}
+
 // THE SECOND SIDE OF THE GATE, AT THE DANGEROUS OPERATION.
 //
 // Everything below this line can power the machine off, so the standing request is re-verified
@@ -501,21 +553,6 @@ if (!requestStillLive(parsed, id)) {
     systemMessage:
       'Shutdown-on-done: this chat was armed, but the standing shutdown request that authorised it is gone ' +
       '(or belongs to a later request), so the PC was NOT shut down and this chat is now disarmed. Re-arm if you still want it.',
-  });
-  process.exit(0);
-}
-
-// THE ARM'S AGE, re-checked on every run too (see armAgeProblem). AFTER the token check, because
-// expiring deletes the request and that is only safe once the request is proven to be this arm's.
-// BEFORE the same-turn exit and the skip branch, so a stale skip-1 arm is cleared rather than
-// decremented toward firing, and a re-entry is never a window in which it survives.
-const ageProblem = armAgeProblem(parsed);
-if (ageProblem) {
-  expireArm(id, ageProblem);
-  emit({
-    systemMessage:
-      `Shutdown-on-done: this chat's arm ${ageProblem[1]}, so the PC was NOT shut down and this chat is now disarmed. ` +
-      'Ask for /shutdown-on-done again if you still want it.',
   });
   process.exit(0);
 }
