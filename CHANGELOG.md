@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.11.2 — 2026-10-15
+
+**Shutdown-on-done could power the PC off a second time, or a day late.** Both found and fixed by
+[@RasmusKD](https://github.com/RasmusKD) on his own branch after 1.11.0; his two commits are
+merged under his name, and the follow-ups below build on them.
+
+- **A resumed chat re-armed itself the morning after a fire** (Rasmus). The PC shut down
+  overnight as asked; the next morning the user reopened the chat, typed, and the shutdown was
+  primed again. The engine was not at fault — it clears the standing request before powering
+  off. The skill told the agent, unconditionally, to "re-arm at the new true completion point"
+  if the session continued, and a chat resumed the next day *is* a session continuing. The skill
+  now says a request is fulfilled by one power-off, and before any re-arm the agent must run
+  `toggle status` and may re-arm only if the arm did not fire and the standing request is still
+  `ACTIVE` — from the engine's state, not from its memory of the conversation. Rasmus' version
+  listed an aborted countdown as a reason to re-arm; that is dropped, because aborting the
+  countdown is the user cancelling.
+- **A per-chat arm had no age limit** (Rasmus). An arm written for "the next turn" that was not
+  consumed until the user replied a day later fired then, in a session they believed was live.
+  The July request-token binding does not cover this — it proves an arm belongs to the request on
+  disk, not when it was made. Arms now expire after 12 hours, measured by **both** the wall clock
+  and machine uptime, so setting the clock back cannot make an old arm look young, and most
+  restarts end one. `toggle status` and `toggle on` also settle an expired arm before reporting or
+  re-arming. If its authorising request is still current, they void it and clear the arm where
+  possible; otherwise the arm stays a refused tombstone and that request is never reported
+  `ACTIVE`. A different, newer verified request is kept `ACTIVE` and may be armed under.
+  Without this settling, the skill's own status-then-re-arm step could have refreshed an old arm
+  with a new timestamp.
+- **Withdrawing consent is recorded before it is carried out.** Review kept finding cases where
+  a file held open by antivirus or a backup survived its deletion and later read as live consent.
+  A withdrawal now first writes the voided token to a small marker file, read back to prove it,
+  then deletes. If a request cannot be proven void by a verified marker or a verified deletion, the
+  engine writes and verifies a hold on the whole chat, which stays until a verified fresh
+  `request-on`. If even the hold cannot be verified, the withdrawal reports failure instead of
+  claiming success.
+- **The engine reports only what it proved.** The fire path, `toggle off`, `request-off`, the
+  corrupt-flag path and three failed-write paths no longer claim success they did not verify.
+  `toggle off` always runs `shutdown -a`, and exits 1 if that fails.
+
+Reviewed over eight rounds by gpt-5.6-sol (high); the last found nothing. Tests: 100 engine,
+543 panel, 113 installer, all passing. 55 of 61 mutants fail the suite and the no-op controls
+pass; of the six survivors, three are reachable only through a file-check error no test can
+produce and three were judged equivalent by the reviewer.
+
+**Known limits:** an arm made within a few minutes of boot can outlive a quick restart, because a
+restart is detected through the two clocks rather than a boot id; it is still bounded by the 12-hour
+ceiling. And a *standing request* with no arm still has no age limit — a 12-hour bound
+would also refuse legitimate jobs that finish later than that, so it is left as is by choice. The
+panel's power button does not yet ignore a request that has been voided; that needs a panel
+change and comes separately. One test failed once early in development on a no-op control and
+could not be reproduced in 30+ reruns, including under parallel load.
+
 ## 1.11.1 — 2026-10-14
 
 **Every strip vanished after a Claude update.** Reported from a second machine by another
