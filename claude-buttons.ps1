@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.2'
+$CB_VERSION = '1.11.3'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1992,6 +1992,13 @@ $script:uiaCache.Add([System.Windows.Automation.AutomationElement]::BoundingRect
 # band (the same quantisation the strip ordering uses, because raw Y jitter reorders panes) and
 # each one's boundary is the midpoint to its neighbour in that row. Single-column layouts fall
 # through to the window edges, which is the same answer.
+# The input BOX's edges for a pane: the measured row extents when present, else the composer's
+# own. Room is measured from the box because that is what the side bars must clear - measuring
+# from an Edit composer, which no longer spans the box, overstated the margin by the width of the
+# in-box buttons and could let a bar claim room it then covered the box with.
+function Get-PaneBoxL($p) { if ($null -ne $p.RowL) { return [double][Math]::Min([double]$p.RowL, [double]$p.Cx) }; return [double]$p.Cx }
+function Get-PaneBoxR($p) { $cr = [double]$p.Cx + [double]$p.Cw; if ($null -ne $p.RowR) { return [double][Math]::Max([double]$p.RowR, $cr) }; return $cr }
+
 function Set-PaneSideRooms($panes, $wr) {
     if (-not $panes -or $panes.Count -eq 0) { return }
     # A composer sits inside exactly one pane rect: use that pane's real edges when we have them.
@@ -2003,8 +2010,8 @@ function Set-PaneSideRooms($panes, $wr) {
             if ($ccx -ge $pb.X -and $ccx -le ($pb.X + $pb.W) -and $ccy -ge $pb.Y -and $ccy -le ($pb.Y + $pb.H)) {
                 $p.PaneL = [int]$pb.X
                 $p.PaneR = [int]($pb.X + $pb.W)
-                $p.LeftRoom = [int]($p.Cx - $pb.X)
-                $p.RightRoom = [int](($pb.X + $pb.W) - ($p.Cx + $p.Cw))
+                $p.LeftRoom = [int]((Get-PaneBoxL $p) - $pb.X)
+                $p.RightRoom = [int](($pb.X + $pb.W) - (Get-PaneBoxR $p))
                 $p.BoundsReal = $true
                 $measured++
                 break
@@ -2019,6 +2026,10 @@ function Set-PaneSideRooms($panes, $wr) {
         (($panes | ForEach-Object { "$($_.LeftRoom)/$($_.RightRoom)" }) -join ' '))
     if ($measured -eq $panes.Count) { return }
 
+    # The boundary between two columns is the midpoint between their BOXES, not their composer
+    # elements: an Edit composer no longer spans its box, and its right-hand in-box buttons are far
+    # wider than its left-hand one, so a midpoint between Edits fell inside the left box and left a
+    # bar negative room beside a box that had space.
     # Group by COLUMN, across every row. Grouping by row band handed a pane that happened to be
     # alone in its row the entire window as its margin, so its bars flew out to the window edge
     # while the pane directly below it - same column - got sane bounds. Columns are stable
@@ -2028,21 +2039,30 @@ function Set-PaneSideRooms($panes, $wr) {
         if (-not $p.Cx) { continue }
         $hit = $null
         foreach ($c in $cols) { if ([Math]::Abs($c.X - $p.Cx) -le 40) { $hit = $c; break } }
-        if ($hit) { $hit.Panes += $p; if ($p.Cx -lt $hit.X) { $hit.X = $p.Cx } }
-        else { $cols += , @{ X = [double]$p.Cx; W = [double]$p.Cw; Panes = @($p) } }
+        if ($hit) {
+            $hit.Panes += $p; if ($p.Cx -lt $hit.X) { $hit.X = $p.Cx }
+            $bl = Get-PaneBoxL $p; $br = Get-PaneBoxR $p
+            if ($bl -lt $hit.BL) { $hit.BL = $bl }; if ($br -gt $hit.BR) { $hit.BR = $br }
+        }
+        else { $cols += , @{ X = [double]$p.Cx; W = [double]$p.Cw; BL = (Get-PaneBoxL $p); BR = (Get-PaneBoxR $p); Panes = @($p) } }
     }
     $cols = @($cols | Sort-Object { $_.X })
     for ($i = 0; $i -lt $cols.Count; $i++) {
         $c = $cols[$i]
         $left = if ($i -eq 0) { [double]$wr.Left }
-                else { $pv = $cols[$i - 1]; (($pv.X + $pv.W) + $c.X) / 2 }
+                else { $pv = $cols[$i - 1]; ($pv.BR + $c.BL) / 2 }
         $right = if ($i -eq ($cols.Count - 1)) { [double]$wr.Right }
-                 else { $nx = $cols[$i + 1]; (($c.X + $c.W) + $nx.X) / 2 }
+                 else { $nx = $cols[$i + 1]; ($c.BR + $nx.BL) / 2 }
         foreach ($p in $c.Panes) {
+            # A pane whose rect WAS measured keeps it. The fallback runs whenever any pane went
+            # unmeasured, and used to overwrite the measured ones too - while leaving BoundsReal
+            # set - so one neighbour missing from a read could hide or misclamp a bar beside a
+            # perfectly measured edge (round 3 of 1.11.3). Inference is for the unmeasured only.
+            if ($p.BoundsReal) { continue }
             $p.PaneL = [int]$left
             $p.PaneR = [int]$right
-            $p.LeftRoom = [int]($p.Cx - $left)
-            $p.RightRoom = [int]($right - ($p.Cx + $p.Cw))
+            $p.LeftRoom = [int]((Get-PaneBoxL $p) - $left)
+            $p.RightRoom = [int]($right - (Get-PaneBoxR $p))
         }
     }
 }
@@ -2138,6 +2158,69 @@ function Get-RowSearchLeft($cx, $cy, $ch, $btnRects, $maxInset, $floor, [bool]$i
 # Leftmost X the row search may use for composer $c: the left edge of the pane that contains it,
 # raised to the right edge of any composer beside it on the SAME row (vertical spans overlap).
 # Stacked panes do not overlap vertically, so they never limit each other. $null = no bound known.
+# Right edge of the composer's visible BOX - the mirror of Get-RowSearchLeft, for the right-hand
+# side bar. Measured 2026-10-20: the Edit now ends at x=2842 while Stop (2852..2903) and the mic
+# (2917..2968) sit to its right INSIDE the box, so anchoring the right bar to the Edit's own edge
+# put it on top of those buttons. (On 2026-10-14 the Edit still ran to the mic's right edge, which
+# is why the right side looked fine then.) So: the rightmost button whose centre lies on the
+# composer's own line, starting at or right of it, ending within $maxInset of it and never past
+# $ceiling (this pane's right edge, or the next composer on the same row). A Group composer IS the
+# box and returns its own right edge - old behaviour exactly, checked first.
+# Unlike the left side there is no blind fallback: the left one only widens a SEARCH window, while
+# here the result is where the bar is DRAWN, so without a measured button it stays on the
+# composer's edge, as before.
+function Get-RowSearchRight($cx, $cy, $cw, $ch, $btnRects, $maxInset, $ceiling, [bool]$isGroup) {
+    $cr = [double]$cx + [double]$cw
+    if ($isGroup) { return $cr }
+    $hi = $cr + [double]$maxInset
+    if ($null -ne $ceiling -and [double]$ceiling -lt $hi) { $hi = [double]$ceiling }
+    $right = $cr
+    foreach ($r in @($btnRects)) {
+        if ($null -eq $r) { continue }
+        $mid = [double]$r.Y + [double]$r.H / 2
+        $rr = [double]$r.X + [double]$r.W
+        if ($mid -ge $cy -and $mid -le ($cy + $ch) -and [double]$r.X -ge $cr -and $rr -le $hi) {
+            if ($rr -gt $right) { $right = $rr }
+        }
+    }
+    return $right
+}
+
+# Rightmost X the right-hand box search may use: the right edge of the pane containing the
+# composer (both axes), lowered to the left edge of any composer beside it on the SAME row.
+function Get-ComposerCeiling($c, $composers, $paneBounds, $btnRects) {
+    $ceil = $null
+    $midX = [double]$c.X + [double]$c.W / 2
+    $midY = [double]$c.Y + [double]$c.H / 2
+    foreach ($pb in @($paneBounds)) {
+        if ($null -eq $pb) { continue }
+        if ($midX -ge [double]$pb.X -and $midX -le ([double]$pb.X + [double]$pb.W) -and
+            $midY -ge [double]$pb.Y -and $midY -le ([double]$pb.Y + [double]$pb.H)) {
+            $pr = [double]$pb.X + [double]$pb.W
+            if ($null -eq $ceil -or $pr -lt $ceil) { $ceil = $pr }
+        }
+    }
+    $cRight = [double]$c.X + [double]$c.W
+    $paneCeil = $ceil
+    foreach ($o in @($composers)) {
+        if ($null -eq $o -or [object]::ReferenceEquals($o, $c)) { continue }
+        $overlap = ([double]$o.Y -lt ([double]$c.Y + [double]$c.H)) -and (([double]$o.Y + [double]$o.H) -gt [double]$c.Y)
+        if ($overlap -and [double]$o.X -ge $cRight) {
+            # A MEASURED pane edge lying between the two Edits IS the boundary. Inferring one from
+            # buttons could only tighten it wrongly - round 2 of 1.11.3: one read missing Stop, or
+            # boxes with no gutter, moved it into this box. Infer only when nothing measured does.
+            if ($null -ne $paneCeil -and $paneCeil -ge $cRight -and $paneCeil -le [double]$o.X) { continue }
+            # Not the neighbour's Edit edge: its in-box "+" sits LEFT of that edge, in the gap,
+            # and would pass as this box's right edge (round-1 review of 1.11.3). The boundary is
+            # the boundary between the two boxes (Get-BoxBoundary).
+            $y0 = [Math]::Min([double]$o.Y, [double]$c.Y); $y1 = [Math]::Max([double]$o.Y + [double]$o.H, [double]$c.Y + [double]$c.H)
+            $split = Get-BoxBoundary $cRight ([double]$o.X) $btnRects $y0 $y1
+            if ($null -eq $ceil -or $split -lt $ceil) { $ceil = $split }
+        }
+    }
+    return $ceil
+}
+
 # Lower X bound for the control-row filter: 12 px of tolerance left of the search edge, but never
 # past the floor. Round 4: the tolerance alone crossed a hard floor, so a neighbour's control
 # starting within 12 px left of it could anchor this pane's strip.
@@ -2147,7 +2230,36 @@ function Get-RowFilterLow($left, $floor) {
     return $lowX
 }
 
-function Get-ComposerFloor($c, $composers, $paneBounds) {
+# Where the boundary between two side-by-side composers' BOXES lies, between $fromX (the left
+# composer's right edge) and $toX (the right composer's left edge). Each same-line button lying
+# wholly in between belongs to the Edit its centre is NEARER to - Stop and mic hug the left Edit,
+# "+" hugs the right one - and the boundary is midway between the last left-owned button and the
+# first right-owned one. With none, the plain midpoint.
+# Two rules were tried first and are wrong for this layout. The midpoint between the two EDITS
+# falls inside the left box, because its right-hand buttons (Stop + mic, 126 px) are far wider
+# than the right box's "+" (~35 px). The middle of the WIDEST gap broke as soon as one read missed
+# a button: without Stop, the gap from the Edit to the mic became the widest (round 2 of 1.11.3).
+# Nearest-Edit ownership survives a missing button, and holds even with no gutter at all: the
+# mic's centre is ~100 px from its own Edit, and well over 100 px from the next one.
+# Known limit: geometry alone cannot separate boxes whose buttons sit nearer the OTHER Edit.
+# Used only where no measured pane edge separates the two (see Get-ComposerFloor/-Ceiling).
+function Get-BoxBoundary($fromX, $toX, $btnRects, $y0, $y1) {
+    $from = [double]$fromX; $to = [double]$toX
+    $lmax = $from; $rmin = $to
+    foreach ($r in @($btnRects)) {
+        if ($null -eq $r) { continue }
+        $mid = [double]$r.Y + [double]$r.H / 2
+        $rx = [double]$r.X; $rr = $rx + [double]$r.W
+        if ($mid -lt $y0 -or $mid -gt $y1 -or $rx -lt $from -or $rr -gt $to) { continue }
+        $cx = ($rx + $rr) / 2
+        if (($cx - $from) -le ($to - $cx)) { if ($rr -gt $lmax) { $lmax = $rr } }
+        else { if ($rx -lt $rmin) { $rmin = $rx } }
+    }
+    if ($lmax -gt $rmin) { return ($from + $to) / 2 }   # contradictory read: nothing to trust
+    return ($lmax + $rmin) / 2
+}
+
+function Get-ComposerFloor($c, $composers, $paneBounds, $btnRects) {
     $floor = $null
     # BOTH axes. Round 4: an X-only test let a pane from another ROW of a staggered 2x2 grid
     # supply the floor, which then rejected this pane's real row and hid its strip.
@@ -2160,12 +2272,20 @@ function Get-ComposerFloor($c, $composers, $paneBounds) {
             if ($null -eq $floor -or [double]$pb.X -gt $floor) { $floor = [double]$pb.X }
         }
     }
+    $paneFloor = $floor
     foreach ($o in @($composers)) {
         if ($null -eq $o -or [object]::ReferenceEquals($o, $c)) { continue }
         $overlap = ([double]$o.Y -lt ([double]$c.Y + [double]$c.H)) -and (([double]$o.Y + [double]$o.H) -gt [double]$c.Y)
         $oR = [double]$o.X + [double]$o.W
         if ($overlap -and $oR -le [double]$c.X) {
-            if ($null -eq $floor -or $oR -gt $floor) { $floor = $oR }
+            # A MEASURED pane edge between the two Edits is the boundary (see Get-ComposerCeiling).
+            if ($null -ne $paneFloor -and $paneFloor -ge $oR -and $paneFloor -le [double]$c.X) { continue }
+            # Not the neighbour's Edit edge: since 2026-10-20 its Stop and mic sit right of that
+            # edge, in the gap, where this composer's "+" search could take them. The box
+            # boundary is the boundary between the two boxes (Get-BoxBoundary).
+            $y0 = [Math]::Min([double]$o.Y, [double]$c.Y); $y1 = [Math]::Max([double]$o.Y + [double]$o.H, [double]$c.Y + [double]$c.H)
+            $split = Get-BoxBoundary $oR ([double]$c.X) $btnRects $y0 $y1
+            if ($null -eq $floor -or $split -gt $floor) { $floor = $split }
         }
     }
     return $floor
@@ -2275,7 +2395,7 @@ function Update-UiaInfo {
                 $cBottom = $c.Y + $c.H
                 # The row starts at the input BOX's edge, which for an Edit composer lies left of
                 # the element itself - see Get-RowSearchLeft and Get-ComposerFloor.
-                $cFloor = Get-ComposerFloor $c $composers $script:paneBounds
+                $cFloor = Get-ComposerFloor $c $composers $script:paneBounds $btnRects
                 $boxL = Get-RowSearchLeft $c.X $c.Y $c.H $btnRects (SW 80) $cFloor ($c.Type -eq 'Group')
                 $rowLo = Get-RowFilterLow $boxL $cFloor
                 # Collect the control-row buttons just below this composer (its left half).
@@ -2325,7 +2445,11 @@ function Update-UiaInfo {
                 # never appear here at all, and every "outermost minus N" rule picked a
                 # different element than the one it looked like on screen. The composer bounds
                 # every one of them and does not move.
-                $rowR = $c.X + $c.W
+                # ...except that an Edit composer no longer IS the box: its in-box buttons (Stop,
+                # mic) sit to its right on its OWN line - not on the unstable row below - so the
+                # box edge is taken from those (Get-RowSearchRight), bounded to this pane.
+                $cCeil = Get-ComposerCeiling $c $composers $script:paneBounds $btnRects
+                $rowR = Get-RowSearchRight $c.X $c.Y $c.W $c.H $btnRects (SW 120) $cCeil ($c.Type -eq 'Group')
                 $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
                 $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
                 $newPanes += @{

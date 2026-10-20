@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.11.3 — 2026-10-20
+
+**The right side bar sat on top of the Stop and mic buttons.** The composer Edit now ends short of
+the buttons inside the input box: measured, the Edit spans x=1675..2842 while Stop (2852..2903) and
+the mic (2917..2968) sit to its right on the same line, inside a box that ends at 2983. The right
+bar was anchored to the Edit's own right edge, so it was drawn over both. On 2026-10-14 the Edit
+still ran to the mic's right edge, which is why 1.11.1 looked right on the right-hand side.
+
+- The right-hand box edge is now the rightmost button on the composer's **own line** to its
+  right — Stop and mic, not the less stable control row below. A Group composer is the box itself
+  and keeps its own edge, as before. If no such button is read, the edge stays the composer's
+  own: unlike the left side, where a fallback only widens a *search*, this value is where the bar
+  is *drawn*, so it is not pushed outward blindly.
+- The search is bounded by the composer's own **measured pane** (both axes). Beside another
+  composer on the same row, a measured pane edge lying between the two decides outright. Only
+  where none does is the boundary inferred: each button between the two Edits belongs to the
+  Edit it is nearer to — Stop and mic hug the left one, "+" the right one — and the boundary lies
+  between the two groups. Neither Edit's own edge is that boundary (a neighbour's "+" sits left
+  of its Edit, its Stop and mic right of it, all in the gap), nor is the midpoint between the
+  Edits (it falls inside the left box, whose right-hand buttons are far wider than the other's
+  "+"), nor the middle of the widest gap (one read missing Stop moved it inside the box).
+- The same boundary now bounds the LEFT search too. This layout puts a left neighbour's Stop and
+  mic in the gap, where its old bound — that neighbour's Edit edge — let them pass as this box's
+  edge.
+- Side-bar **room** is measured from the box's edges rather than the composer element's. Measured
+  from the Edit, the right margin was overstated by the width of the in-box buttons, so a bar
+  could claim room that it then used to cover the box. Where pane rects are not measured, the
+  column boundary is likewise taken between boxes rather than between Edits, which could leave a
+  box with space a negative margin and hide its bar. And when only SOME panes are measured, the
+  measured ones keep their edges: the fallback used to overwrite them too, so one neighbour
+  missing from a read could hide or misclamp a bar beside a correctly measured edge.
+
+Tests: 580 panel (37 new), 113 installer, 100 engine — all passing. Every new guard fails the
+suite when reverted: the right edge wired back to the Edit, the Group check removed, the same-line
+check removed, the inset or ceiling bound removed, the ceiling's pane or same-row check removed,
+room measured from the Edit again, the box edge allowed inside the composer, a neighbour bound
+taken from its Edit edge again on either side, ownership by nearer Edit removed, a measured pane
+edge no longer taking precedence on either side or taking it when it does not separate the two,
+the contradictory-read fallback removed, measured panes overwritten by the room fallback, buttons
+off the line or only partly in the gap counted, and the room fallback back on Edit midpoints. A
+no-op control passes.
+
+**Known limits:** if one UIA read misses both in-box buttons, the right bar sits on the
+composer's edge until the next read (1.5–5 s), as it did before this release. Where no measured
+pane edge separates two side-by-side composers, a button nearer the *other* Edit — boxes touching
+with no padding — is assigned to the wrong box. With a measured pane edge between them, the normal
+case in the current app, the pane edge decides.
+
 ## 1.11.2 — 2026-10-15
 
 **Shutdown-on-done could power the PC off a second time, or a day late.** Both found and fixed by

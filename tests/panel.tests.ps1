@@ -2985,7 +2985,9 @@ Check 'the compact (short-label) measurement is narrower than the full one' `
 # only trace was "measured=0" in the log, 66705 times on one machine. The type is now a knob and
 # is filtered after a name-only query. These pin the parsing, the filter, and the query shape.
 $typeFnsMissing = @()
-foreach ($fn in @('ConvertTo-ComposerTypes', 'Test-ComposerTypeAllowed', 'Set-ComposerConfig', 'Write-CkLog', 'Get-RowSearchLeft', 'Get-ComposerFloor', 'Get-RowFilterLow')) {
+foreach ($fn in @('ConvertTo-ComposerTypes', 'Test-ComposerTypeAllowed', 'Set-ComposerConfig', 'Write-CkLog', 'Get-RowSearchLeft', 'Get-ComposerFloor', 'Get-RowFilterLow',
+                  'Get-RowSearchRight', 'Get-ComposerCeiling', 'Get-PaneBoxL', 'Get-PaneBoxR',
+                  'Get-BoxBoundary', 'Set-PaneSideRooms')) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
     if ($node) { Invoke-Expression $node.Extent.Text } else { $typeFnsMissing += $fn }
 }
@@ -3057,15 +3059,92 @@ Check "a Group composer with no in-box button keeps its own X ($leftGroup)" ($le
 $leftGroupSame = Get-RowSearchLeft 1640 1940 80 @(@{ X = 1580; Y = 1950; W = 47; H = 47 }) 120 $null $true
 Check "a Group composer ignores a same-line button to its left - old behaviour exactly ($leftGroupSame)" ($leftGroupSame -eq 1640)
 
-# Round-3 reviewer A: a neighbouring pane must not be reachable. Two composers side by side,
-# the left one's mic within 80 logical px of the right one, and the right pane's own row absent.
-$cL = [pscustomobject]@{ X = 900;  Y = 1963; W = 680; H = 34 }
-$cR = [pscustomobject]@{ X = 1696; Y = 1963; W = 680; H = 34 }
-$floorR = Get-ComposerFloor $cR @($cL, $cR) @()
-Check "the right pane's floor is the left composer's right edge ($floorR)" ($floorR -eq 1580)
-$leftNb = Get-RowSearchLeft $cR.X $cR.Y $cR.H @(@{ X = 1560; Y = 1957; W = 47; H = 47 }) 120 $floorR $false
-Check "a neighbour's control left of the floor is never taken as this box's edge ($leftNb)" ($leftNb -ge 1580)
-Check "...and the neighbour's row (x=1530) cannot anchor this pane's strip" (-not (Test-RowAnchors $leftNb 1530 $floorR))
+# --- Side-by-side panes with NO measured pane rects (the fallback) ---
+# Realistic tight split in the 2026-10-20 layout: the left Edit 900..1400 with its Stop
+# (1410..1461) and mic (1475..1526) inside ITS box, right of it; a 44 px gap; then the right pane's
+# "+" (1570..1610) inside ITS box, left of its Edit at 1620. A neighbour's EDIT edge is not a box
+# edge: round 1 of 1.11.3 (both reviewers) found the right pane's "+" passing as the left box's
+# right edge, because the ceiling was the neighbour Edit's X. The midpoint between the two Edits
+# (1510) is no better - it falls inside the left box, left of its own mic.
+$nL = [pscustomobject]@{ X = 900;  Y = 1952; W = 500; H = 37 }
+$nR = [pscustomobject]@{ X = 1620; Y = 1952; W = 500; H = 37 }
+$nBtns = @(@{ X = 1410; Y = 1945; W = 51; H = 51 },   # left pane's Stop
+           @{ X = 1475; Y = 1945; W = 51; H = 51 },   # left pane's mic
+           @{ X = 1570; Y = 1945; W = 40; H = 51 })   # right pane's "+"
+$nSplit = Get-BoxBoundary 1400 1620 $nBtns 1952 1989
+Check "the box boundary lies between the left box's mic and the right box's '+' ($nSplit)" ($nSplit -eq 1548)
+# Round 2 of 1.11.3 (reviewer B): one read missing Stop made the Edit-to-mic gap the widest, and a
+# widest-gap rule then put the boundary left of the mic. Ownership by the NEARER Edit must not care.
+$nNoStop = @($nBtns | Where-Object { $_.X -ne 1410 })
+Check 'with Stop missing from the read, the boundary does not move' ((Get-BoxBoundary 1400 1620 $nNoStop 1952 1989) -eq 1548)
+Check 'a contradictory read (a left-owned button reaching past a right-owned one) falls back to the midpoint' `
+    ((Get-BoxBoundary 1400 1620 @(@{ X = 1405; Y = 1945; W = 195; H = 51 }, @{ X = 1560; Y = 1945; W = 50; H = 51 }) 1952 1989) -eq 1510)
+Check 'with "+" missing from the read, the boundary is still right of the left box''s mic' ((Get-BoxBoundary 1400 1620 @($nBtns | Where-Object { $_.X -ne 1570 }) 1952 1989) -gt 1526)
+
+# A MEASURED pane edge between the two Edits decides; nothing inferred may tighten it (round 2,
+# both reviewers). Two measured panes split at 1548.
+$nPanes = @(@{ X = 0; W = 1548; Y = 0; H = 2088 }, @{ X = 1548; W = 1452; Y = 0; H = 2088 })
+$ceilP = Get-ComposerCeiling $nL @($nL, $nR) $nPanes $nNoStop
+Check "with a measured pane edge, the ceiling IS that edge even when Stop is missing ($ceilP)" ($ceilP -eq 1548)
+Check '...so the left box still reaches its own mic' ((Get-RowSearchRight $nL.X $nL.Y $nL.W $nL.H $nNoStop 180 $ceilP $false) -eq 1526)
+$floorP = Get-ComposerFloor $nR @($nL, $nR) $nPanes @($nBtns | Where-Object { $_.X -ne 1570 })
+Check "with a measured pane edge, the floor IS that edge even when '+' is missing ($floorP)" ($floorP -eq 1548)
+# Touching boxes, where inference is genuinely wrong: the left box's mic (1530..1581) sits NEARER
+# the right Edit (1620) than its own (1400), so ownership-by-distance hands it to the right box and
+# infers a boundary of 1465 - left of that mic. The measured pane edge at 1590 is right; it must
+# win, or the bar is drawn over the mic. (Wide inset so only the ceiling decides.)
+$touchPanes = @(@{ X = 0; W = 1590; Y = 0; H = 2088 }, @{ X = 1590; W = 1410; Y = 0; H = 2088 })
+$touchBtns = @(@{ X = 1530; Y = 1945; W = 51; H = 51 })
+$ceilT = Get-ComposerCeiling $nL @($nL, $nR) $touchPanes $touchBtns
+Check "touching boxes: the measured pane edge wins over a wrong inference ($ceilT)" ($ceilT -eq 1590)
+Check '...so the left box keeps the mic that sits nearer the other Edit' `
+    ((Get-RowSearchRight $nL.X $nL.Y $nL.W $nL.H $touchBtns 300 $ceilT $false) -eq 1581)
+# A measured pane that does NOT separate them (both composers in one pane rect) leaves the
+# inference to do its job.
+$onePane = @(@{ X = 0; W = 3000; Y = 0; H = 2088 })
+Check 'one pane holding both composers: the boundary is still inferred between the boxes' `
+    ((Get-ComposerCeiling $nL @($nL, $nR) $onePane $nBtns) -eq 1548)
+$ceilL = Get-ComposerCeiling $nL @($nL, $nR) @() $nBtns
+Check "the left pane's ceiling is that boundary, not the neighbour's Edit edge ($ceilL)" ($ceilL -eq 1548)
+$rightL = Get-RowSearchRight $nL.X $nL.Y $nL.W $nL.H $nBtns 180 $ceilL $false
+Check "the left box keeps its OWN mic as its right edge, not the neighbour's '+' ($rightL)" ($rightL -eq 1526)
+$floorRt = Get-ComposerFloor $nR @($nL, $nR) @() $nBtns
+Check "the right pane's floor is the same boundary ($floorRt)" ($floorRt -eq 1548)
+# A wide inset (300) so the search window would reach the neighbour's Stop and mic: only the
+# floor can keep them out, which is exactly what this checks.
+$leftRt = Get-RowSearchLeft $nR.X $nR.Y $nR.H $nBtns 300 $floorRt $false
+Check "the right box takes its OWN '+' as its left edge, not the neighbour's Stop or mic ($leftRt)" ($leftRt -eq 1570)
+Check "...and the neighbour's control row cannot anchor this pane's strip" (-not (Test-RowAnchors $leftRt 1500 $floorRt))
+Check 'no buttons between two composers: the plain midpoint' ((Get-BoxBoundary 1400 1620 @() 1952 1989) -eq 1510)
+Check 'a button on another line does not take part in the split' `
+    ((Get-BoxBoundary 1400 1620 @(@{ X = 1410; Y = 2030; W = 150; H = 40 }) 1952 1989) -eq 1510)
+Check 'a button only partly between the edges does not take part in the split' `
+    ((Get-BoxBoundary 1400 1620 @(@{ X = 1380; Y = 1945; W = 51; H = 51 }) 1952 1989) -eq 1510)
+# The room fallback must use the same notion of a boundary - between BOXES. Between Edits it was
+# 1510, left of the left box's own mic (1526): negative room, and a bar hidden beside a box that
+# had space.
+$script:paneBounds = @()
+$savedLogPathR = $script:logPath
+$script:logPath = Join-Path ([IO.Path]::GetTempPath()) ("cb-rooms-test-" + [guid]::NewGuid().ToString('N') + '.log')
+$pL = @{ Cx = 900;  Cw = 500; Cy = 1952; Ch = 37; RowL = 900;  RowR = 1526 }
+$pR = @{ Cx = 1620; Cw = 500; Cy = 1952; Ch = 37; RowL = 1570; RowR = 2120 }
+Set-PaneSideRooms @($pL, $pR) @{ Left = 0; Right = 3840 }
+Remove-Item $script:logPath -ErrorAction SilentlyContinue; $script:logPath = $savedLogPathR
+Check "the room fallback puts the column boundary between the BOXES ($($pL.PaneR))" ($pL.PaneR -eq 1548)
+Check "...so the left pane's right room is not negative ($($pL.RightRoom))" ($pL.RightRoom -eq 22)
+Check "...and the right pane's left room is measured from its own box ($($pR.LeftRoom))" ($pR.LeftRoom -eq 22)
+# Round 3 (reviewer B): with only ONE of two pane rects measured, the fallback overwrote the
+# measured pane as well. The measured one must keep its own edges; only the other is inferred.
+$script:paneBounds = @(@{ X = 0; W = 1580; Y = 0; H = 2088 })   # left pane measured, right one not
+$script:logPath = Join-Path ([IO.Path]::GetTempPath()) ("cb-rooms-test-" + [guid]::NewGuid().ToString('N') + '.log')
+$mL = @{ Cx = 900;  Cw = 500; Cy = 1952; Ch = 37; RowL = 900;  RowR = 1526 }
+$mR = @{ Cx = 1620; Cw = 500; Cy = 1952; Ch = 37; RowL = 1570; RowR = 2120 }
+Set-PaneSideRooms @($mL, $mR) @{ Left = 0; Right = 3840 }
+Remove-Item $script:logPath -ErrorAction SilentlyContinue; $script:logPath = $savedLogPathR
+Check "one of two panes measured: the measured pane keeps its own right edge ($($mL.PaneR))" (($mL.PaneR -eq 1580) -and $mL.BoundsReal)
+Check "...and its room comes from that measured edge ($($mL.RightRoom))" ($mL.RightRoom -eq 54)
+Check "...while the unmeasured pane is still inferred, between the boxes ($($mR.PaneL))" (($mR.PaneL -eq 1548) -and -not $mR.BoundsReal)
+$script:paneBounds = @()
 # Round 4, reviewer B: the 12 px tolerance must not cross the floor. A neighbour control starting
 # INSIDE that band (floor 1580, control at 1572) could otherwise anchor this pane's strip.
 Check 'a neighbour control inside the 12 px band left of the floor cannot anchor' (-not (Test-RowAnchors 1580 1572 1580))
@@ -3089,10 +3168,62 @@ Check 'a button on the ROW below is never mistaken for the box edge' `
     ((Get-RowSearchLeft 1696 1963 34 @(@{ X = 1600; Y = 2029; W = 219; H = 46 }) 120 690 $true) -eq 1696)
 Check 'no buttons and no bound: an Edit still searches its full inset' ((Get-RowSearchLeft 1696 1963 34 @() 120 $null $false) -eq 1576)
 
+# --- Right-hand box edge (Get-RowSearchRight / Get-ComposerCeiling) ---
+# 2026-10-20: the Edit stopped short of the in-box Stop and mic, so the right side bar - anchored
+# to the Edit's own right edge - was drawn on top of them. Rects measured in the live app.
+$editR = @{ X = 1675; Y = 1952; W = 1167; H = 37 }          # Edit 1675..2842
+$rBtns = @(
+    @{ X = 2852; Y = 1945; W = 51;  H = 51 },   # Stop 2852..2903, on the Edit's line
+    @{ X = 2917; Y = 1945; W = 51;  H = 51 },   # mic  2917..2968, on the Edit's line
+    @{ X = 2723; Y = 2025; W = 189; H = 48 },   # Model - the row BELOW
+    @{ X = 2920; Y = 2025; W = 45;  H = 48 }    # Usage - the row below
+)
+$rPane = @(@{ X = 756; W = 3084; Y = 64; H = 2024 })        # "Primary pane", measured
+$ceilLive = Get-ComposerCeiling $editR @($editR) $rPane
+Check "the live composer's ceiling is its own pane's right edge ($ceilLive)" ($ceilLive -eq 3840)
+$rightLive = Get-RowSearchRight $editR.X $editR.Y $editR.W $editR.H $rBtns 180 $ceilLive $false
+Check "an Edit composer's box edge on the right is the in-box mic's right edge ($rightLive)" ($rightLive -eq 2968)
+Check '...so a bar anchored there clears the Stop and mic buttons' ($rightLive -gt 2903)
+Check 'buttons on the ROW below never move the right edge' `
+    ((Get-RowSearchRight 1675 1952 1167 37 @(@{ X = 2920; Y = 2025; W = 45; H = 48 }) 180 $null $false) -eq 2842)
+Check 'with no in-box button read, the right edge stays the composer''s own (no blind push outward)' `
+    ((Get-RowSearchRight 1675 1952 1167 37 @() 180 $null $false) -eq 2842)
+# The button must sit RIGHT of the Group and on its line, or the Group check is never exercised:
+# a button inside the Group cannot move its edge either way (a mutant removing the check survived).
+Check 'a Group composer ignores a same-line button just right of it - old behaviour exactly' `
+    ((Get-RowSearchRight 1599 1900 1384 90 @(@{ X = 3000; Y = 1920; W = 40; H = 40 }) 180 $null $true) -eq 2983)
+Check '...while an Edit at the same place WOULD take that button (so the test above can fail)' `
+    ((Get-RowSearchRight 1599 1900 1384 90 @(@{ X = 3000; Y = 1920; W = 40; H = 40 }) 180 $null $false) -eq 3040)
+Check 'a same-line button beyond the inset is not part of this box' `
+    ((Get-RowSearchRight 1675 1952 1167 37 @(@{ X = 3100; Y = 1945; W = 51; H = 51 }) 180 $null $false) -eq 2842)
+# Stacked composer to the RIGHT and above - on another row. It must not lower the ceiling. (A
+# composer to the left can never qualify, so it cannot exercise the row check at all.)
+$cS = [pscustomobject]@{ X = 2900; Y = 900; W = 800; H = 37 }
+Check 'a composer on another ROW (stacked) does not lower the ceiling' ($null -eq (Get-ComposerCeiling $editR @($cS, $editR) @()))
+# Room is measured from the BOX, not the composer element.
+$roomP = @{ Cx = 1675; Cw = 1167; RowL = 1617; RowR = 2968 }
+Check 'side-bar room is measured from the box''s left edge (row start), not the Edit' ((Get-PaneBoxL $roomP) -eq 1617)
+Check '...and from the box''s right edge (in-box mic), not the Edit' ((Get-PaneBoxR $roomP) -eq 2968)
+Check 'a pane without measured row extents falls back to the composer''s own edges' `
+    (((Get-PaneBoxL @{ Cx = 1675; Cw = 1167 }) -eq 1675) -and ((Get-PaneBoxR @{ Cx = 1675; Cw = 1167 }) -eq 2842))
+Check 'the box edge never lies INSIDE the composer, even if a row extent does' `
+    (((Get-PaneBoxL @{ Cx = 1675; Cw = 1167; RowL = 1700 }) -eq 1675) -and ((Get-PaneBoxR @{ Cx = 1675; Cw = 1167; RowR = 2800 }) -eq 2842))
+
 # Wiring: the row search must use the derived edge, and the composer type must reach it.
+$uiaNodeR = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-UiaInfo' }, $true)
+$uiaTextR = if ($uiaNodeR) { $uiaNodeR.Body.Extent.Text } else { '' }
+Check 'Update-UiaInfo bounds the right-hand search with Get-ComposerCeiling, given the button rects' ($uiaTextR -match '\$cCeil\s*=\s*Get-ComposerCeiling \$c \$composers \$script:paneBounds \$btnRects')
+Check '...and takes RowR from Get-RowSearchRight, with the ceiling and the Group flag' `
+    ($uiaTextR -match '\$rowR\s*=\s*Get-RowSearchRight \$c\.X \$c\.Y \$c\.W \$c\.H \$btnRects \(SW 120\) \$cCeil \(\$c\.Type -eq ''Group''\)')
+$roomsNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Set-PaneSideRooms' }, $true)
+$roomsText = if ($roomsNode) { $roomsNode.Body.Extent.Text } else { '' }
+Check 'Set-PaneSideRooms measures room from the box edges in BOTH of its branches' `
+    (([regex]::Matches($roomsText, 'LeftRoom = \[int\]\(\(Get-PaneBoxL \$p\) - ').Count -eq 2) -and
+     ([regex]::Matches($roomsText, 'RightRoom = \[int\]\([^\r\n]*- \(Get-PaneBoxR \$p\)\)').Count -eq 2) -and
+     ($roomsText -notmatch 'Room = \[int\]\([^\r\n]*\$p\.Cx'))
 $uiaNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-UiaInfo' }, $true)
 $uiaText = if ($uiaNode) { $uiaNode.Body.Extent.Text } else { '' }
-Check 'Update-UiaInfo bounds the search with Get-ComposerFloor' ($uiaText -match '\$cFloor\s*=\s*Get-ComposerFloor \$c \$composers \$script:paneBounds')
+Check 'Update-UiaInfo bounds the search with Get-ComposerFloor, given the button rects' ($uiaText -match '\$cFloor\s*=\s*Get-ComposerFloor \$c \$composers \$script:paneBounds \$btnRects')
 Check '...derives the edge with Get-RowSearchLeft, passing the floor and whether it is a Group' `
     ($uiaText -match '\$boxL\s*=\s*Get-RowSearchLeft \$c\.X \$c\.Y \$c\.H \$btnRects \(SW 80\) \$cFloor \(\$c\.Type -eq ''Group''\)')
 Check '...the filter bound comes from Get-RowFilterLow, which respects the floor' ($uiaText -match '\$rowLo\s*=\s*Get-RowFilterLow \$boxL \$cFloor')
