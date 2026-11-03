@@ -28,7 +28,7 @@ bliver lang, og det overlader knaprækken til appen selv:
 - **Sidebjælker:** flyt knapper til en lodret strimmel i venstre eller højre margen i stedet for bundrækken. ⋮-menuen kan flytte med, og **Flyt til bjælke** tager hele strimlen med sig.
 - **Grupper:** fold flere knapper sammen til én knap på bjælken; hold musen over, og medlemmerne folder ud. En gruppe har sit eget ikon og navn, og flyttes som én blok i stedet for at blive spredt.
 - **Farver per type:** prompts, kommandoer, grupper og kontakter kan hver få sin farve fra ⋮ → Farver. Typen udledes af knappen, så en nypinnet slash-kommando automatisk får kommandofarven.
-- **Knapstørrelse** fra ⋮ → Knapstørrelse, 14–32 px, for hele panelet. Knapperne beholder deres størrelse når vinduet flyttes mellem skærme med forskellig DPI.
+- **Knapstørrelse** fra ⋮ → Knapstørrelse, 14–64 px, for hele panelet. Sidebjælkerne har samme pixelstørrelse på alle skærme, eller sæt flueben ved **Sidebjælker følger skærmskalering** i samme undermenu, så de skaleres som appens egne knapper.
 - **Knappen kontrollerer før den sender.** Den læser beskedfeltet tilbage gennem accessibility-træet og trykker først Enter, når den kan se at det der landede, kom fra knappen. Kan den ikke bekræfte det — en indsætning der udeblev, en gammel udklipsholder, tekst den ikke selv lagde ind — sender den ingenting, lader feltet være og siger det. Se [CHANGELOG.md](CHANGELOG.md) for hvad den fanger og ikke fanger.
 - **To-kliks bekræftelse** på destruktive knapper; **EN/DA** UI; tooltips.
 - **Robust:** alt app-afhængigt (accessibility-navne, zoner) kan rettes i `buttons.json` uden kodeændring, så en app-opdatering degraderer pænt.
@@ -78,9 +78,10 @@ Alle kan sættes i filen; de tre første også fra ⋮-menuen.
 
 | Felt | Standard | Betydning |
 |---|---|---|
-| `btnSize` | `21` | Knapstørrelse i logiske px, 10–40, for hele panelet. Skalerer med skærmen. |
+| `btnSize` | `21` | Knapstørrelse i logiske px, 10–64, for hele panelet. Skalerer med skærmen. |
 | `colors` | `{}` | Farve per type: `prompt`, `command`, `group`, `toggle`. |
 | `kebabBar` | `"row"` | Hvilken bjælke ⋮-håndtaget sidder på: `row`, `left` eller `right`. |
+| `sideFollowScale` | `false` | Når `true`, følger sidebjælkerne skærmens skalering ligesom appens egne knapper (32 ved 150 % tegnes 48 px). Slået fra er de lige mange skærmpixels på alle skærme. Slås til og fra under ⋮ → **Knapstørrelse**. |
 | `bar` (per knap) | `row` | Hvilken bjælke knappen ligger på: `row`, `left` eller `right`. |
 | `group` (per knap) | — | Gruppenavn. Grupperede knapper folder sammen til én knap med en udfoldning. Matches **uden** hensyn til store/små bogstaver, fordi navnet er en JSON-nøgle og PowerShells JSON-læser afviser en fil med nøgler der kun adskiller sig i versaltype. |
 | `groups` | `{}` | Gruppedefinitioner: `{ "ops": { "icon": "settings", "label": "Drift" } }`. Ryddes automatisk når sidste medlem forlader gruppen. |

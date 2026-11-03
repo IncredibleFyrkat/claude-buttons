@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.11.4 — 2026-11-03
+
+**Every strip and side bar hid after the app's November update.** The app moved every control on
+the row below the input box to that row's right end (model picker, permissions, usage) and put
+"+" inside the box on the input's own line. Measured: the Edit spans x=1685..2846, "+" sits at
+1621 on its line, and the row below holds only Model (2515), Bypass permissions (2698) and Usage
+(2928). The row strip docks after the row's left-hand cluster of controls, and that cluster was
+also the only proof the panel had that no dialog covered the composer. With the cluster gone,
+the panel concluded a dialog was open and hid the row strip and both side bars.
+
+- A row that has controls but no left-hand cluster now counts as found. The strip docks at the
+  box's left edge (the in-box "+"), at the row's own height. Those controls are looked for across
+  the whole input box (from "+" to the mic), not just the Edit's span. The Edit stops short of the
+  row's right end, so a read that missed the model picker would have hidden everything again. The
+  search stays inside this pane's own bounds, so a neighbouring chat's controls cannot count.
+- Because row controls show the row exists but not that nothing is over it, the panel also
+  hit-tests the composer's centre: a Claude menu or popover drawn over the composer hides the
+  strips. The panel's own windows never count as covering it. A failed hit-test leaves the strips
+  visible rather than hiding everything.
+- A row with no controls at all still means a dialog is up and hides everything, as before.
+- The left-hand cluster must now **start at the box's left edge**. In a narrow split pane the
+  right-hand group reaches into the part of the row that is searched, and taken as the cluster it
+  would have docked the strip after the usage meter.
+- The left side bar is placed from the box's measured left edge (the in-box "+"). It used the row
+  below, which now starts at the model picker, so it fell back to the Edit's own edge and was
+  drawn on top of "+". Positions use only buttons that were actually read. The blind search window
+  still only widens a search. A Group composer and a layout with no in-box button behave exactly
+  as before.
+
+**Larger buttons, and side bars that can follow display scaling.** Side bars are sized in screen
+pixels, the same on every monitor. On a 150% monitor the largest size, 32, therefore drew 32 px
+next to the app's own 51 px buttons.
+
+- ⋮ → **Button size** now goes up to 64 px. `btnSize` accepts 10–64.
+- New: ⋮ → Button size → **Side bars follow display scaling** (`sideFollowScale`, off by default).
+  With it on, the size is scaled like the app's own controls (32 at 150% draws 48 px), and it
+  follows the window to a monitor with different scaling.
+- A side button without an icon shows its two letters in a font scaled to the button. It used a
+  fixed 11 pt, which looked lost on the larger sizes.
+- Only the side bars change with that setting. The control row and the flyouts keep their own
+  glyph size. A side button keeps its side-bar look after a confirm click, and so does a side
+  group's flyout.
+
+Tests: 630 panel (50 new), 113 installer, 100 engine. All pass. Four review rounds, ending with
+approval from both reviewers. Every new guard fails the suite when reverted or mutated (26
+mutants): the row fallback, the start-at-box-edge rule, docking at the box edge, the in-box
+floor, the row search across the box, its floor and its ceiling, the composer hit-test, ignoring
+other processes' windows, failing open, the left bar anchor, the Group exemption, the size
+clamp, follow-scaling in sizing, in room and in fonts, the row font staying put, the side glyph
+and text fonts, the side face after a confirm, and the flyout stem face.
+
 ## 1.11.3 — 2026-10-20
 
 **The right side bar sat on top of the Stop and mic buttons.** The composer Edit now ends short of

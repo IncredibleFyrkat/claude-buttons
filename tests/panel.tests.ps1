@@ -2987,7 +2987,7 @@ Check 'the compact (short-label) measurement is narrower than the full one' `
 $typeFnsMissing = @()
 foreach ($fn in @('ConvertTo-ComposerTypes', 'Test-ComposerTypeAllowed', 'Set-ComposerConfig', 'Write-CkLog', 'Get-RowSearchLeft', 'Get-ComposerFloor', 'Get-RowFilterLow',
                   'Get-RowSearchRight', 'Get-ComposerCeiling', 'Get-PaneBoxL', 'Get-PaneBoxR',
-                  'Get-BoxBoundary', 'Set-PaneSideRooms')) {
+                  'Get-BoxBoundary', 'Set-PaneSideRooms', 'Get-InBoxLeft', 'Get-RowDock', 'Get-RowCys')) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
     if ($node) { Invoke-Expression $node.Extent.Text } else { $typeFnsMissing += $fn }
 }
@@ -3168,6 +3168,90 @@ Check 'a button on the ROW below is never mistaken for the box edge' `
     ((Get-RowSearchLeft 1696 1963 34 @(@{ X = 1600; Y = 2029; W = 219; H = 46 }) 120 690 $true) -eq 1696)
 Check 'no buttons and no bound: an Edit still searches its full inset' ((Get-RowSearchLeft 1696 1963 34 @() 120 $null $false) -eq 1576)
 
+# --- Row dock when the row's left half is EMPTY (November 2026, Get-RowDock / Get-InBoxLeft) ---
+# The app moved every control on the row below to its right end and "+" up into the box. With no
+# left cluster, Anchored went false and every strip and side bar hid. Rects measured in the live app.
+$novC = @{ X = 1685; Y = 1957; W = 1161; H = 39 }                 # Edit 1685..2846
+$novBtns = @(
+    @{ X = 1621; Y = 1951; W = 51;  H = 51 },   # Add ("+"), on the Edit's line
+    @{ X = 2859; Y = 1951; W = 52;  H = 51 },   # Stop
+    @{ X = 2924; Y = 1951; W = 51;  H = 51 },   # mic
+    @{ X = 2515; Y = 2030; W = 177; H = 44 },   # Model - the row below, right end
+    @{ X = 2698; Y = 2030; W = 222; H = 44 },   # Bypass permissions
+    @{ X = 2928; Y = 2030; W = 44;  H = 44 }    # Usage
+)
+$novIn = Get-InBoxLeft $novC.X $novC.Y $novC.H $novBtns 120 756
+Check "the box's measured left edge is the in-box '+' ($novIn)" ($novIn -eq 1621)
+Check 'no button on the line: the measured edge is NOTHING, not the blind search window' `
+    ($null -eq (Get-InBoxLeft $novC.X $novC.Y $novC.H @($novBtns | Where-Object { $_.X -ne 1621 }) 120 756))
+Check 'Get-InBoxLeft respects the floor' ($null -eq (Get-InBoxLeft $novC.X $novC.Y $novC.H $novBtns 120 1650))
+# The production row filter: the left 60% of the composer, from the search edge.
+$novLo = Get-RowFilterLow (Get-RowSearchLeft $novC.X $novC.Y $novC.H $novBtns 120 756 $false) 756
+$novRow = @(foreach ($b in $novBtns) { $cy = $b.Y + $b.H / 2
+    if ($cy -gt ($novC.Y + $novC.H) -and $cy -lt ($novC.Y + $novC.H + 96) -and $b.X -ge $novLo -and $b.X -lt ($novC.X + $novC.W * 0.6)) {
+        [pscustomobject]@{ X = [double]$b.X; R = [double]($b.X + $b.W); CY = $cy } } })
+Check 'the live row has no left cluster (so this is the case that hid everything)' ($novRow.Count -eq 0)
+# Production-shaped: the row heights come from Get-RowCys over the BOX (in-box "+" to in-box mic)
+# within the pane, exactly as Update-UiaInfo calls it - not a hand-made list.
+$novR = Get-RowSearchRight $novC.X $novC.Y $novC.W $novC.H $novBtns 180 3840 $false
+$novCys = @(Get-RowCys $novBtns 1996 96 1621 $novR 60 756 3840)
+Check "the box's right edge is the in-box mic ($novR)" ($novR -eq 2975)
+Check "all three right-end row controls are counted, Usage included ($($novCys.Count))" ($novCys.Count -eq 3)
+# Review of 1.11.4, reviewer A: bounded by the Edit's span (2846 + 60), Bypass (ends 2920) and Usage
+# (ends 2972) fell outside, so a read without Model left nothing and hid every strip again.
+$novNoModel = @(Get-RowCys @($novBtns | Where-Object { $_.X -ne 2515 }) 1996 96 1621 $novR 60 756 3840)
+Check "...so a read MISSING Model still finds the row ($($novNoModel.Count))" ($novNoModel.Count -eq 2)
+Check '...and that row still anchors' ((Get-RowDock @() 1621 $novNoModel $novC.X 1996 30 90 30).Anchored)
+# Reviewer B: a tight split where the neighbour's usage meter (1516..1556) sits inside the old
+# +-60 window of a pane whose box starts at 1570. The floor (the boundary between the boxes) must
+# keep it out, or that pane anchors on its neighbour's control.
+$tightCys = @(Get-RowCys @(@{ X = 1516; Y = 2030; W = 40; H = 44 }) 1996 96 1570 2200 60 1560 $null)
+Check "a neighbour's row control left of the floor is not this pane's row ($($tightCys.Count))" ($tightCys.Count -eq 0)
+Check '...nor one right of the ceiling' (@(Get-RowCys @(@{ X = 2210; Y = 2030; W = 40; H = 44 }) 1996 96 1570 2200 60 $null 2205).Count -eq 0)
+Check 'controls on the composer''s OWN line or far below are not row controls' `
+    (@(Get-RowCys @(@{ X = 1700; Y = 1951; W = 51; H = 51 }, @{ X = 1700; Y = 2150; W = 51; H = 44 }) 1996 96 1621 2975 60 $null $null).Count -eq 0)
+$novDock = Get-RowDock $novRow 1621 $novCys $novC.X 1996 30 90 30
+Check 'an empty-left row with controls on its right still ANCHORS' ($novDock.Anchored -eq $true)
+Check "...docking at the box's left edge, the in-box '+' ($($novDock.X))" ($novDock.X -eq 1621)
+Check "...at the row's own height ($($novDock.Y))" ($novDock.Y -eq 2052)
+$noRow = Get-RowDock @() 1621 @() $novC.X 1996 30 90 30
+Check 'a row with NO controls at all (a dialog is up) does not anchor' ($noRow.Anchored -eq $false)
+Check '...and keeps the old fallback position' (($noRow.X -eq 1685) -and ($noRow.Y -eq 2026))
+# The October layout keeps its left cluster: Bypass permissions at the box's left edge.
+$octRow = @([pscustomobject]@{ X = 1643; R = 1862; CY = 2052 }, [pscustomobject]@{ X = 2646; R = 2754; CY = 2052 })
+$octDock = Get-RowDock $octRow 1640 @(2052, 2052) 1696 1997 30 90 30
+Check "the October row still docks after its left cluster, not after Model ($($octDock.X))" (($octDock.X -eq 1862) -and $octDock.Anchored)
+# A narrow split pane: the right-hand group reaches into the left 60% the caller scans. Taken as
+# the cluster, the strip would dock after the usage meter.
+$narRow = @([pscustomobject]@{ X = 1250; R = 1427; CY = 2052 }, [pscustomobject]@{ X = 1433; R = 1655; CY = 2052 })
+$narDock = Get-RowDock $narRow 1050 @(2052, 2052) 1110 1996 30 90 30
+Check "a right-aligned group that does not start at the box edge is NOT the cluster ($($narDock.X))" (($narDock.X -eq 1050) -and $narDock.Anchored)
+Check '...while a cluster starting within the tolerance still is' `
+    ((Get-RowDock @([pscustomobject]@{ X = 1130; R = 1200; CY = 2052 }) 1050 @(2052) 1110 1996 30 90 30).X -eq 1200)
+# Wiring: Update-UiaInfo must take the dock and Anchored from Get-RowDock, fed the MEASURED edge.
+$uiaNodeD = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-UiaInfo' }, $true)
+$uiaTextD = if ($uiaNodeD) { $uiaNodeD.Body.Extent.Text } else { '' }
+Check 'Update-UiaInfo reads the measured in-box edge with Get-InBoxLeft, skipping Groups' `
+    ($uiaTextD -match "\`$inBoxL = if \(\`$c\.Type -eq 'Group'\) \{ \`$null \} else \{ Get-InBoxLeft \`$c\.X \`$c\.Y \`$c\.H \`$btnRects \(SW 80\) \`$cFloor \}")
+Check '...docks with Get-RowDock from that edge and the row heights' ($uiaTextD -match '\$dock = Get-RowDock \$rowBtns \$boxEdge \$rowCys ')
+Check '...collects the row heights with Get-RowCys over the box, bounded by floor and ceiling' `
+    ($uiaTextD -match '\$rowCys = Get-RowCys \$btnRects \$cBottom \(SW 64\) \$boxEdge \$rowR \(SW 40\) \$cFloor \$cCeil')
+Check '...after the ceiling and right edge it depends on are computed' `
+    ($uiaTextD.IndexOf('$rowR = Get-RowSearchRight') -ge 0 -and $uiaTextD.IndexOf('$rowR = Get-RowSearchRight') -lt $uiaTextD.IndexOf('$rowCys = Get-RowCys'))
+# Both reviewers: row controls prove the row exists, not that nothing covers the composer.
+Check '...and Anchored also requires the composer to be on top at its own centre' `
+    (($uiaTextD -match '\$anchored = \$dock\.Anchored -and \(Test-ComposerOnTop \$c\.El \(\$c\.X \+ \$c\.W / 2\) \(\$c\.Y \+ \$c\.H / 2\)\)') -and
+     ($uiaTextD -match 'Anchored = \$anchored\r?\n'))
+$hitNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-ComposerOnTop' }, $true)
+$hitText = if ($hitNode) { $hitNode.Body.Extent.Text } else { '' }
+Check 'Test-ComposerOnTop hit-tests the point and walks up to the composer' `
+    (($hitText -match 'AutomationElement\]::FromPoint') -and ($hitText -match 'Automation\]::Compare\(\$hit, \$el\)') -and ($hitText -match 'GetParent\(\$hit\)'))
+Check '...counts only CLAUDE''s own UI as covering it - not other apps, not the panel itself' ($hitText -match 'ProcessId -ne \[uint32\]\$script:targetPid\) \{ return \$true \}')
+Check '...and fails OPEN on an exception (hiding everything is the outage)' ($hitText -match 'catch \{ return \$true \}')
+Check '...and returns false when the hit is something else' ($hitText -match 'return \$false')
+Check '...and the left side bar anchor (RowL) takes the measured in-box edge' `
+    ($uiaTextD -match 'if \(\$null -ne \$inBoxL -and \(\$null -eq \$rowL -or \$inBoxL -lt \$rowL\)\) \{ \$rowL = \$inBoxL \}')
+
 # --- Right-hand box edge (Get-RowSearchRight / Get-ComposerCeiling) ---
 # 2026-10-20: the Edit stopped short of the in-box Stop and mic, so the right side bar - anchored
 # to the Edit's own right edge - was drawn on top of them. Rects measured in the live app.
@@ -3306,6 +3390,92 @@ Check '...and passes exactly that condition to FindAll' ($gcText -match '\$root\
 $floorM = [regex]::Match($gcText, '\$b\.Height\s+-lt\s+(\d+)')
 Check ("the composer height floor admits the 23 px Edit measured in the field" + $(if ($floorM.Success) { " (floor $($floorM.Groups[1].Value))" } else { ' (floor not found)' })) `
     ($floorM.Success -and ([int]$floorM.Groups[1].Value -lt 23))
+
+# --- Larger button sizes (1.11.4) ---
+# A side bar is sized in raw screen pixels, so on a 150% monitor the old top size (32) drew no
+# bigger than 21 of the app's units beside its 51 px buttons. The menu and the clamp now go to 64.
+$sizesM = [regex]::Match($srcText, '\$script:ckSideSizes = @\(([^)]*)\)')
+$sizes = if ($sizesM.Success) { @($sizesM.Groups[1].Value -split ',' | ForEach-Object { [int]$_.Trim() }) } else { @() }
+Check "the size menu offers sizes up to 64 px ($($sizes -join ', '))" (($sizes -contains 48) -and ($sizes -contains 64) -and (($sizes | Measure-Object -Maximum).Maximum -eq 64))
+Check '...in ascending order' ((($sizes | Sort-Object) -join ',') -eq ($sizes -join ','))
+$clampM = [regex]::Match($srcText, 'if \(\$v -ge (\d+) -and \$v -le (\d+)\) \{ \$script:btnLogical = \$v \}')
+Check "the btnSize clamp admits every size the menu offers ($($clampM.Groups[1].Value)..$($clampM.Groups[2].Value))" `
+    ($clampM.Success -and ($sizes | Where-Object { $_ -lt [int]$clampM.Groups[1].Value -or $_ -gt [int]$clampM.Groups[2].Value }).Count -eq 0)
+# The no-icon text scales with the button, and its updater is defined before the load-time call.
+# Scoped to Build-SideStrip: Set-PillFace carries the same line, so a file-wide match passed with
+# the side bar's own builder reverted to the fixed font (a surviving mutant).
+$bssNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Build-SideStrip' }, $true)
+$bssText = if ($bssNode) { $bssNode.Body.Extent.Text } else { '' }
+Check 'Build-SideStrip draws a side button''s text in the size-scaled font' ($bssText -match '\$btn\.Font = if \(\$script:sideTextFont\) \{ \$script:sideTextFont \} else \{ \$script:btnFont \}')
+$defSTF = $srcText.IndexOf('function Update-SideTextFont'); $callPIF = $srcText.IndexOf("`nUpdate-PanelIconFont")
+Check 'Update-SideTextFont is defined before Update-PanelIconFont first runs at load time' (($defSTF -ge 0) -and ($callPIF -gt $defSTF))
+$pifNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Update-PanelIconFont' }, $true)
+Check '...and every size change refreshes it, even with no icon font installed' `
+    ($pifNode -and ($pifNode.Body.Extent.Text -match '(?s)Update-SideTextFont.*if \(-not \$script:iconFontName\) \{ return \}'))
+
+# Follow display scaling (sideFollowScale): off = raw screen pixels as before, on = scaled like the
+# app's own buttons. Both passes that decide a side bar's size must use the same rule, or the bar
+# flickers as one pass keeps what the other hides.
+foreach ($fn in @('S', 'Get-SideBtnPx')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text }
+}
+$savedScale = $script:scale; $savedBL = $script:btnLogical; $savedFS = $script:sideFollowScale
+$script:scale = 1.5; $script:btnLogical = 32
+$script:sideFollowScale = $false
+Check 'side bars default to raw screen pixels (32 stays 32 at 150%)' ((Get-SideBtnPx) -eq 32)
+$script:sideFollowScale = $true
+Check 'following display scaling, 32 at 150% is 48 px' ((Get-SideBtnPx) -eq 48)
+$script:scale = 1.0
+Check '...and 32 again on a 100% monitor' ((Get-SideBtnPx) -eq 32)
+$script:scale = $savedScale; $script:btnLogical = $savedBL; $script:sideFollowScale = $savedFS
+Check 'the setting is read from buttons.json as a strict true' ($srcText -match '\$script:sideFollowScale = \(\$script:config\.sideFollowScale -eq \$true\)')
+Check 'the sizing pass sizes side buttons with Get-SideBtnPx' ($srcText -match '\$size = Get-SideBtnPx\r?\n')
+Check '...and the placement pass hides by the same rule' ($srcText -match 'if \(\$room -lt \(\(Get-SideBtnPx\) \+ \(S 6\)\)\)')
+# Behaviour, not just text: the row/flyout glyph font must NOT follow a side-bar setting (review
+# round 2 of 1.11.4, both reviewers: it grew every row icon by half at 150%), while the side
+# bars' own glyph and text fonts do.
+foreach ($fn in @('Update-SideTextFont', 'Update-PanelIconFont', 'Set-PillFace')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text }
+}
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$savedFont = @($script:iconFontName, $script:iconFontPanel, $script:iconFontSide, $script:sideTextFont, $script:iconFont, $script:scale, $script:btnLogical, $script:sideFollowScale)
+$script:iconFontName = 'Segoe UI'; $script:iconFont = $null; $script:iconFontPanel = $null; $script:iconFontSide = $null; $script:sideTextFont = $null
+$script:scale = 1.5; $script:btnLogical = 32
+$script:sideFollowScale = $false; Update-PanelIconFont
+$rowOff = $script:iconFontPanel.Size; $sideOff = $script:iconFontSide.Size; $textOff = $script:sideTextFont.Size
+$script:sideFollowScale = $true; Update-PanelIconFont
+$rowOn = $script:iconFontPanel.Size; $sideOn = $script:iconFontSide.Size; $textOn = $script:sideTextFont.Size
+Check "following display scaling leaves the ROW's glyph font alone ($rowOff -> $rowOn px)" ([Math]::Abs($rowOff - $rowOn) -lt 0.01)
+Check "...while the side bars' glyph font follows it ($sideOff -> $sideOn px)" (([Math]::Abs($sideOff - 14.4) -lt 0.01) -and ([Math]::Abs($sideOn - 21.6) -lt 0.01))
+Check "...and so does their text font ($textOff -> $textOn px)" ($textOn -gt $textOff)
+Check 'side bar glyphs are drawn with the side font' ($bssText -match '\$btn\.Font = if \(\$script:iconFontSide\) \{ \$script:iconFontSide \} else \{ \$script:iconFontPanel \}\r?\n\s+\$btn\.Text = \$glyph; \$btn\.Glyph = \$true')
+# A confirm click on a side-bar button restores its face through Set-PillFace. It must restore
+# the SIDE face (square, side font), not the row's.
+$sidePanel = New-Object System.Windows.Forms.Panel
+$sideBtnT = New-Object System.Windows.Forms.Button
+$sideBtnT.Tag = [pscustomobject]@{ label = 'Shutdown on done'; short = 'Shutdown' }
+$sideBtnT.Height = 48; $sideBtnT.Width = 130
+$sidePanel.Controls.Add($sideBtnT)
+$savedSides = $script:sideStrips; $script:sideStrips = @(@{ Panel = $sidePanel; Side = 'right' })
+# Guarded: if the side check is lost, the row path runs helpers this harness does not load, and an
+# exception must still read as a FAILED check rather than end the suite.
+try { Set-PillFace $sideBtnT } catch { $sideBtnT.Text = "EXCEPTION: $($_.Exception.Message)" }
+Check "a side button's face is restored square ($($sideBtnT.Width)x$($sideBtnT.Height)) with its two letters ('$($sideBtnT.Text)')" `
+    (($sideBtnT.Width -eq 48) -and ($sideBtnT.Text -ceq 'Sh'))
+Check '...in the side text font, not the row''s' ([object]::ReferenceEquals($sideBtnT.Font, $script:sideTextFont))
+$script:sideStrips = $savedSides; $sidePanel.Dispose()
+# Review round 3 (reviewer A): the side-group flyout's stem clone is built off-strip, so
+# Set-PillFace gives it the row face; it must wear its owner's face instead.
+$sgfNode = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-GroupFlyout' }, $true)
+$sgfText = if ($sgfNode) { $sgfNode.Body.Extent.Text } else { '' }
+Check 'the vertical (side) flyout''s stem clone copies its owner''s font and text after Set-PillFace' `
+    ($sgfText -match '(?s)\$script:flySurface\.Vertical = \$true.{0,900}Set-PillFace \$ob\r?\n[^\r\n]*\r?\n(?:\s*#[^\r\n]*\r?\n)*\s*\$ob\.Font = \$btn\.Font; \$ob\.Text = \$btn\.Text')
+$script:iconFontName, $script:iconFontPanel, $script:iconFontSide, $script:sideTextFont, $script:iconFont, $script:scale, $script:btnLogical, $script:sideFollowScale = $savedFont
+Check 'a monitor scale change refreshes the fonts when following scaling' ($srcText -match '(?s)\$script:scale = \$ws.{0,900}if \(\$script:sideFollowScale\) \{ Update-PanelIconFont \}.{0,40}Rebuild-Buttons')
+Check 'the size menu offers the toggle, in both languages' `
+    (($srcText -match "followScale = 'Side bars follow display scaling'") -and ($srcText -match "followScale = 'Sidebj\w+ker f\w+ger sk\w+rmskalering'") -and ($srcText -match 'Set-SideFollowScale \(-not \$script:sideFollowScale\)'))
 
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }

@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.3'
+$CB_VERSION = '1.11.4'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1082,10 +1082,18 @@ if ($null -ne $script:config.sideNudgeY) {
 $script:btnLogical = 21
 if ($script:config.btnSize) {
     $v = [int]$script:config.btnSize
-    # Clamp: below 10 the glyph is unreadable, above the row size it stops being a side strip
-    # and starts overlapping the chat.
-    if ($v -ge 10 -and $v -le 40) { $script:btnLogical = $v }
+    # Clamp: below 10 the glyph is unreadable. The top was 40, but a side bar is sized in raw
+    # screen pixels (see the sizing pass), so on a 150% monitor 32 drew no bigger than 21 of the
+    # app's own units beside its 51 px buttons - "tiny even at the largest size". 64 covers that
+    # with room to spare; a bar too wide for its margin still hides rather than overlap the chat.
+    if ($v -ge 10 -and $v -le 64) { $script:btnLogical = $v }
 }
+# Side bars are a fixed number of SCREEN pixels by default (see the sizing pass): the same size on
+# every monitor. sideFollowScale makes them follow the monitor's scaling instead, like the app's
+# own buttons do - 32 at 150% draws 48 px - for whoever would rather match the app than the screen.
+$script:sideFollowScale = ($script:config.sideFollowScale -eq $true)
+# The side buttons' size in screen pixels, under whichever of those two rules is chosen.
+function Get-SideBtnPx { if ($script:sideFollowScale) { return [int](S $script:btnLogical) }; return [int]$script:btnLogical }
 $script:uiaSidebarName = 'Sidebar'      # accessibility name of the sidebar (fallback strategy)
 if ($script:config.uiaSidebarName) { $script:uiaSidebarName = [string]$script:config.uiaSidebarName }
 $script:zoneTop = 45                    # height (logical px) of the top zone holding the chat-title tab
@@ -1143,7 +1151,7 @@ $script:strings = @{
         editText = 'Edit text/prompt...'; editTextTitle = 'Edit button text'
         groupTitle = 'Move to group'; groupAsk = 'Group name (empty = no group):'
         groupNew = 'New group...'; groupNone = 'No group'
-        moveBar = 'Move to bar'; sideSize = 'Button size'; bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
+        moveBar = 'Move to bar'; sideSize = 'Button size'; followScale = 'Side bars follow display scaling';bar_row = 'Control row'; bar_left = 'Left side'; bar_right = 'Right side'
         moveUp = 'Move up'; moveDown = 'Move down'
         dissolve = 'Dissolve group'
         colours = 'Colours'; colDefault = 'Default'
@@ -1186,7 +1194,7 @@ $script:strings = @{
         editText = 'Redigér tekst/prompt…'; editTextTitle = 'Redigér knappens tekst'
         groupTitle = 'Flyt til gruppe'; groupAsk = 'Gruppenavn (tomt = ingen gruppe):'
         groupNew = 'Ny gruppe...'; groupNone = 'Ingen gruppe'
-        moveBar = 'Flyt til bjælke'; sideSize = 'Knapstørrelse'; bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
+        moveBar = 'Flyt til bjælke'; sideSize = 'Knapstørrelse'; followScale = 'Sidebjælker følger skærmskalering';bar_row = 'Knaprækken'; bar_left = 'Venstre side'; bar_right = 'Højre side'
         moveUp = 'Flyt op'; moveDown = 'Flyt ned'
         dissolve = 'Opløs gruppe'
         colours = 'Farver'; colDefault = 'Standard'
@@ -1601,7 +1609,18 @@ $script:iconFont = if ($script:iconFontName) { New-Object System.Drawing.Font($s
 # the glyphs did not. 9pt is calibrated for the 27px control row, so scale it by the same ratio
 # the button was scaled by, and the icon keeps its proportion instead of its absolute size.
 $script:iconFontPanel = $script:iconFont
+# The two-letter text a side button shows when it has no icon. It was a fixed 11pt, which was
+# fine at 21 px and lost inside the larger sizes; pixels and the same ratio as the glyph keep
+# it in proportion to the button at every size, on every monitor. Defined ABOVE
+# Update-PanelIconFont, which calls it and runs at load time.
+$script:sideTextFont = $null
+function Update-SideTextFont {
+    if ($script:sideTextFont) { $script:sideTextFont.Dispose() }
+    $script:sideTextFont = New-Object System.Drawing.Font('Segoe UI', [Math]::Max(8.0, (Get-SideBtnPx) * 0.45), [System.Drawing.GraphicsUnit]::Pixel)
+}
 function Update-PanelIconFont {
+    # First, so the text font follows the size even when no icon font is installed.
+    Update-SideTextFont
     if (-not $script:iconFontName) { return }
     # PIXELS, not points. A point size is resolved against the target's DPI, so the same font
     # object draws a bigger glyph on a 144-DPI monitor than on a 96-DPI one - the very thing the
@@ -1612,7 +1631,15 @@ function Update-PanelIconFont {
     $px = [Math]::Max(6.0, $script:btnLogical * 0.45)
     if ($script:iconFontPanel -and $script:iconFontPanel -ne $script:iconFont) { $script:iconFontPanel.Dispose() }
     $script:iconFontPanel = New-Object System.Drawing.Font($script:iconFontName, $px, [System.Drawing.GraphicsUnit]::Pixel)
+    # The SIDE bars' glyphs get their own font, sized from their own button (Get-SideBtnPx).
+    # iconFontPanel also draws the control row and the flyouts (Set-PillFace), so sizing it from
+    # sideFollowScale grew every row icon by half at 150% with a setting that is about the side
+    # bars only (review round 2 of 1.11.4). Without that setting the two are the same size.
+    $sidePx = [Math]::Max(6.0, (Get-SideBtnPx) * 0.45)
+    if ($script:iconFontSide) { $script:iconFontSide.Dispose() }
+    $script:iconFontSide = New-Object System.Drawing.Font($script:iconFontName, $sidePx, [System.Drawing.GraphicsUnit]::Pixel)
 }
+$script:iconFontSide = $null
 # Called once here rather than at the knob, because the knob is read long before the font
 # families are enumerated - reading it there would size a font that does not exist yet.
 Update-PanelIconFont
@@ -1938,6 +1965,24 @@ function Get-StripWidth([bool]$useShort) {
 function Set-PillFace($btn) {
     $b = $btn.Tag
     $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
+    # A side-bar button keeps the face Build-SideStrip gave it: its own square size and its own
+    # fonts. Restored through the row's rules (after a confirm click, or a toggle), it took the
+    # row's glyph font and width - invisible while the two sizes agreed, but with side bars
+    # following display scaling the glyph shrank by a third after every confirm.
+    $onSide = $false
+    foreach ($ss in @($script:sideStrips)) { if ($ss -and $btn.Parent -eq $ss.Panel) { $onSide = $true; break } }
+    if ($onSide) {
+        if ($glyph) {
+            $btn.Font = if ($script:iconFontSide) { $script:iconFontSide } else { $script:iconFontPanel }
+            $btn.Text = $glyph
+        } else {
+            $btn.Font = if ($script:sideTextFont) { $script:sideTextFont } else { $script:btnFont }
+            $lbl = [string]$(if ($b.short) { $b.short } else { $b.label })
+            $btn.Text = if ($lbl.Length -gt 2) { $lbl.Substring(0, 2) } else { $lbl }
+        }
+        $btn.Width = $btn.Height
+        return
+    }
     if ($glyph) {
         $btn.Font = $script:iconFontPanel
         $btn.Text = $glyph
@@ -2141,6 +2186,18 @@ function Get-RowSearchLeft($cx, $cy, $ch, $btnRects, $maxInset, $floor, [bool]$i
     # FIRST, before any scan. Round 5: checking this only after the scan let an unrelated
     # same-line button left of a Group move its edge - so "unchanged" was not actually true.
     if ($isGroup) { return [double]$cx }
+    $left = Get-InBoxLeft $cx $cy $ch $btnRects $maxInset $floor
+    if ($null -ne $left) { return $left }
+    $lo = [double]$cx - [double]$maxInset
+    if ($null -ne $floor -and [double]$floor -gt $lo) { $lo = [double]$floor }
+    return [double][Math]::Min([double]$cx, $lo)
+}
+
+# The MEASURED part of Get-RowSearchLeft: the leftmost button on the composer's own line, left of
+# it, within $maxInset and never past $floor - or $null when there is none. Kept apart because a
+# search window may be blind but a drawn position may not: the row strip and the left side bar are
+# PLACED from this, and only ever from a button that is really there.
+function Get-InBoxLeft($cx, $cy, $ch, $btnRects, $maxInset, $floor) {
     $lo = [double]$cx - [double]$maxInset
     if ($null -ne $floor -and [double]$floor -gt $lo) { $lo = [double]$floor }
     $left = $null
@@ -2151,8 +2208,82 @@ function Get-RowSearchLeft($cx, $cy, $ch, $btnRects, $maxInset, $floor, [bool]$i
             if ($null -eq $left -or [double]$r.X -lt $left) { $left = [double]$r.X }
         }
     }
-    if ($null -ne $left) { return $left }
-    return [double][Math]::Min([double]$cx, $lo)
+    return $left
+}
+
+function Get-RowCys($btnRects, $cBottom, $band, $boxL, $boxR, $slop, $floor, $ceil) {
+    # The centre heights of every control on the row below the composer, across its whole BOX
+    # ($boxL..$boxR, plus $slop) and never past this pane's $floor/$ceil. Review of 1.11.4: bounded
+    # by the Edit's own span instead, the row's right end (Bypass ends at 2920, Usage at 2972, the
+    # Edit at 2846) fell outside it, so one read missing Model left nothing and hid every strip
+    # again; and without the floor/ceiling a tight split let a neighbour's control count as ours.
+    $lo = [double]$boxL - [double]$slop
+    if ($null -ne $floor -and [double]$floor -gt $lo) { $lo = [double]$floor }
+    $hi = [double]$boxR + [double]$slop
+    if ($null -ne $ceil -and [double]$ceil -lt $hi) { $hi = [double]$ceil }
+    $cys = @()
+    foreach ($r in @($btnRects)) {
+        if ($null -eq $r) { continue }
+        $mid = [double]$r.Y + [double]$r.H / 2
+        if ($mid -gt [double]$cBottom -and $mid -lt ([double]$cBottom + [double]$band) -and
+            [double]$r.X -ge $lo -and ([double]$r.X + [double]$r.W) -le $hi) { $cys += $mid }
+    }
+    return $cys
+}
+
+# Is the composer what is actually on top at ($x, $y), its own centre? UIA hit-test, then up the
+# parents: the hit is usually the Edit itself or a text run inside it (measured: the Edit, depth
+# 0). Anything else of Claude's - a menu or popover drawn over it - means it is covered. Other
+# processes never count (see below), and a failed hit-test fails OPEN: hiding every strip on an
+# exception is the outage this release fixes.
+function Test-ComposerOnTop($el, $x, $y) {
+    if ($null -eq $el) { return $true }
+    try {
+        $hit = [System.Windows.Automation.AutomationElement]::FromPoint((New-Object System.Windows.Point([double]$x, [double]$y)))
+        if ($null -eq $hit) { return $true }
+        # Only CLAUDE's own UI counts as covering it. Another app's window over the centre is left
+        # to Test-PaneVisible, which probes each strip on its own: a strip that is still exposed
+        # stays clickable (review round 2 of 1.11.4), and our own windows never count at all.
+        if ([uint32]$hit.Current.ProcessId -ne [uint32]$script:targetPid) { return $true }
+        $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+        for ($i = 0; $null -ne $hit -and $i -lt 12; $i++) {
+            if ([System.Windows.Automation.Automation]::Compare($hit, $el)) { return $true }
+            $hit = $walker.GetParent($hit)
+        }
+        return $false
+    } catch { return $true }
+}
+
+# Where a pane's row strip docks, and whether its control row was found at all (Anchored).
+# The strip docks after the CONTIGUOUS left cluster of the row below the composer (Auto/+/mic/...):
+# walk left to right and stop at the first real gap. The genuine controls sit ~6px apart, so a
+# tight $gapTol keeps out anything further right (a send/stop control, the model label).
+# November 2026 the app moved every control on that row to its RIGHT end and "+" up into the box,
+# so the row's left half is empty. Measured: Edit 1685..2846, "+" 1621 on the Edit's line, and on
+# the row below only Model 2515, Bypass permissions 2698 and Usage 2928. No cluster meant Anchored
+# false, and every strip and side bar hid as if a dialog were open. So:
+# - the cluster must START at the box's left edge (within $startTol). In a narrow split pane the
+#   right-hand group reaches into the left 60% the caller scans, and taken as "the cluster" it
+#   would dock the strip after the usage meter, at the far right of the box.
+# - with no cluster, the row is still there if any control sits on it ($rowCys): dock at the box's
+#   left edge, at that row's height. Only a row with no controls at all means a dialog is up -
+#   the case Anchored exists for.
+function Get-RowDock($rowBtns, $boxEdge, $rowCys, $cx, $cBottom, $gapTol, $startTol, $drop) {
+    $rightEdge = [double]$cx; $sumY = 0.0; $n = 0
+    foreach ($rb in (@($rowBtns) | Sort-Object X)) {
+        if ($n -eq 0 -and [double]$rb.X -gt ([double]$boxEdge + [double]$startTol)) { break }
+        if ($n -eq 0 -or [double]$rb.X -le ($rightEdge + [double]$gapTol)) {
+            if ([double]$rb.R -gt $rightEdge) { $rightEdge = [double]$rb.R }
+            $sumY += [double]$rb.CY; $n++
+        } else { break }
+    }
+    if ($n -gt 0) { return @{ X = [int]$rightEdge; Y = [int]($sumY / $n); Anchored = $true } }
+    $cys = @($rowCys | Where-Object { $null -ne $_ })
+    if ($cys.Count -gt 0) {
+        $s = 0.0; foreach ($cy in $cys) { $s += [double]$cy }
+        return @{ X = [int]$boxEdge; Y = [int]($s / $cys.Count); Anchored = $true }
+    }
+    return @{ X = [int]$cx; Y = [int]([double]$cBottom + [double]$drop); Anchored = $false }
 }
 
 # Leftmost X the row search may use for composer $c: the left edge of the pane that contains it,
@@ -2414,17 +2545,6 @@ function Update-UiaInfo {
                     $a = $_
                     -not ($rowBtns | Where-Object { $_ -ne $a -and $_.X -ge $a.X -and $_.R -le $a.R -and (($_.R - $_.X) -lt ($a.R - $a.X)) })
                 })
-                # Dock after the CONTIGUOUS left cluster (Auto/+/mic/...), not the rightmost
-                # button: walk left-to-right and stop at the first real gap. The genuine controls
-                # sit ~6px apart, so a tight threshold keeps out anything further right (a send/
-                # stop control that appears while typing, or the model label).
-                $rightEdge = $c.X; $sumY = 0.0; $n = 0
-                foreach ($rb in ($rowBtns | Sort-Object X)) {
-                    if ($n -eq 0 -or $rb.X -le ($rightEdge + (SW 20))) {
-                        if ($rb.R -gt $rightEdge) { $rightEdge = $rb.R }
-                        $sumY += $rb.CY; $n++
-                    } else { break }
-                }
                 # The row's OUTERMOST controls, for the side bars to sit just beyond. $rowBtns is
                 # capped at the composer's left 60% to find the mic cluster, so it cannot give a
                 # right extent. Bounded to this composer's own span: in a grid the neighbouring
@@ -2450,8 +2570,26 @@ function Update-UiaInfo {
                 # box edge is taken from those (Get-RowSearchRight), bounded to this pane.
                 $cCeil = Get-ComposerCeiling $c $composers $script:paneBounds $btnRects
                 $rowR = Get-RowSearchRight $c.X $c.Y $c.W $c.H $btnRects (SW 120) $cCeil ($c.Type -eq 'Group')
-                $dockX = if ($n -gt 0) { [int]$rightEdge } else { [int]$c.X }
-                $dockY = if ($n -gt 0) { [int]($sumY / $n) } else { [int]($cBottom + (SW 20)) }
+                # The box's MEASURED left edge: an in-box button on the composer's own line ("+"),
+                # never the blind search window. $null for a Group (it IS the box) or when none
+                # was read - then everything below behaves exactly as before.
+                $inBoxL = if ($c.Type -eq 'Group') { $null } else { Get-InBoxLeft $c.X $c.Y $c.H $btnRects (SW 80) $cFloor }
+                $boxEdge = if ($null -ne $inBoxL) { [double]$inBoxL } else { [double]$c.X }
+                # Every control on the row, across the whole BOX and within this pane's bounds
+                # (Get-RowCys) - not the Edit's own span, which since November 2026 stops short
+                # of the box and of the usage meter at the row's right end.
+                $rowCys = Get-RowCys $btnRects $cBottom (SW 64) $boxEdge $rowR (SW 40) $cFloor $cCeil
+                $dock = Get-RowDock $rowBtns $boxEdge $rowCys $c.X $cBottom (SW 20) (SW 60) (SW 20)
+                # Row controls prove the composer's row exists, not that nothing covers it: a Claude
+                # menu or popover can leave the composer and the row in the tree while drawn over
+                # them. So the composer must also be what is on top at its own centre.
+                $anchored = $dock.Anchored -and (Test-ComposerOnTop $c.El ($c.X + $c.W / 2) ($c.Y + $c.H / 2))
+                # The left side bar's anchor is the box's left edge too. It came from the row below
+                # alone, which since November 2026 starts at the Model picker, far right - so the
+                # bar fell back to the Edit's X and was drawn over "+".
+                if ($null -ne $inBoxL -and ($null -eq $rowL -or $inBoxL -lt $rowL)) { $rowL = $inBoxL }
+                $dockX = $dock.X
+                $dockY = $dock.Y
                 $newPanes += @{
                     OffL = $c.X - $wr.Left; OffT = $c.Y - $wr.Top; Width = $c.W
                     BottomOff = 0; Title = $null; RowCenter = $null; LeftOff = $null
@@ -2468,7 +2606,7 @@ function Update-UiaInfo {
                     # (settings, connectors, a menu) is open they leave the tree, which both
                     # slides the strip to the pane's left edge and means the composer is not
                     # really usable - so the strip hides instead of floating over the dialog.
-                    Anchored = ($n -gt 0)
+                    Anchored = $anchored
                 }
             }
         } elseif ($script:composerSeen) {
@@ -2827,6 +2965,11 @@ function Show-GroupFlyout($btn, [bool]$pin) {
             $ob.Width = $btn.Width; $ob.Height = $btn.Height
             Set-PillFace $ob
             $ob.Width = $btn.Width; $ob.Height = $btn.Height
+            # The stem clone covers its side-bar button exactly, so it wears that button's face.
+            # It is not attached to a side strip, so Set-PillFace gave it the ROW's font: with side
+            # bars following display scaling the group icon shrank by a third on hover (review
+            # round 3 of 1.11.4).
+            $ob.Font = $btn.Font; $ob.Text = $btn.Text
             $ob.ForeColor = $btn.ForeColor; $ob.Fill = $btn.Fill; $ob.Bold = $btn.Bold; $ob.Glyph = $btn.Glyph
             # The group face sits INSIDE the flyout's stem, which is the same Surface colour as
             # the pill, so it needs the flyout's cues too - not the bar's.
@@ -3180,7 +3323,7 @@ $miKebabBar = New-Object System.Windows.Forms.ToolStripMenuItem 'Move to bar'
 # A menu makes that one click, and the answer lands in buttons.json where it survives updates.
 $miSideSize = New-Object System.Windows.Forms.ToolStripMenuItem 'Side bar size'
 [void]$gripMenu.Items.Add($miSideSize)
-$script:ckSideSizes = @(14, 16, 18, 21, 24, 27, 32)
+$script:ckSideSizes = @(14, 16, 18, 21, 24, 27, 32, 40, 48, 56, 64)
 
 function Set-SideBtnSize([int]$px) {
     $ok = Update-Config {
@@ -3198,6 +3341,21 @@ function Set-SideBtnSize([int]$px) {
     }
 }
 
+function Set-SideFollowScale([bool]$on) {
+    $ok = Update-Config {
+        param($cfg)
+        if ($on) { $cfg | Add-Member -NotePropertyName sideFollowScale -NotePropertyValue $true -Force }
+        else { $cfg.PSObject.Properties.Remove('sideFollowScale') }
+        $cfg
+    }
+    if ($ok) {
+        $script:sideFollowScale = $on
+        Update-PanelIconFont
+        Hide-GroupFlyout
+        Rebuild-Buttons
+    }
+}
+
 function Fill-SideSizeMenu {
     $miSideSize.DropDownItems.Clear()
     foreach ($px in $script:ckSideSizes) {
@@ -3207,6 +3365,11 @@ function Fill-SideSizeMenu {
         $mi.add_Click({ Set-SideBtnSize ([int]$this.Tag) })
         [void]$miSideSize.DropDownItems.Add($mi)
     }
+    [void]$miSideSize.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $mf = New-Object System.Windows.Forms.ToolStripMenuItem (L 'followScale')
+    $mf.Checked = $script:sideFollowScale
+    $mf.add_Click({ Set-SideFollowScale (-not $script:sideFollowScale) })
+    [void]$miSideSize.DropDownItems.Add($mf)
 }
 
 # Moves the kebab AND every button with it, because "move the bar" is what the menu says and
@@ -5135,9 +5298,10 @@ function Build-SideStrip($strip, [string]$paneTitle, [bool]$isPrimary, [int]$btn
         $btn.Width = $btnSize; $btn.Height = $btnSize
         $glyph = if ($b.icon) { Get-IconGlyph ([string]$b.icon) } else { $null }
         if ($glyph) {
-            $btn.Font = $script:iconFontPanel; $btn.Text = $glyph; $btn.Glyph = $true; $btn.Bold = $true
+            $btn.Font = if ($script:iconFontSide) { $script:iconFontSide } else { $script:iconFontPanel }
+            $btn.Text = $glyph; $btn.Glyph = $true; $btn.Bold = $true
         } else {
-            $btn.Font = $script:btnFont
+            $btn.Font = if ($script:sideTextFont) { $script:sideTextFont } else { $script:btnFont }
             $lbl = [string]$(if ($b.short) { $b.short } else { $b.label })
             $btn.Text = if ($lbl.Length -gt 2) { $lbl.Substring(0, 2) } else { $lbl }
         }
@@ -5350,7 +5514,8 @@ function Rebuild-Buttons {
         # floats in the pane margin, and the panel's owner wants it to look identical on every
         # screen rather than to track each monitor's scale. Scaling it made it 14px on one
         # monitor and 21px on the other, which reads as the bar shrinking when the window moves.
-        $size = $script:btnLogical
+        # ...unless the user chose to follow the monitor's scaling (sideFollowScale).
+        $size = Get-SideBtnPx
         $st.BtnSize = $size
         if (($room - (S 6)) -lt $size) { $st.Form.Hide(); continue }
         # The stack is bottom-anchored but the FORM grows from its Top, so adding a button made
@@ -5505,6 +5670,8 @@ $timer.add_Tick({
             # change - so choosing 32 in the menu held until the window crossed to another
             # screen, at which point the row silently reverted.
             $script:pillH = S $script:btnLogical
+            # Side bars that follow the monitor's scaling change size here too, glyphs with them.
+            if ($script:sideFollowScale) { Update-PanelIconFont }
             Rebuild-Buttons
         }
 
@@ -5710,7 +5877,7 @@ $timer.add_Tick({
             # way round), the strip would flicker on every tick.
             # Unscaled, to agree with the sizing pass - if these two disagreed the strip would
             # flicker on every tick, appearing and vanishing as each pass reached its own verdict.
-            if ($room -lt ($script:btnLogical + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
+            if ($room -lt ((Get-SideBtnPx) + (S 6))) { if ($sForm.Visible) { $sForm.Hide() }; continue }
             # Anchor to the CHAT's own left/right edges, exactly as the row bar anchors to its
             # bottom edge. Hugging a derived "pane edge" instead gave every pane a different
             # answer: a pane edge is not measured, it is the midpoint between neighbouring
