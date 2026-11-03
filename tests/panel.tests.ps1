@@ -3477,6 +3477,65 @@ Check 'a monitor scale change refreshes the fonts when following scaling' ($srcT
 Check 'the size menu offers the toggle, in both languages' `
     (($srcText -match "followScale = 'Side bars follow display scaling'") -and ($srcText -match "followScale = 'Sidebj\w+ker f\w+ger sk\w+rmskalering'") -and ($srcText -match 'Set-SideFollowScale \(-not \$script:sideFollowScale\)'))
 
+# --- Strips that fell out of the top-most band (1.11.5) ---
+# Measured 2026-11-03: the row strip kept WS_EX_TOPMOST yet sat at z 61 below Claude (z 45) and
+# Outlook (z 54); it counted as visible, so nothing re-showed it, and no buttons could be seen.
+# Real windows, parked far off every monitor so nothing flashes on the user's screen.
+if ('CkWin' -as [type]) {
+    $mkForm = {
+        param($x)
+        $f = New-Object System.Windows.Forms.Form
+        $f.FormBorderStyle = 'None'; $f.ShowInTaskbar = $false; $f.StartPosition = 'Manual'
+        $f.Bounds = New-Object System.Drawing.Rectangle($x, 30000, 200, 60)
+        $f
+    }
+    $tStrip = & $mkForm 30000
+    $tNormal = & $mkForm 30100     # overlaps the strip (30100 < 30200)
+    $tFar = & $mkForm 31000         # does not overlap
+    $tTop = & $mkForm 30050; $tTop.TopMost = $true   # top-most, overlaps the strip
+    try {
+        $tStrip.Show(); $tFar.Show(); $tNormal.Show()   # shown last = on top of the strip
+        Check 'a strip with a NORMAL window above it that overlaps it is buried' ([CkWin]::BuriedUnderNormal($tStrip.Handle))
+        $tNormal.Hide()
+        Check '...but not when that window is hidden' (-not [CkWin]::BuriedUnderNormal($tStrip.Handle))
+        $tNormal.Show()
+        [CkWin]::Retop($tStrip.Handle)
+        Check 'Retop puts the strip back on top, so it is no longer buried' (-not [CkWin]::BuriedUnderNormal($tStrip.Handle))
+        Check '...and leaves it in the top-most band' ([CkWin]::IsTopmost($tStrip.Handle))
+        Check '...without moving or resizing it' ($tStrip.Bounds -eq (New-Object System.Drawing.Rectangle(30000, 30000, 200, 60)))
+        $tNormal.Hide(); $tStrip.TopMost = $false; $tFar.BringToFront()
+        Check 'a normal window above that does NOT overlap the strip does not count' (-not [CkWin]::BuriedUnderNormal($tStrip.Handle))
+        # A top-most window of another process over the strip (a screen-capture overlay) defers
+        # the repair; the panel's own top-most windows and click-through windows do not.
+        $tStrip.TopMost = $false; $tNormal.Show(); $tNormal.BringToFront(); $tTop.Show()   # strip < normal < top-most, all overlapping
+        Check 'the panel''s OWN top-most window above does not stop the repair' ([CkWin]::BuriedUnderNormal($tStrip.Handle))
+        $savedPid = [CkWin]::SelfPid
+        try {
+            [CkWin]::SelfPid = 0   # every window now counts as another process's
+            Check 'another process''s top-most window over the strip defers the repair' (-not [CkWin]::BuriedUnderNormal($tStrip.Handle))
+            if (-not ('CkTestWl' -as [type])) {
+                Add-Type -Name CkTestWl -Namespace '' -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);'
+            }
+            [void][CkTestWl]::SetWindowLong($tTop.Handle, -20, ([CkTestWl]::GetWindowLong($tTop.Handle, -20) -bor 0x20))
+            Check '...also when it is only WS_EX_TRANSPARENT (that still takes clicks)' (-not [CkWin]::BuriedUnderNormal($tStrip.Handle))
+            [void][CkTestWl]::SetWindowLong($tTop.Handle, -20, ([CkTestWl]::GetWindowLong($tTop.Handle, -20) -bor 0x80000))
+            Check '...but not when it is click-through (LAYERED + TRANSPARENT)' ([CkWin]::BuriedUnderNormal($tStrip.Handle))
+        } finally { [CkWin]::SelfPid = $savedPid }
+    } finally { foreach ($f in @($tStrip, $tNormal, $tFar, $tTop)) { try { $f.Close(); $f.Dispose() } catch {} } }
+} else { Check 'CkWin was compiled for the z-order tests' $false }
+$tickM = [regex]::Match($srcText, '(?s)elseif \(-not \$mForm\.Visible\) \{ \$mForm\.Show\(\).{0,2200}# Group flyout dismissal')
+$ixRetop = $srcText.IndexOf('[CkWin]::Retop($sf.Handle)')
+Check 'the band check runs AFTER this tick''s show/hide of the row, side bars and mirrors' `
+    ($ixRetop -gt $srcText.IndexOf('if ($script:composerLost) {') -and
+     $ixRetop -gt $srcText.IndexOf('elseif (-not $form.Visible) { $form.Show()') -and
+     $ixRetop -gt $srcText.IndexOf('if (-not $sForm.Visible) { $sForm.Show()') -and
+     $ixRetop -gt $srcText.IndexOf('elseif (-not $mForm.Visible) { $mForm.Show()'))
+Check 'the tick re-checks the band for every shown strip (row, mirrors, side bars), throttled' `
+    ($tickM.Success -and ($tickM.Value -match 'retopAt\)\.TotalMilliseconds -ge 500') -and
+     ($tickM.Value -match '\$stripForms = @\(\$form\) \+ @\(\$script:mirrors \| ForEach-Object \{ \$_\.Form \}\) \+ @\(\$script:sideStrips \| ForEach-Object \{ \$_\.Form \}\)') -and
+     ($tickM.Value -match '\$sf\.Visible -and \$sf\.IsHandleCreated -and \[CkWin\]::BuriedUnderNormal\(\$sf\.Handle\)\) \{\r?\n\s+\[CkWin\]::Retop\(\$sf\.Handle\)'))
+Check '...with its throttle initialised outside the tick' ($srcText -match "(?m)^\`$script:retopAt = Get-Date '2000-01-01'")
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "Panel tests: $count passed" -ForegroundColor Green; exit 0 }
 else { Write-Host "Panel tests: $fails of $count FAILED" -ForegroundColor Red; exit 1 }

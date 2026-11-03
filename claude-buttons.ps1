@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.4'
+$CB_VERSION = '1.11.5'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -683,6 +683,34 @@ public class CkWin {
     // WS_EX_TOPMOST: screen-snip/capture overlays are top-most and briefly cover Claude; a
     // normal app that covers Claude is not. Used to avoid hiding the strips for such overlays.
     public static bool IsTopmost(IntPtr h) { return (GetWindowLong(h, -20) & 0x00000008) != 0; }
+    // A strip can fall out of the top-most band while keeping WS_EX_TOPMOST: measured 2026-11-03,
+    // the row strip sat at z 61 below Claude (z 45) and Outlook (z 54), neither top-most, so it was
+    // "visible" yet drawn behind both and the user saw no buttons at all. True when a VISIBLE window
+    // that is NOT top-most lies above $h and overlaps it - exactly the case the user can see.
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    // A top-most window of ANOTHER process that overlaps from above (a screen-capture overlay, say)
+    // means "not now": re-topping would put the strip over it. Click-through windows (LAYERED +
+    // TRANSPARENT - TRANSPARENT alone only changes painting order, the window still takes input)
+    // and the panel's own windows do not count. SelfPid is settable for tests.
+    public static uint SelfPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+    public static bool BuriedUnderNormal(IntPtr h) {
+        RECT me; if (!GetWindowRect(h, out me)) return false;
+        bool buried = false;
+        IntPtr p = GetWindow(h, 3); // GW_HWNDPREV: the next window ABOVE
+        for (int guard = 0; p != IntPtr.Zero && guard < 5000; guard++) {
+            RECT o;
+            if (IsWindowVisible(p) && GetWindowRect(p, out o) && o.Left < me.Right && o.Right > me.Left && o.Top < me.Bottom && o.Bottom > me.Top) {
+                int ex = GetWindowLong(p, -20);
+                if ((ex & 0x00000008) == 0) buried = true;
+                else if ((ex & 0x00080020) != 0x00080020) { uint pid; GetWindowThreadProcessId(p, out pid); if (pid != SelfPid) return false; }
+            }
+            p = GetWindow(p, 3);
+        }
+        return buried;
+    }
+    // Back to the top of the top-most band, without moving, sizing or activating it.
+    public static void Retop(IntPtr h) { SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); }
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
 
@@ -3966,6 +3994,7 @@ $script:menuAway = 0
 $script:armedBtn = $null
 $script:armedAt = Get-Date '2000-01-01'
 $script:stateGlobLast = Get-Date '2000-01-01'
+$script:retopAt = Get-Date '2000-01-01'   # last top-most band check (see the tick)
 
 function Test-TargetForeground {
     [CkWin]::GetForegroundWindow() -eq $script:target
@@ -5979,6 +6008,23 @@ $timer.add_Tick({
                 if ($mForm.Location -ne $mDesired) { $mForm.Location = $mDesired }
                 if ($script:mirrors[$i].Panel.Controls.Count -eq 0) { if ($mForm.Visible) { $mForm.Hide() } }
             elseif (-not $mForm.Visible) { $mForm.Show(); Update-LayeredStrip $mForm $script:mirrors[$i].Panel }
+            }
+        }
+
+        # Keep every shown strip in the top-most band. One fell out while keeping WS_EX_TOPMOST
+        # (see CkWin.BuriedUnderNormal) and stayed "visible" behind Claude, so no buttons showed
+        # and nothing in the panel noticed. Checked twice a second, and only a strip that a normal
+        # window really overlaps from above is moved - never a strip that is already on top.
+        # Placed AFTER this tick's show/hide decisions for the row, side bars and mirrors, so a
+        # strip about to be hidden (covered pane, Claude modal) is never raised over that window.
+        if (((Get-Date) - $script:retopAt).TotalMilliseconds -ge 500) {
+            $script:retopAt = Get-Date
+            $stripForms = @($form) + @($script:mirrors | ForEach-Object { $_.Form }) + @($script:sideStrips | ForEach-Object { $_.Form })
+            foreach ($sf in $stripForms) {
+                if ($sf -and $sf.Visible -and $sf.IsHandleCreated -and [CkWin]::BuriedUnderNormal($sf.Handle)) {
+                    [CkWin]::Retop($sf.Handle)
+                    Write-CkLog 'A strip had fallen behind other windows; put it back on top'
+                }
             }
         }
 

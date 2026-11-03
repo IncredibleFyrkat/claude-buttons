@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.11.5 — 2026-11-03
+
+**A strip could sit behind other windows with no buttons in sight.** Strips are top-most windows,
+so they draw over Claude. Measured today, the row strip still carried the top-most flag but sat
+in the window order below Claude and Outlook, neither of them top-most. Windows counted it as
+visible, so the panel never showed it again, and the user saw no buttons at all. What pushes a
+strip out of the top-most band is not known.
+
+- Twice a second, every shown strip (row, mirrors, side bars) is checked. If a normal window that
+  overlaps it lies above it, the strip goes back to the top of the top-most band, without moving,
+  resizing or taking focus. A strip that is already on top is left alone.
+- The check runs after the tick has decided which strips to show, so a strip about to be hidden
+  (its pane covered, a Claude dialog open) is never raised over the window covering it.
+- If another program's top-most window (a screen-capture overlay, say) overlaps the strip from
+  above, the repair waits, so the strip is not put over it. Click-through windows (layered and
+  transparent) and the panel's own windows do not count.
+- Logged as "A strip had fallen behind other windows; put it back on top".
+
+Tests: 643 panel (13 new, using real windows parked off-screen), 113 installer, 100 engine.
+
 ## 1.11.4 — 2026-11-03
 
 **Every strip and side bar hid after the app's November update.** The app moved every control on
