@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.5'
+$CB_VERSION = '1.11.6'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -2314,6 +2314,47 @@ function Get-RowDock($rowBtns, $boxEdge, $rowCys, $cx, $cBottom, $gapTol, $start
     return @{ X = [int]$cx; Y = [int]([double]$cBottom + [double]$drop); Anchored = $false }
 }
 
+# The left side bar's anchor: the row below's leftmost control ($rowL), lowered to the box's
+# in-box "+" ($inBoxL) when that lies further left. InBox says the anchor was REPLACED - then it
+# sits inside the box, as the right bar's anchor (the mic) does, and Get-SideBarX must push the
+# bar out by the same amount. Decided by the replacement itself, never by comparing X: a row
+# control that merely shares the "+"'s X is outside the box and must not be nudged.
+function Get-LeftAnchor($rowL, $inBoxL) {
+    if ($null -ne $inBoxL -and ($null -eq $rowL -or [double]$inBoxL -lt [double]$rowL)) { return @{ X = $inBoxL; InBox = $true } }
+    return @{ X = $rowL; InBox = $false }
+}
+
+# Screen X of a side bar of width $formW beside pane $pn. Each side anchors on the outermost
+# measured control on its side: the left on RowL, the right on the composer's or the row's right
+# edge, $edgeGap outside it, less $tuck.
+# $nudge (sideNudge) pushes a bar further OUT, because an anchor INSIDE the chat's rounded box
+# leaves the box's own padding between it and the box edge, and that edge is not in the
+# accessibility tree. The right anchor (the mic) always lies inside, so it always takes it. The
+# left anchor did not, while it came from the row below (real margin outside the box), and
+# nudging it then pushed a correct bar away. Since November 2026 it is the in-box "+" instead
+# (RowLInBox), which sits exactly as far inside the box as the mic does: without the nudge the
+# left bar overlapped the box while the right one stood clear of it.
+function Get-SideBarX([string]$side, $pn, [int]$formW, [int]$edgeGap, [int]$tuck, [int]$nudge) {
+    if ($side -eq 'left') {
+        $rowL = if ($null -ne $pn.RowL) { [int]$pn.RowL } else { [int]$pn.Cx }
+        $x = [int]($rowL - $edgeGap - $formW + $tuck)
+        if (-not $pn.RowLInBox) { return $x }
+        $nx = $x - $nudge
+        # The nudge never pushes the bar past the pane's left edge - but never pulls it further
+        # in than it stood without the nudge either, so the room check (LeftRoom, measured from
+        # the box to PaneL) still holds. Clamped by an INFERRED PaneL too, unlike the right
+        # bar's clamp: the inferred edge is the midpoint to a neighbouring chat, and the nudge is
+        # new - it must never carry a bar into the next pane.
+        if ($null -ne $pn.PaneL) { $nx = [Math]::Max($nx, [Math]::Min($x, [int]$pn.PaneL + 2)) }
+        return [int]$nx
+    }
+    $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
+    $want = [int]([Math]::Max([int]($pn.Cx + $pn.Cw), $rowR) + $edgeGap - $tuck + $nudge)
+    # Still clamped by the pane rect where that is real, so a bar is never drawn off the window.
+    if ($pn.BoundsReal) { return [int][Math]::Min($want, [int]($pn.PaneR - $formW - 2)) }
+    return $want
+}
+
 # Leftmost X the row search may use for composer $c: the left edge of the pane that contains it,
 # raised to the right edge of any composer beside it on the SAME row (vertical spans overlap).
 # Stacked panes do not overlap vertically, so they never limit each other. $null = no bound known.
@@ -2615,7 +2656,8 @@ function Update-UiaInfo {
                 # The left side bar's anchor is the box's left edge too. It came from the row below
                 # alone, which since November 2026 starts at the Model picker, far right - so the
                 # bar fell back to the Edit's X and was drawn over "+".
-                if ($null -ne $inBoxL -and ($null -eq $rowL -or $inBoxL -lt $rowL)) { $rowL = $inBoxL }
+                $leftAnchor = Get-LeftAnchor $rowL $inBoxL
+                $rowL = $leftAnchor.X; $rowLInBox = $leftAnchor.InBox
                 $dockX = $dock.X
                 $dockY = $dock.Y
                 $newPanes += @{
@@ -2624,6 +2666,7 @@ function Update-UiaInfo {
                     Cx = $c.X; Cy = $c.Y; Cw = $c.W; Ch = $c.H; Composer = $c.El
                     # Measured row extents; fall back to the composer's own edges.
                     RowL = if ($null -ne $rowL) { [int]$rowL } else { [int]$c.X }
+                    RowLInBox = [bool]$rowLInBox
                     RowR = if ($null -ne $rowR) { [int]$rowR } else { [int]($c.X + $c.W) }
                     DockX = $dockX; DockY = $dockY
                     # Dock point stored RELATIVE to the composer, so the per-tick geometry
@@ -5915,9 +5958,6 @@ $timer.add_Tick({
             # Anchor to the CONTROL ROW's outermost controls - the same kind of measured anchor
             # the row bar itself docks against. Every inferred edge tried before this (window,
             # midpoint between composers, column cluster) gave a different answer per pane.
-            $edgeGap = S 6
-            $rowL = if ($null -ne $pn.RowL) { [int]$pn.RowL } else { [int]$pn.Cx }
-            $rowR = if ($null -ne $pn.RowR) { [int]$pn.RowR } else { [int]($pn.Cx + $pn.Cw) }
             # The composer element is only the TEXT AREA - the control row below it is wider, so
             # the composer's right edge sits left of the row's own outermost controls. The pane
             # rect is the real outer bound. Used only when it came from a measured UIA pane
@@ -5942,19 +5982,10 @@ $timer.add_Tick({
             # tick, inside the same pass that repositions the bars, so a window drag turned into
             # a config property lookup per frame and the bars visibly lagged the window.
             # The setting is still a setting - it just takes effect on restart.
-            # RIGHT SIDE ONLY. Left already lands correctly: there is real margin to the left of
-            # the control row, so rowL is a good anchor and needs no correction. Applying the
-            # nudge to both sides pushed the left bar off a position that was already right -
-            # a fix for one side breaking the other.
-            $nudge = if ($st.Side -eq 'right') { [int](S $script:sideNudge) } else { 0 }
+            # The left bar takes the same nudge whenever its anchor is ALSO inside the box (the
+            # in-box "+") - see Get-SideBarX.
             $nudgeY = if ($st.Side -eq 'right') { [int](S $script:sideNudgeY) } else { 0 }
-            $chatR = [int]($pn.Cx + $pn.Cw)
-            $sx = if ($st.Side -eq 'left') {
-                      $rowL - $edgeGap - $sForm.Width + (S 2)
-                  } else {
-                      $want = [int]([Math]::Max($chatR, $rowR) + $edgeGap) - (S 2) + $nudge
-                      if ($pn.BoundsReal) { [Math]::Min($want, [int]($pn.PaneR - $sForm.Width - 2)) } else { $want }
-                  }
+            $sx = Get-SideBarX $st.Side $pn ([int]$sForm.Width) ([int](S 6)) ([int](S 2)) ([int](S $script:sideNudge))
             # Line the lowest side BUTTON up with the row, not the form that contains it. The
             # panel's padding and the button's margin sit between the two, so aligning form
             # edges left the button a few px high. Measured off the control itself, so it stays

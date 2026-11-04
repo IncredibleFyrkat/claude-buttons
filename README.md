@@ -183,7 +183,7 @@ The file the panel reads (created from `buttons.default.json` on first install, 
 | `kebabBar` | `"row"` | Which strip the ⋮ menu handle sits on: `row`, `left` or `right`. |
 | `sideFollowScale` | `false` | When `true`, side bars follow the monitor's display scaling like the app's own buttons (32 at 150% draws 48 px). Off, they are the same number of screen pixels on every monitor. Toggle from ⋮ → **Button size**. |
 | `btnSize` | `21` | Button size in logical px, 10–64, for the whole panel. Set from ⋮ → **Button size**; scales with the monitor like everything else. |
-| `sideNudge` | `0` | Moves a **right-hand** side bar further out from the chat, in logical px. Needed because the chat's visual edge is not exposed in the accessibility tree — every anchor that can be measured (the composer, the control row, the pane) sits somewhere *inside* the rounded container, so the last few pixels cannot be derived. The left bar needs no correction and is unaffected. |
+| `sideNudge` | `0` | Moves a side bar further out from the chat, in logical px. Needed because the chat's visual edge is not exposed in the accessibility tree — every anchor that can be measured (the composer, the control row, the pane) sits somewhere *inside* the rounded container, so the last few pixels cannot be derived. A left bar anchored on the in-box "+" takes the same nudge, so both bars stand the same distance from the box; one anchored on the row below needs no correction and is unaffected. |
 | `sideNudgeY` | `0` | Same, vertically: negative lifts a right-hand bar, positive lowers it. |
 
 Per-button fields:

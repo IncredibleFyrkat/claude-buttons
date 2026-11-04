@@ -2987,7 +2987,7 @@ Check 'the compact (short-label) measurement is narrower than the full one' `
 $typeFnsMissing = @()
 foreach ($fn in @('ConvertTo-ComposerTypes', 'Test-ComposerTypeAllowed', 'Set-ComposerConfig', 'Write-CkLog', 'Get-RowSearchLeft', 'Get-ComposerFloor', 'Get-RowFilterLow',
                   'Get-RowSearchRight', 'Get-ComposerCeiling', 'Get-PaneBoxL', 'Get-PaneBoxR',
-                  'Get-BoxBoundary', 'Set-PaneSideRooms', 'Get-InBoxLeft', 'Get-RowDock', 'Get-RowCys')) {
+                  'Get-BoxBoundary', 'Set-PaneSideRooms', 'Get-InBoxLeft', 'Get-RowDock', 'Get-RowCys', 'Get-SideBarX', 'Get-LeftAnchor')) {
     $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
     if ($node) { Invoke-Expression $node.Extent.Text } else { $typeFnsMissing += $fn }
 }
@@ -3250,7 +3250,7 @@ Check '...counts only CLAUDE''s own UI as covering it - not other apps, not the 
 Check '...and fails OPEN on an exception (hiding everything is the outage)' ($hitText -match 'catch \{ return \$true \}')
 Check '...and returns false when the hit is something else' ($hitText -match 'return \$false')
 Check '...and the left side bar anchor (RowL) takes the measured in-box edge' `
-    ($uiaTextD -match 'if \(\$null -ne \$inBoxL -and \(\$null -eq \$rowL -or \$inBoxL -lt \$rowL\)\) \{ \$rowL = \$inBoxL \}')
+    ($uiaTextD -match '\$leftAnchor = Get-LeftAnchor \$rowL \$inBoxL\r?\n\s+\$rowL = \$leftAnchor\.X')
 
 # --- Right-hand box edge (Get-RowSearchRight / Get-ComposerCeiling) ---
 # 2026-10-20: the Edit stopped short of the in-box Stop and mic, so the right side bar - anchored
@@ -3476,6 +3476,43 @@ $script:iconFontName, $script:iconFontPanel, $script:iconFontSide, $script:sideT
 Check 'a monitor scale change refreshes the fonts when following scaling' ($srcText -match '(?s)\$script:scale = \$ws.{0,900}if \(\$script:sideFollowScale\) \{ Update-PanelIconFont \}.{0,40}Rebuild-Buttons')
 Check 'the size menu offers the toggle, in both languages' `
     (($srcText -match "followScale = 'Side bars follow display scaling'") -and ($srcText -match "followScale = 'Sidebj\w+ker f\w+ger sk\w+rmskalering'") -and ($srcText -match 'Set-SideFollowScale \(-not \$script:sideFollowScale\)'))
+
+# --- Side bars stand the same distance from the box on both sides (1.11.6) ---
+# Measured 2026-11-04 at 150 %, sideNudge 35 (52 px): box 1606..2990, in-box "+" at 1621 and mic
+# right edge at 2975 - both 15 px inside the box. The right bar stood 43 px clear of the box; the
+# left one, un-nudged, ended at 1615 and overlapped it by 9 px.
+$sbPane = @{ Cx = 1685; Cw = 1161; RowL = 1621; RowR = 2975; RowLInBox = $true; BoundsReal = $true; PaneL = 854; PaneR = 3760 }
+$sbL = Get-SideBarX 'left' $sbPane 57 9 3 52
+$sbR = Get-SideBarX 'right' $sbPane 57 9 3 52
+Check 'the left bar anchored on the in-box "+" clears the box (no overlap)' (($sbL + 57) -lt 1606)
+Check '...by the same distance as the right bar' (((1606 - ($sbL + 57)) -eq ($sbR - 2990)))
+Check '...which is the right bar''s position unchanged from before (43 px clear)' ($sbR -eq 3033)
+$sbOld = @{} + $sbPane; $sbOld.RowLInBox = $false; $sbOld.RowL = 1560
+Check 'a left anchor from the row below (outside the box) still takes no nudge' ((Get-SideBarX 'left' $sbOld 57 9 3 52) -eq (1560 - 9 - 57 + 3))
+$sbTight = @{} + $sbPane; $sbTight.PaneL = 1530
+Check 'the nudge never pushes the left bar past the pane''s left edge' ((Get-SideBarX 'left' $sbTight 57 9 3 52) -eq 1532)
+$sbTighter = @{} + $sbPane; $sbTighter.PaneL = 1600
+Check '...nor pulls it further in than it stood without the nudge' ((Get-SideBarX 'left' $sbTighter 57 9 3 52) -eq (1621 - 9 - 57 + 3))
+$sbInf = @{} + $sbPane; $sbInf.BoundsReal = $false; $sbInf.PaneL = 1600
+Check '...and an INFERRED pane edge (midpoint to the next chat) clamps it too' ((Get-SideBarX 'left' $sbInf 57 9 3 52) -eq (1621 - 9 - 57 + 3))
+$sbNoB = @{} + $sbPane; $sbNoB.BoundsReal = $false; $sbNoB.Remove('PaneL')
+Check '...while with no pane edge at all the full nudge applies' ((Get-SideBarX 'left' $sbNoB 57 9 3 52) -eq (1621 - 9 - 57 + 3 - 52))
+$sbClamp = @{} + $sbPane; $sbClamp.PaneR = 3050
+Check 'the right bar keeps its pane clamp' ((Get-SideBarX 'right' $sbClamp 57 9 3 52) -eq (3050 - 57 - 2))
+Check 'the tick places side bars through Get-SideBarX with sideNudge for both sides' `
+    ($srcText -match [regex]::Escape('$sx = Get-SideBarX $st.Side $pn ([int]$sForm.Width) ([int](S 6)) ([int](S 2)) ([int](S $script:sideNudge))'))
+$la = Get-LeftAnchor 2515 1621
+Check 'the in-box "+" left of the row below replaces the left anchor, flagged InBox' (($la.X -eq 1621) -and $la.InBox)
+$la = Get-LeftAnchor $null 1621
+Check '...also when the row below has no control at all' (($la.X -eq 1621) -and $la.InBox)
+$la = Get-LeftAnchor 1621 1621
+Check 'a row control that merely SHARES the "+"''s X stays the anchor, not flagged' (($la.X -eq 1621) -and -not $la.InBox)
+$la = Get-LeftAnchor 1560 1621
+Check 'a row control left of the "+" stays the anchor, not flagged' (($la.X -eq 1560) -and -not $la.InBox)
+$la = Get-LeftAnchor 1560 $null
+Check 'no in-box "+" read: the row control stays, not flagged' (($la.X -eq 1560) -and -not $la.InBox)
+Check 'Update-UiaInfo takes the left anchor and its flag from Get-LeftAnchor and stores the flag per pane' `
+    (($srcText -match [regex]::Escape('$leftAnchor = Get-LeftAnchor $rowL $inBoxL') + '\r?\n\s+' + [regex]::Escape('$rowL = $leftAnchor.X; $rowLInBox = $leftAnchor.InBox')) -and ($srcText -match 'RowLInBox = \[bool\]\$rowLInBox'))
 
 # --- Strips that fell out of the top-most band (1.11.5) ---
 # Measured 2026-11-03: the row strip kept WS_EX_TOPMOST yet sat at z 61 below Claude (z 45) and

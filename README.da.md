@@ -85,7 +85,7 @@ Alle kan sættes i filen; de tre første også fra ⋮-menuen.
 | `bar` (per knap) | `row` | Hvilken bjælke knappen ligger på: `row`, `left` eller `right`. |
 | `group` (per knap) | — | Gruppenavn. Grupperede knapper folder sammen til én knap med en udfoldning. Matches **uden** hensyn til store/små bogstaver, fordi navnet er en JSON-nøgle og PowerShells JSON-læser afviser en fil med nøgler der kun adskiller sig i versaltype. |
 | `groups` | `{}` | Gruppedefinitioner: `{ "ops": { "icon": "settings", "label": "Drift" } }`. Ryddes automatisk når sidste medlem forlader gruppen. |
-| `sideNudge` | `0` | Skubber en **højre** sidebjælke længere væk fra chatten, i logiske px. Nødvendig fordi chattens synlige kant ikke findes i accessibility-træet — alt der *kan* måles (beskedfeltet, knaprækken, ruden) ligger inde i den afrundede boks, så de sidste par pixels kan ikke udledes. Venstre side skal ikke korrigeres og påvirkes ikke. |
+| `sideNudge` | `0` | Skubber en sidebjælke længere væk fra chatten, i logiske px. Nødvendig fordi chattens synlige kant ikke findes i accessibility-træet — alt der *kan* måles (beskedfeltet, knaprækken, ruden) ligger inde i den afrundede boks, så de sidste par pixels kan ikke udledes. En venstre bjælke forankret til "+" inde i boksen får samme skub, så begge bjælker står lige langt fra boksen; en forankret til rækken under skal ikke korrigeres og påvirkes ikke. |
 | `sideNudgeY` | `0` | Samme, lodret: negativ løfter en højre bjælke, positiv sænker den. |
 
 ## Fejlsøgning

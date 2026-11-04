@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.11.6 — 2026-11-04
+
+**The left side bar overlapped the input box; the right one stood clear of it.** Since 1.11.4 the
+left bar anchors on the in-box "+", which sits as far inside the box as the right bar's anchor
+(the mic): measured 15 px on both sides. Only the right bar was pushed out by `sideNudge`, so
+at 150 % with `sideNudge` 35 the right bar stood 43 px from the box and the left one overlapped
+it by 9 px.
+
+- A left bar anchored on the in-box "+" now takes the same `sideNudge` as the right bar, so both
+  stand the same distance from the box. A left bar anchored on the row below (older layouts,
+  where that anchor lies outside the box) is unchanged.
+- The nudge never pushes a left bar past the pane's left edge, measured or inferred, so it cannot
+  reach into a neighbouring chat in a split view.
+- The left anchor's "inside the box" flag is set where the "+" replaces the row's control, never
+  by comparing positions: a row control that only shares the "+"'s X is not nudged.
+- Side-bar placement moved into `Get-SideBarX` and the anchor choice into `Get-LeftAnchor`, so
+  both are tested directly.
+
+Tests: 659 panel (16 new), 113 installer, 100 engine.
+
 ## 1.11.5 — 2026-11-03
 
 **A strip could sit behind other windows with no buttons in sight.** Strips are top-most windows,
