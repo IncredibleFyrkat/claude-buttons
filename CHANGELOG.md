@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.11.7 — 2026-11-04
+
+**Icons on the control row were smaller than the same icons on a side bar.** The row's buttons
+are sized with the display scale, but the icon font inside them was not: at 150 % a 14 px icon
+sat in a 48 px button, while a side bar that follows scaling drew 22 px icons in the same 48 px
+button. The row looked as if it ignored the screen's magnification.
+
+- The row's (and flyouts') icon font is now sized from the row's real button, so it keeps the
+  same proportion at every display scale: 21.6 px at 150 % with button size 32.
+- It is rebuilt on every monitor-scale change, not only when side bars follow scaling.
+- `sideFollowScale` still affects the side bars only.
+
+Tests: 662 panel (3 new), 113 installer, 100 engine.
+
 ## 1.11.6 — 2026-11-04
 
 **The left side bar overlapped the input box; the right one stood clear of it.** Since 1.11.4 the

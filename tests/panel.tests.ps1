@@ -3448,6 +3448,13 @@ $rowOff = $script:iconFontPanel.Size; $sideOff = $script:iconFontSide.Size; $tex
 $script:sideFollowScale = $true; Update-PanelIconFont
 $rowOn = $script:iconFontPanel.Size; $sideOn = $script:iconFontSide.Size; $textOn = $script:sideTextFont.Size
 Check "following display scaling leaves the ROW's glyph font alone ($rowOff -> $rowOn px)" ([Math]::Abs($rowOff - $rowOn) -lt 0.01)
+# 1.11.7: the row's glyph follows the row's REAL button, S(btnLogical) - at 150 % a 48 px button
+# with a 21.6 px glyph, the side bars' proportion - not the unscaled 14.4 px it was before.
+Check "the row's glyph font is sized from its scaled button: 32 at 150 % -> 21.6 px ($rowOff px)" ([Math]::Abs($rowOff - 21.6) -lt 0.01)
+Check "...the same size as a side bar glyph that follows scaling ($sideOn px)" ([Math]::Abs($rowOff - $sideOn) -lt 0.01)
+$script:scale = 1.0; Update-PanelIconFont
+Check "...and at 100 % it is 14.4 px ($($script:iconFontPanel.Size) px)" ([Math]::Abs($script:iconFontPanel.Size - 14.4) -lt 0.01)
+$script:scale = 1.5
 Check "...while the side bars' glyph font follows it ($sideOff -> $sideOn px)" (([Math]::Abs($sideOff - 14.4) -lt 0.01) -and ([Math]::Abs($sideOn - 21.6) -lt 0.01))
 Check "...and so does their text font ($textOff -> $textOn px)" ($textOn -gt $textOff)
 Check 'side bar glyphs are drawn with the side font' ($bssText -match '\$btn\.Font = if \(\$script:iconFontSide\) \{ \$script:iconFontSide \} else \{ \$script:iconFontPanel \}\r?\n\s+\$btn\.Text = \$glyph; \$btn\.Glyph = \$true')
@@ -3473,7 +3480,7 @@ $sgfText = if ($sgfNode) { $sgfNode.Body.Extent.Text } else { '' }
 Check 'the vertical (side) flyout''s stem clone copies its owner''s font and text after Set-PillFace' `
     ($sgfText -match '(?s)\$script:flySurface\.Vertical = \$true.{0,900}Set-PillFace \$ob\r?\n[^\r\n]*\r?\n(?:\s*#[^\r\n]*\r?\n)*\s*\$ob\.Font = \$btn\.Font; \$ob\.Text = \$btn\.Text')
 $script:iconFontName, $script:iconFontPanel, $script:iconFontSide, $script:sideTextFont, $script:iconFont, $script:scale, $script:btnLogical, $script:sideFollowScale = $savedFont
-Check 'a monitor scale change refreshes the fonts when following scaling' ($srcText -match '(?s)\$script:scale = \$ws.{0,900}if \(\$script:sideFollowScale\) \{ Update-PanelIconFont \}.{0,40}Rebuild-Buttons')
+Check 'a monitor scale change always refreshes the fonts (the row glyph follows the scale)' ($srcText -match '(?s)\$script:scale = \$ws.{0,900}\r?\n\s+Update-PanelIconFont\r?\n\s+Rebuild-Buttons')
 Check 'the size menu offers the toggle, in both languages' `
     (($srcText -match "followScale = 'Side bars follow display scaling'") -and ($srcText -match "followScale = 'Sidebj\w+ker f\w+ger sk\w+rmskalering'") -and ($srcText -match 'Set-SideFollowScale \(-not \$script:sideFollowScale\)'))
 

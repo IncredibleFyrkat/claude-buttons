@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.6'
+$CB_VERSION = '1.11.7'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1656,13 +1656,17 @@ function Update-PanelIconFont {
     # has to be one too, or the two drift apart as the window moves between screens.
     # 0.45 is the ratio the control row uses (9pt renders ~12px inside its 27px button) and it is
     # the proportion the panel's owner approved on screen.
-    $px = [Math]::Max(6.0, $script:btnLogical * 0.45)
+    # Of the row's REAL button, S(btnLogical) - the size $pillH gives it. Taken from the unscaled
+    # btnLogical, the glyph ignored the display scale while its button followed it: at 150 % a
+    # 14 px glyph sat in a 48 px button, visibly smaller than the side bars' 22 px glyph in the
+    # same 48 px button, and the owner saw the row "not following the screen's magnification".
+    $px = [Math]::Max(6.0, (S $script:btnLogical) * 0.45)
     if ($script:iconFontPanel -and $script:iconFontPanel -ne $script:iconFont) { $script:iconFontPanel.Dispose() }
     $script:iconFontPanel = New-Object System.Drawing.Font($script:iconFontName, $px, [System.Drawing.GraphicsUnit]::Pixel)
     # The SIDE bars' glyphs get their own font, sized from their own button (Get-SideBtnPx).
-    # iconFontPanel also draws the control row and the flyouts (Set-PillFace), so sizing it from
-    # sideFollowScale grew every row icon by half at 150% with a setting that is about the side
-    # bars only (review round 2 of 1.11.4). Without that setting the two are the same size.
+    # iconFontPanel also draws the control row and the flyouts (Set-PillFace) and follows THEIR
+    # button, never sideFollowScale - a setting about the side bars only (review round 2 of
+    # 1.11.4). With that setting on, the two are the same size: both buttons are S(btnLogical).
     $sidePx = [Math]::Max(6.0, (Get-SideBtnPx) * 0.45)
     if ($script:iconFontSide) { $script:iconFontSide.Dispose() }
     $script:iconFontSide = New-Object System.Drawing.Font($script:iconFontName, $sidePx, [System.Drawing.GraphicsUnit]::Pixel)
@@ -5742,8 +5746,9 @@ $timer.add_Tick({
             # change - so choosing 32 in the menu held until the window crossed to another
             # screen, at which point the row silently reverted.
             $script:pillH = S $script:btnLogical
-            # Side bars that follow the monitor's scaling change size here too, glyphs with them.
-            if ($script:sideFollowScale) { Update-PanelIconFont }
+            # The row's glyphs follow its button, so they are rebuilt on every scale change - and
+            # side bars that follow the monitor's scaling change size here too, glyphs with them.
+            Update-PanelIconFont
             Rebuild-Buttons
         }
 
