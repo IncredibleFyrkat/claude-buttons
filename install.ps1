@@ -213,13 +213,83 @@ function Stop-Panel {
     $parentMap = @{}
     foreach ($p in $all) { $parentMap[[int]$p.ProcessId] = [int]$p.ParentProcessId }
     $spare = @(Get-ProcessAncestry $PID $parentMap)
-    foreach ($p in $all) {
-        if ($spare -contains [int]$p.ProcessId) { continue }
-        # The real image name, from the OS - the command line's argv[0] is caller-supplied text
-        # and a process can be started with any argv[0] it likes.
-        if ($p.Name -notmatch '^(powershell|powershell_ise|pwsh)\.exe$') { continue }
-        if (-not (Test-PanelCommandLine $p.CommandLine $panelName)) { continue }
-        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
+    # A panel that is killed cannot log its own exit, and leaves its run marker behind - which the
+    # next panel reports as "stopped without closing". The installer knows why it stopped, so it
+    # says so and clears the marker - but only the marker of a process it really stopped (the
+    # matcher also takes -AddButton/-RemoveButton CLI runs, which never own a marker).
+    # The panel's mutex handle is opened BEFORE anything is killed and held until the marker is
+    # dealt with. While it is open the mutex exists, and a panel's single-instance check is "did
+    # I create it", so no replacement panel can start in between and report or replace the
+    # marker of the panel being stopped. Ownership is taken after the kill: a killed panel
+    # abandons the mutex, which counts as acquiring it.
+    $pm = $null; $owned = $false
+    try { $pm = New-Object System.Threading.Mutex($false, 'Local\ClaudeButtonsPanel') } catch {}
+    try {
+        $stoppedPids = @()
+        foreach ($p in $all) {
+            if ($spare -contains [int]$p.ProcessId) { continue }
+            # The real image name, from the OS - the command line's argv[0] is caller-supplied text
+            # and a process can be started with any argv[0] it likes.
+            if ($p.Name -notmatch '^(powershell|powershell_ise|pwsh)\.exe$') { continue }
+            if (-not (Test-PanelCommandLine $p.CommandLine $panelName)) { continue }
+            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $stoppedPids += [int]$p.ProcessId } catch {}
+        }
+        if ($stoppedPids.Count -gt 0 -and $pm) {
+            try { $owned = $pm.WaitOne(3000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+            if ($owned) {
+                $gone = Clear-PanelRunMarker $stoppedPids (Join-Path $env:LOCALAPPDATA 'claude-buttons.running')
+                if ($gone) { [void](Write-PanelLog (Join-Path $env:LOCALAPPDATA 'claude-buttons.log') "Panel stopped by the installer (pid $gone)") }
+            }
+        }
+    } finally {
+        if ($owned) { try { $pm.ReleaseMutex() } catch {} }
+        if ($pm) { $pm.Dispose() }
+    }
+}
+
+# Deletes the panel's run marker when it belongs to one of $stoppedPids; returns that pid, or 0.
+function Clear-PanelRunMarker([int[]]$stoppedPids, [string]$marker) {
+    if (-not (Test-Path -LiteralPath $marker)) { return 0 }
+    $txt = try { [string](Get-Content -LiteralPath $marker -Raw -ErrorAction Stop) } catch { '' }
+    if ($txt -notmatch '^pid (\d+),') { return 0 }
+    $owner = [int]$Matches[1]
+    if (@($stoppedPids) -notcontains $owner) { return 0 }
+    try { Remove-Item -LiteralPath $marker -Force -ErrorAction Stop } catch { return 0 }
+    return $owner
+}
+
+# One log line, written the way the panel writes (CkWin.LogAppend): under the shared log mutex,
+# with full sharing and a few retries, so it neither drops nor breaks a line the panel is writing.
+# The lock's name is a script variable so the tests contend on one of their own, never the
+# live panel's.
+$script:panelLogMutex = 'Local\ClaudeButtonsLog'
+# Test seam: called with the attempt number each time the file could not be opened, before the
+# retry. Null in a real install.
+$script:panelLogOpenFailed = $null
+function Write-PanelLog([string]$path, [string]$msg) {
+    $lm = $null; $owned = $false
+    try {
+        $lm = New-Object System.Threading.Mutex($false, $script:panelLogMutex)
+        try { $owned = $lm.WaitOne(2000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+        # No lock, no write - as in CkWin.LogAppend: unsynchronised appends can interleave.
+        if (-not $owned) { return $false }
+        $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg`r`n")
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                $fs = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write,
+                                                      ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+                return $true
+            } catch {
+                if ($script:panelLogOpenFailed) { try { & $script:panelLogOpenFailed $i } catch {} }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+        return $false
+    } catch { return $false }
+    finally {
+        if ($owned) { try { $lm.ReleaseMutex() } catch {} }
+        if ($lm) { $lm.Dispose() }
     }
 }
 

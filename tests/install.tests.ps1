@@ -461,6 +461,64 @@ Check 'Stop-Panel calls the narrowed matcher' ($stopSrc -match 'Test-PanelComman
 Check 'Stop-Panel no longer wildcard-matches the raw command line' `
     ($stopSrc -notmatch '-like\s*"\*')
 Check 'Stop-Panel excludes itself and its ancestors' ($stopSrc -match 'Get-ProcessAncestry')
+# 1.11.8: a killed panel leaves its run marker, which the next panel reports as "stopped without
+# closing". The installer knows why it stopped one, so it clears the marker and logs it - only
+# when it really stopped something.
+Check 'Stop-Panel records the pids it really stopped' ($stopSrc -match 'Stop-Process -Id \$p\.ProcessId -Force -ErrorAction Stop; \$stoppedPids \+= \[int\]\$p\.ProcessId')
+$ixPm = $stopSrc.IndexOf("New-Object System.Threading.Mutex(`$false, 'Local\ClaudeButtonsPanel')")
+$ixKill = $stopSrc.IndexOf('Stop-Process -Id $p.ProcessId')
+$ixWait = $stopSrc.IndexOf('$owned = $pm.WaitOne(3000)')
+$ixClear = $stopSrc.IndexOf('$gone = Clear-PanelRunMarker $stoppedPids')
+$ixDispose = $stopSrc.IndexOf('if ($pm) { $pm.Dispose() }')
+Check 'the panel mutex is opened BEFORE anything is killed, so no replacement panel can start meanwhile' (($ixPm -gt 0) -and ($ixKill -gt $ixPm))
+Check '...owned after the kill (abandoned counts as owned), the marker cleared under it, and only then let go' `
+    (($ixWait -gt $ixKill) -and ($ixClear -gt $ixWait) -and ($ixDispose -gt $ixClear) -and ($stopSrc -match 'AbandonedMutexException\] \{ \$owned = \$true \}') -and
+     ($stopSrc -match '(?s)\} finally \{\r?\n\s+if \(\$owned\) \{ try \{ \$pm\.ReleaseMutex\(\) \} catch \{\} \}\r?\n\s+if \(\$pm\) \{ \$pm\.Dispose\(\) \}'))
+$instAst = [System.Management.Automation.Language.Parser]::ParseFile($install, [ref]$null, [ref]$null)
+Check 'the open-failure seam is unset in a real install' ((Get-Content $install -Raw) -match [regex]::Escape('$script:panelLogOpenFailed = $null'))
+Check 'the installer writes the log under the panel''s own lock name (Local\ClaudeButtonsLog)' (((Get-Content $install -Raw) -match [regex]::Escape("$script:panelLogMutex = 'Local\ClaudeButtonsLog'")) -and ((Get-Content $install -Raw) -match [regex]::Escape('New-Object System.Threading.Mutex($false, $script:panelLogMutex)')))
+# The suite's own log lock: the tests below hold it, and must never hold the live panel's.
+$script:panelLogMutex = "Local\CbInstTestsLog-$PID-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+foreach ($fn in @('Clear-PanelRunMarker', 'Write-PanelLog')) {
+    $node = $instAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text } else { Check "install.ps1 defines $fn" $false }
+}
+$rmDir = Join-Path ([IO.Path]::GetTempPath()) ("cb-inst-run-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $rmDir | Out-Null
+try {
+    $rm = Join-Path $rmDir 'claude-buttons.running'
+    Set-Content -LiteralPath $rm -Value 'pid 4242, v1.11.8, started 2026-11-04 08:00:00, alive 2026-11-04 09:00:00'
+    Check 'a marker of a process the installer did NOT stop is left alone (a CLI run, or a new panel)' ((Clear-PanelRunMarker @(1111, 2222) $rm) -eq 0 -and (Test-Path -LiteralPath $rm))
+    Check 'nothing stopped: the marker is left alone' ((Clear-PanelRunMarker @() $rm) -eq 0 -and (Test-Path -LiteralPath $rm))
+    Check 'the marker of the panel it stopped is cleared, naming it' ((Clear-PanelRunMarker @(1111, 4242) $rm) -eq 4242 -and -not (Test-Path -LiteralPath $rm))
+    Check 'no marker: nothing to clear' ((Clear-PanelRunMarker @(4242) $rm) -eq 0)
+    $rl = Join-Path $rmDir 'claude-buttons.log'
+    Check 'Write-PanelLog appends a timestamped line' ((Write-PanelLog $rl 'Panel stopped by the installer (pid 4242)') -and ((Get-Content -LiteralPath $rl) -match '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d Panel stopped by the installer \(pid 4242\)$'))
+    $hold = New-Object System.IO.FileStream($rl, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    try { $okHeld = Write-PanelLog $rl 'while another writer holds the file' } finally { $hold.Dispose() }
+    Check '...also while another writer (the panel) has the file open' ($okHeld -and (@(Get-Content -LiteralPath $rl).Count -eq 2))
+    Check '...and reports a write that cannot happen' (-not (Write-PanelLog (Join-Path $rmDir 'no\such\dir\x.log') 'x'))
+    # A file locked for a moment (antivirus, a backup) is retried, not given up on at once.
+    # Deterministic: the lock is let go from the seam Write-PanelLog calls after a failed open.
+    $script:lkHandle = New-Object System.IO.FileStream($rl, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $script:lkFails = @()
+    $script:panelLogOpenFailed = { param($a) $script:lkFails += $a; $script:lkHandle.Dispose() }
+    try { $okR = Write-PanelLog $rl 'after a short lock' } finally { $script:panelLogOpenFailed = $null; $script:lkHandle.Dispose() }
+    Check 'the first open met the lock, and only the first' (($script:lkFails -join ',') -eq '0')
+    Check 'Write-PanelLog retries a file locked for a moment, and then writes' ($okR -and (@(Get-Content -LiteralPath $rl | Where-Object { $_ -match 'after a short lock$' }).Count -eq 1))
+    # Another writer holding the log lock past the 2 s wait: no write at all, rather than an
+    # unsynchronised append that could interleave with it.
+    $held = New-Object System.Threading.ManualResetEventSlim($false)
+    $holderPs = [powershell]::Create()
+    [void]$holderPs.AddScript({ param($name, $held) $m = New-Object System.Threading.Mutex($false, $name); [void]$m.WaitOne(); $held.Set(); Start-Sleep -Milliseconds 3500; $m.ReleaseMutex(); $m.Dispose() }).AddArgument($script:panelLogMutex).AddArgument($held)
+    $holderH = $holderPs.BeginInvoke()
+    Check 'the lock holder signalled that it holds the lock' ($held.Wait(5000))
+    $before = (Get-Item -LiteralPath $rl).Length
+    $okLocked = Write-PanelLog $rl 'must not be written'
+    $after = (Get-Item -LiteralPath $rl).Length
+    [void]$holderPs.EndInvoke($holderH); $holderPs.Dispose(); $held.Dispose()
+    Check 'with the log lock held elsewhere past the wait, Write-PanelLog writes nothing and says so' ((-not $okLocked) -and ($before -eq $after))
+} finally { Remove-Item -LiteralPath $rmDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 # ---- /pin and /unpin must FAIL CLOSED on a stale session file (PRIV-01) --------------------
 # Reported: the user asks to pin private text "only in this chat", active-session.json is stale,

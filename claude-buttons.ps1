@@ -28,7 +28,7 @@ param(
 # Requires Windows 10/11 built-in Windows PowerShell 5.1 (do not run under pwsh 7).
 
 $ErrorActionPreference = 'Stop'
-$CB_VERSION = '1.11.7'
+$CB_VERSION = '1.11.8'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -709,6 +709,104 @@ public class CkWin {
         }
         return buried;
     }
+    // THE way anything appends a line to the log - the panel's Write-CkLog, the crash handlers
+    // below, and (with the same lock and sharing, in PowerShell) the installer. Several writers
+    // share one file: the UI thread, a background thread's fatal handler, Windows ending the
+    // session, a CLI run, the installer. Each used to open it on its own terms, so one could hit
+    // a sharing violation and silently drop the very line being written. Serialised by a
+    // cross-process mutex, opened with full sharing, retried briefly. True when it was written.
+    // Settable so tests contend on a lock of their own, never the live panel's.
+    public static string LogMutexName = "Local\\ClaudeButtonsLog";
+    // Test seam: called with the attempt number each time the file could not be opened, before
+    // the retry. Null in the live panel.
+    public static Action<int> LogOpenFailed;
+    public static bool LogAppend(string path, string line) {
+        System.Threading.Mutex m = null; bool owned = false;
+        try {
+            m = new System.Threading.Mutex(false, LogMutexName);
+            try { owned = m.WaitOne(2000); } catch (System.Threading.AbandonedMutexException) { owned = true; }
+            // No lock, no write: two unsynchronised append streams can overwrite each other's
+            // bytes even with full sharing, so a line that cannot be written whole is not written.
+            if (!owned) return false;
+            byte[] bytes = new UTF8Encoding(false).GetBytes(line + Environment.NewLine);
+            for (int attempt = 0; attempt < 5; attempt++) {
+                try {
+                    using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Append, System.IO.FileAccess.Write,
+                                                             System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+                        fs.Write(bytes, 0, bytes.Length);
+                    }
+                    return true;
+                } catch (System.IO.DirectoryNotFoundException) { return false; }
+                catch (System.IO.IOException) {
+                    var onFail = LogOpenFailed; if (onFail != null) { try { onFail(attempt); } catch { } }
+                    System.Threading.Thread.Sleep(25);
+                }
+            }
+            return false;
+        } catch { return false; }
+        finally {
+            if (owned) { try { m.ReleaseMutex(); } catch { } }
+            if (m != null) m.Dispose();
+        }
+    }
+
+    // Crash log (1.11.8). The panel stopped once with nothing in its log: no exit, no error.
+    // These handlers log from C#, because the moments they cover - an exception on a background
+    // thread, Windows ending the session - are exactly the ones a PowerShell handler cannot be
+    // trusted to run in. Installed once; re-installing re-points the path and resets the counter.
+    static string crashLog;
+    static bool crashLogOn;
+    static bool CrashAppend(string line) {
+        if (crashLog == null) return false;
+        return LogAppend(crashLog, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + line);
+    }
+    static string OneLine(object ex) {
+        string t = (ex == null) ? "(no exception object)" : ex.ToString();
+        t = t.Replace("\r", " ").Replace("\n", " ");
+        return t.Length > 800 ? t.Substring(0, 800) : t;
+    }
+    // A UI-thread exception is logged and the panel keeps going: a single failed click or paint
+    // must not take every button away. But Microsoft warns the state after one is unknown, and a
+    // failure that repeats (a paint that throws every frame) would otherwise flood the log for
+    // ever. So: an identical message is logged once a minute at most, and UiLimit of them within
+    // a minute stop the panel cleanly (StopReason, then Application.Exit -> FormClosing logs it).
+    public static int UiLimit = 5;
+    public static string StopReason;
+    public static Action OnTooManyUiErrors = () => System.Windows.Forms.Application.Exit();
+    static DateTime uiWindowStart = DateTime.MinValue;
+    static int uiCount;
+    static string uiLastMsg;
+    static DateTime uiLastAt = DateTime.MinValue;
+    static bool uiStopping;
+    public static void OnUiException(Exception ex) {
+        DateTime now = DateTime.Now;
+        if ((now - uiWindowStart).TotalSeconds > 60) { uiWindowStart = now; uiCount = 0; }
+        uiCount++;
+        string msg = OneLine(ex);
+        // Remembered only once it is really in the log: a write lost to a locked file must not
+        // suppress the same exception's next attempt for a minute.
+        if (msg != uiLastMsg || (now - uiLastAt).TotalSeconds >= 60) {
+            if (CrashAppend("Unhandled UI exception (the panel kept running): " + msg)) { uiLastMsg = msg; uiLastAt = now; }
+        }
+        if (uiCount >= UiLimit && !uiStopping) {
+            uiStopping = true;
+            StopReason = uiCount + " unhandled UI exceptions within a minute - stopping, the panel's state cannot be trusted. Last: " +
+                         (msg.Length > 300 ? msg.Substring(0, 300) : msg);
+            CrashAppend(StopReason);
+            OnTooManyUiErrors();
+        }
+    }
+    public static void InstallCrashLog(string path) {
+        crashLog = path;
+        uiWindowStart = DateTime.MinValue; uiCount = 0; uiLastMsg = null; uiLastAt = DateTime.MinValue; uiStopping = false; StopReason = null;
+        if (crashLogOn) return;
+        crashLogOn = true;
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            CrashAppend("FATAL unhandled exception" + (e.IsTerminating ? " - the panel is stopping" : "") + ": " + OneLine(e.ExceptionObject));
+        System.Windows.Forms.Application.ThreadException += (s, e) => OnUiException(e.Exception);
+        Microsoft.Win32.SystemEvents.SessionEnding += (s, e) =>
+            CrashAppend("Windows session ending (" + e.Reason + ") - the panel closes with it");
+    }
     // Back to the top of the top-most band, without moving, sizing or activating it.
     public static void Retop(IntPtr h) { SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); }
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
@@ -842,23 +940,60 @@ function SW([double]$v) { [int][Math]::Round($v * $script:winScale) }    # posit
 
 # ---------- Logging ----------
 $script:logPath = Join-Path $env:LOCALAPPDATA 'claude-buttons.log'
+# A running panel keeps this file; a clean exit deletes it. Finding it at start therefore means
+# the previous panel was killed, crashed hard or lost power - the cases nothing can log as they
+# happen (Test-PreviousRun). The panel rewrites it once a minute with its own last sign of life
+# (Write-RunMarker), so that time is always the panel's own - never a line some other process
+# (a duplicate launch, the CLI, the installer) appended to the shared log after it.
+$script:runMarker = Join-Path $env:LOCALAPPDATA 'claude-buttons.running'
+$script:runStarted = Get-Date
+$script:runMarkerAt = Get-Date '2000-01-01'
+$script:exitReason = $null
 $script:lastLogMsg = ''
 $script:lastLogAt = Get-Date '2000-01-01'
 # -PassThru returns $true only when the line actually reached the file. It is opt-in because a
 # PowerShell function's return value goes to the pipeline: the hundreds of existing callers use
 # Write-CkLog as a statement, and a bare $true from every one of them would leak into the return
-# value of whatever function they sit in. -ErrorAction Stop turns a failed write into something
-# the catch can see - without it Add-Content's error is non-terminating and the try never knew.
+# value of whatever function they sit in. A failed write (LogAppend returning false) is thrown,
+# so the catch sees it and the dedupe state is left untouched.
 function Write-CkLog([string]$msg, [switch]$PassThru) {
     try {
         if ($script:lastLogMsg -eq $msg -and ((Get-Date) - $script:lastLogAt).TotalSeconds -lt 60) {
             if ($PassThru) { return $false }
             return
         }
-        Add-Content -Path $script:logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8 -ErrorAction Stop
+        # Through CkWin.LogAppend, the one writer every process and thread shares (see there).
+        if (-not [CkWin]::LogAppend($script:logPath, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg")) { throw 'log write failed' }
         $script:lastLogMsg = $msg; $script:lastLogAt = Get-Date
         if ($PassThru) { return $true }
     } catch { if ($PassThru) { return $false } }
+}
+
+# The run marker's one line: who this panel is and when it was last alive.
+function Format-RunMarker([int]$procId, [string]$version, [datetime]$started, [datetime]$alive) {
+    return ("pid {0}, v{1}, started {2}, alive {3}" -f $procId, $version, $started.ToString('yyyy-MM-dd HH:mm:ss'), $alive.ToString('yyyy-MM-dd HH:mm:ss'))
+}
+# Written to a sibling file and swapped in, so a panel killed mid-write leaves the previous,
+# complete marker - not an empty one that no longer names it (the installer could then not
+# recognise a panel it stopped, and the next start would report an unexplained stop).
+function Write-RunMarker {
+    $tmp = "$($script:runMarker).tmp"
+    try {
+        [IO.File]::WriteAllText($tmp, (Format-RunMarker $PID $CB_VERSION $script:runStarted (Get-Date)), (New-Object System.Text.UTF8Encoding $false))
+        # [NullString]::Value, not $null: PowerShell passes $null to a .NET string as "", which
+        # File.Replace rejects as a backup path - every heartbeat would fail and keep the old marker.
+        if ([IO.File]::Exists($script:runMarker)) { [IO.File]::Replace($tmp, $script:runMarker, [NullString]::Value) }
+        else { [IO.File]::Move($tmp, $script:runMarker) }
+    } catch { try { [IO.File]::Delete($tmp) } catch {} }
+    $script:runMarkerAt = Get-Date
+}
+# The log line for a previous panel that did not close cleanly, or $null when it did (no marker).
+function Test-PreviousRun([string]$marker) {
+    if (-not (Test-Path -LiteralPath $marker)) { return $null }
+    $txt = try { ([string](Get-Content -LiteralPath $marker -Raw -ErrorAction Stop)).Trim() } catch { '' }
+    $who = if ($txt -match '^(pid \d+, v[^,]+, started [\d\- :]+)') { $Matches[1] } else { 'unknown' }
+    $at = if ($txt -match 'alive (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)') { $Matches[1] } else { 'unknown' }
+    return "The previous panel ($who) stopped without closing - killed, crashed hard or the PC lost power. It was last alive at $at"
 }
 
 # ---------- Config ----------
@@ -3534,7 +3669,7 @@ $miTips.add_Click({
 [void]$gripMenu.Items.Add($miTips)
 [void]$gripMenu.Items.Add('-')
 $miClose = $gripMenu.Items.Add('Close panel')
-$miClose.add_Click({ $form.Close() })
+$miClose.add_Click({ $script:exitReason = 'Close panel chosen in the menu'; $form.Close() })
 [void]$gripMenu.Items.Add('-')
 $miVer = $gripMenu.Items.Add("Claude Buttons v$CB_VERSION")
 $miVer.Enabled = $false
@@ -5635,6 +5770,9 @@ function Test-PaneVisible([int]$x, [int]$y) {
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 50
 $timer.add_Tick({
+    # The run marker's sign of life, once a minute, first - before any early return, so a panel
+    # that is hidden (Claude in the background) or mid-send still counts as alive.
+    if (((Get-Date) - $script:runMarkerAt).TotalSeconds -ge 60) { Write-RunMarker }
     if ($script:sending) { return }   # don't touch the UI mid-send
     try {
         # Close open menus when the mouse leaves them (the window never takes focus,
@@ -6125,7 +6263,16 @@ $timer.add_Tick({
     }
 })
 
-$form.add_FormClosing({ Save-PanelState })
+$form.add_FormClosing({
+    Save-PanelState
+    # Why the panel is going, so a stop can be told from a crash. CloseReason covers Windows
+    # shutting down (WindowsShutDown) and Task Manager's End task (TaskManagerClosing).
+    $why = if ($script:exitReason) { $script:exitReason }
+           elseif ([CkWin]::StopReason) { [CkWin]::StopReason }   # the UI-exception breaker
+           else { "closed by Windows ($($_.CloseReason))" }
+    Write-CkLog "Panel closing: $why"
+    try { Remove-Item -LiteralPath $script:runMarker -Force -ErrorAction Stop } catch {}
+})
 
 if ($SmokeTest) {
     Write-Output "SMOKE-OK v$CB_VERSION`: $(@($panel.Controls | Where-Object { $_ -is [PillButton] }).Count) buttons, target='$targetTitle'/'$targetProcess', scale=$($script:scale), stripWidth=$(Get-StripWidth $false)px"
@@ -6140,8 +6287,25 @@ if (-not $created) { Write-CkLog 'Another instance is already running - exiting'
 # Only now: this process is THE panel for this session, so its path is the authoritative one.
 Write-InstallMarker
 
+# Only now, too: a second instance exits above and must not report on, or replace, the marker of
+# the panel that is running.
+$prevRun = Test-PreviousRun $script:runMarker
+if ($prevRun) { Write-CkLog $prevRun }
+$script:runStarted = Get-Date
+Write-RunMarker
+Write-CkLog "Panel started: v$CB_VERSION, pid $PID"
+[CkWin]::InstallCrashLog($script:logPath)
+
 [WinHook]::Start()   # let Windows push window move/resize/foreground/chat-switch events
 $timer.Start()
-[System.Windows.Forms.Application]::Run($form)
-$timer.Stop()
-[WinHook]::Stop()
+try {
+    [System.Windows.Forms.Application]::Run($form)
+} catch {
+    Write-CkLog "Panel crashed: $($_.Exception.GetType().Name): $($_.Exception.Message)"
+    throw
+} finally {
+    $timer.Stop()
+    [WinHook]::Stop()
+    Write-CkLog 'Panel stopped'
+    try { Remove-Item -LiteralPath $script:runMarker -Force -ErrorAction Stop } catch {}
+}

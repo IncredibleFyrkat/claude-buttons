@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.11.8 — 2026-11-05
+
+**The panel logs how it stops.** On 2026-11-03 it stopped at 13:55 with nothing in its log and
+nothing in the Windows Event Log, so there was no way to tell why.
+
+- Start: "Panel started: v…, pid …".
+- A normal close says why: "Close panel chosen in the menu", or the reason Windows gave
+  (shutdown, Task Manager's End task). Then "Panel stopped".
+- An unhandled error on the UI thread is logged and the panel keeps running, instead of showing
+  Windows Forms' error dialog. The same error again within a minute is not logged again, and 5
+  errors within a minute stop the panel cleanly, logged as the reason, because its state can no
+  longer be trusted. An error on a background thread is logged before the panel stops. Windows
+  ending the session is logged too.
+- A panel that is killed or loses power cannot log anything. It keeps a small run marker,
+  `%LOCALAPPDATA%\claude-buttons.running`, refreshed once a minute with its own last sign of
+  life and swapped in whole, so a kill mid-write keeps the previous marker. The next start
+  reports "The previous panel (pid …) stopped without closing… It was last alive at …". That
+  time is the panel's own, never a line another process wrote to the log.
+- The installer, when it stops a panel itself, logs "Panel stopped by the installer" and clears
+  that panel's marker, so a reinstall is not reported as a crash. It only clears the marker of a
+  process it really stopped. It holds the panel's mutex from before it stops anything until the
+  marker is dealt with, so no other panel can start in between.
+- Every writer to the log (the panel, its crash handlers, the installer) goes through one shared
+  lock with full file sharing and a few retries. A writer that cannot get the lock within 2 s
+  skips its line rather than risk mixing it into another one.
+
+Tests: 694 panel (32 new), 129 installer (16 new), 100 engine.
+
 ## 1.11.7 — 2026-11-04
 
 **Icons on the control row were smaller than the same icons on a side bar.** The row's buttons

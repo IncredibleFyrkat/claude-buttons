@@ -1649,6 +1649,9 @@ if ($csBlock.Success) {
     if (-not ('PillButton' -as [type])) {
         Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csBlock.Groups[1].Value
     }
+    # Every log write in this suite contends on a lock of its own, never the live panel's: a test
+    # holding the real one would make the running panel's writes time out and drop their lines.
+    if ('CkWin' -as [type]) { [CkWin]::LogMutexName = "Local\CbTestsLog-$PID-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) }
     # The real shipped colours, parsed out of source rather than retyped.
     $accentCol = [System.Drawing.Color]::FromArgb(198, 146, 78)
     $tRingCol  = [System.Drawing.Color]::FromArgb(236, 200, 130)
@@ -3520,6 +3523,139 @@ $la = Get-LeftAnchor 1560 $null
 Check 'no in-box "+" read: the row control stays, not flagged' (($la.X -eq 1560) -and -not $la.InBox)
 Check 'Update-UiaInfo takes the left anchor and its flag from Get-LeftAnchor and stores the flag per pane' `
     (($srcText -match [regex]::Escape('$leftAnchor = Get-LeftAnchor $rowL $inBoxL') + '\r?\n\s+' + [regex]::Escape('$rowL = $leftAnchor.X; $rowLInBox = $leftAnchor.InBox')) -and ($srcText -match 'RowLInBox = \[bool\]\$rowLInBox'))
+
+# --- The panel logs how it stops (1.11.8) ---
+# 2026-11-03 the panel stopped at 13:55 with nothing in its log and nothing in the Event Log.
+foreach ($fn in @('Test-PreviousRun', 'Format-RunMarker', 'Write-RunMarker')) {
+    $node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+    if ($node) { Invoke-Expression $node.Extent.Text }
+}
+$tprDir = Join-Path ([IO.Path]::GetTempPath()) ("cb-run-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tprDir | Out-Null
+$savedRun = @($script:runMarker, $script:runStarted, $script:runMarkerAt)
+try {
+    $tprMarker = Join-Path $tprDir 'claude-buttons.running'
+    Check 'no run marker = the previous panel closed cleanly: nothing to report' ($null -eq (Test-PreviousRun $tprMarker))
+    # The marker carries the panel's OWN last sign of life - not the shared log's last line,
+    # which a duplicate launch, the CLI or the installer may have written after it.
+    $script:runMarker = $tprMarker; $script:runStarted = Get-Date '2026-11-03 08:00:00'; $CB_VERSION_saved = $CB_VERSION; $CB_VERSION = '1.11.7'
+    Write-RunMarker
+    $CB_VERSION = $CB_VERSION_saved
+    $tprTxt = [IO.File]::ReadAllText($tprMarker)
+    Check "the marker names the panel and when it was last alive ($tprTxt)" ($tprTxt -match "^pid $PID, v1\.11\.7, started 2026-11-03 08:00:00, alive \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+    Check '...and its heartbeat clock is reset' (((Get-Date) - $script:runMarkerAt).TotalSeconds -lt 5)
+    [IO.File]::WriteAllText($tprMarker, 'the previous complete marker')
+    Write-RunMarker
+    Check 'a heartbeat REPLACES the existing marker whole, leaving no temp file' (([IO.File]::ReadAllText($tprMarker) -match "^pid $PID, ") -and -not (Test-Path -LiteralPath "$tprMarker.tmp"))
+    Check '...through a sibling file swapped in (a kill mid-write keeps the old marker)' `
+        ($srcText -match '(?s)function Write-RunMarker \{.{0,120}\$tmp = "\$\(\$script:runMarker\)\.tmp".{0,200}WriteAllText\(\$tmp, .{0,500}\[IO\.File\]::Replace\(\$tmp, \$script:runMarker, \[NullString\]::Value\)')
+    [IO.File]::WriteAllText($tprMarker, (Format-RunMarker 4242 '1.11.7' (Get-Date '2026-11-03 08:00:00') (Get-Date '2026-11-03 13:55:12')))
+    $tprMsg = Test-PreviousRun $tprMarker
+    Check "a marker left behind is reported, with who it was and its own last sign of life ($tprMsg)" `
+        (($tprMsg -match 'stopped without closing') -and ($tprMsg -match '\(pid 4242, v1\.11\.7, started 2026-11-03 08:00:00\)') -and ($tprMsg -match 'last alive at 2026-11-03 13:55:12$'))
+    [IO.File]::WriteAllText($tprMarker, 'garbage')
+    Check '...and an unreadable marker still reports, as unknown' ((Test-PreviousRun $tprMarker) -match '\(unknown\).*at unknown$')
+    if ('CkWin' -as [type]) {
+        $tprLog = Join-Path $tprDir 'crash.log'
+        $savedStop = [CkWin]::OnTooManyUiErrors; $savedLimit = [CkWin]::UiLimit
+        $script:tooMany = 0
+        try {
+            [CkWin]::OnTooManyUiErrors = [Action]{ $script:tooMany++ }
+            [CkWin]::UiLimit = 3
+            [CkWin]::InstallCrashLog($tprLog)
+            [CkWin]::InstallCrashLog($tprLog)   # twice: must not double the handlers
+            [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('boom from the test')))
+            $tprLines = @(Get-Content -LiteralPath $tprLog -ErrorAction SilentlyContinue)
+            Check "an unhandled UI exception is written to the log, once, panel kept running ($($tprLines.Count) line(s))" `
+                (($tprLines.Count -eq 1) -and ($tprLines[0] -match '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d Unhandled UI exception \(the panel kept running\): System\.InvalidOperationException: boom from the test') -and ($script:tooMany -eq 0))
+            [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('boom from the test')))
+            $tprLines = @(Get-Content -LiteralPath $tprLog)
+            Check 'the SAME exception again within a minute is not logged again (no flood)' (($tprLines.Count -eq 1) -and ($script:tooMany -eq 0))
+            [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('a different boom')))
+            $tprLines = @(Get-Content -LiteralPath $tprLog)
+            Check "the limit within a minute stops the panel, once, saying why ($($tprLines[-1]))" `
+                (($script:tooMany -eq 1) -and ($tprLines.Count -eq 3) -and ($tprLines[1] -match 'a different boom') -and
+                 ($tprLines[2] -match '3 unhandled UI exceptions within a minute - stopping') -and ([CkWin]::StopReason -match '^3 unhandled UI exceptions'))
+            [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('after the stop')))
+            Check '...and does not ask to stop again' ($script:tooMany -eq 1)
+            Check '...and its reason carries the last exception' ([CkWin]::StopReason -match 'Last: System\.InvalidOperationException: a different boom')
+            [CkWin]::InstallCrashLog($tprLog)
+            Check 're-installing resets the breaker' ($null -eq [CkWin]::StopReason)
+            # A first write lost to a locked file must not suppress the same exception's next try.
+            [CkWin]::UiLimit = 100
+            $lockedLog = New-Object System.IO.FileStream($tprLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            try { [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('lost then kept'))) } finally { $lockedLog.Dispose() }
+            [System.Windows.Forms.Application]::OnThreadException((New-Object System.InvalidOperationException('lost then kept')))
+            Check 'an exception whose first write failed (file locked) is written on its next occurrence' (@(Get-Content -LiteralPath $tprLog | Where-Object { $_ -match 'lost then kept' }).Count -eq 1)
+        } finally { [CkWin]::OnTooManyUiErrors = $savedStop; [CkWin]::UiLimit = $savedLimit; [CkWin]::InstallCrashLog($tprLog) }
+        # One writer for everyone: 4 threads x 100 lines, plus a reader holding the file open the
+        # whole time, must lose nothing.
+        $cLog = Join-Path $tprDir 'concurrent.log'
+        [IO.File]::WriteAllText($cLog, '')
+        $holder = New-Object System.IO.FileStream($cLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        $jobs = @()
+        try {
+            foreach ($w in 1..4) {
+                $ps = [powershell]::Create()
+                [void]$ps.AddScript({ param($path, $w) $ok = 0; foreach ($i in 1..100) { if ([CkWin]::LogAppend($path, "w$w line $i")) { $ok++ } }; $ok }).AddArgument($cLog).AddArgument($w)
+                $jobs += @{ PS = $ps; H = $ps.BeginInvoke() }
+            }
+            $okTotal = 0; foreach ($j in $jobs) { $okTotal += [int]($j.PS.EndInvoke($j.H) | Select-Object -Last 1); $j.PS.Dispose() }
+        } finally { $holder.Dispose() }
+        $cLines = @(Get-Content -LiteralPath $cLog | Where-Object { $_ -match '^w\d line \d+$' })
+        Check "LogAppend from 4 threads at once, with the file held open, writes every line whole ($okTotal ok, $($cLines.Count) lines)" (($okTotal -eq 400) -and ($cLines.Count -eq 400))
+        # Another WRITER with the file open (the installer, an older panel, an editor): full
+        # sharing on our side, or the open fails with a sharing violation.
+        $wHold = New-Object System.IO.FileStream($cLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try { $okW = [CkWin]::LogAppend($cLog, 'beside another writer') } finally { $wHold.Dispose() }
+        Check 'LogAppend writes while another writer has the file open' ($okW -and (@(Get-Content -LiteralPath $cLog | Where-Object { $_ -eq 'beside another writer' }).Count -eq 1))
+        # A file locked for a moment (antivirus, a backup) is retried, not given up on at once.
+        # Deterministic: the lock is let go from the seam LogAppend calls after a failed open, so
+        # the first open is known to have met it and the write can only come from a retry.
+        $script:lkHandle = New-Object System.IO.FileStream($cLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $script:lkFails = @()
+        [CkWin]::LogOpenFailed = [Action[int]]{ param($a) $script:lkFails += $a; $script:lkHandle.Dispose() }
+        try { $okR = [CkWin]::LogAppend($cLog, 'after a short lock') } finally { [CkWin]::LogOpenFailed = $null; $script:lkHandle.Dispose() }
+        Check 'the first open met the lock, and only the first' (($script:lkFails -join ',') -eq '0')
+        Check 'LogAppend retries a file locked for a moment, and then writes' ($okR -and (@(Get-Content -LiteralPath $cLog | Where-Object { $_ -eq 'after a short lock' }).Count -eq 1))
+        Check 'LogAppend reports a write that cannot happen (no such folder)' (-not [CkWin]::LogAppend((Join-Path $tprDir 'no\such\dir\x.log'), 'x'))
+        # The log lock held elsewhere past the 2 s wait: no unsynchronised append, no line.
+        # The holder really acquires the suite's own lock (WaitOne - creating it would not, if it
+        # already exists) and says so before the writer is tried.
+        $held = New-Object System.Threading.ManualResetEventSlim($false)
+        $holderPs = [powershell]::Create()
+        [void]$holderPs.AddScript({ param($name, $held) $m = New-Object System.Threading.Mutex($false, $name); [void]$m.WaitOne(); $held.Set(); Start-Sleep -Milliseconds 3500; $m.ReleaseMutex(); $m.Dispose() }).AddArgument([CkWin]::LogMutexName).AddArgument($held)
+        $holderH = $holderPs.BeginInvoke()
+        Check 'the lock holder signalled that it holds the lock' ($held.Wait(5000))
+        $lenBefore = (Get-Item -LiteralPath $cLog).Length
+        $okLocked = [CkWin]::LogAppend($cLog, 'must not be written')
+        $lenAfter = (Get-Item -LiteralPath $cLog).Length
+        [void]$holderPs.EndInvoke($holderH); $holderPs.Dispose(); $held.Dispose()
+        Check 'with the log lock held elsewhere past the wait, LogAppend writes nothing and says so' ((-not $okLocked) -and ($lenBefore -eq $lenAfter))
+    } else { Check 'CkWin was compiled for the crash-log test' $false }
+} finally { $script:runMarker, $script:runStarted, $script:runMarkerAt = $savedRun; Remove-Item -LiteralPath $tprDir -Recurse -Force -ErrorAction SilentlyContinue }
+Check 'the open-failure seam is unset in the live panel' ($srcText -match [regex]::Escape('public static Action<int> LogOpenFailed;'))
+Check 'the live panel''s log lock is Local\ClaudeButtonsLog, and LogAppend uses the settable name' (($srcText -match [regex]::Escape('public static string LogMutexName = "Local\\ClaudeButtonsLog";')) -and ($srcText -match [regex]::Escape('m = new System.Threading.Mutex(false, LogMutexName);')))
+Check 'Write-CkLog writes through the shared LogAppend' ($srcText -match [regex]::Escape('if (-not [CkWin]::LogAppend($script:logPath, "$(Get-Date -Format ''yyyy-MM-dd HH:mm:ss'') $msg")) { throw ''log write failed'' }'))
+Check 'the crash handlers write through it too, and report the result' ($srcText -match 'static bool CrashAppend\(string line\) \{\r?\n\s+if \(crashLog == null\) return false;\r?\n\s+return LogAppend\(crashLog, ')
+Check 'the tick refreshes the marker once a minute, before any early return' `
+    ($srcText -match '\$timer\.add_Tick\(\{\r?\n(?:\s*#[^\r\n]*\r?\n)*\s*if \(\(\(Get-Date\) - \$script:runMarkerAt\)\.TotalSeconds -ge 60\) \{ Write-RunMarker \}\r?\n\s+if \(\$script:sending\) \{ return \}')
+Check 'closing names the breaker''s reason when it stopped the panel' ($srcText -match 'elseif \(\[CkWin\]::StopReason\) \{ \[CkWin\]::StopReason \}')
+$ixMutex = $srcText.IndexOf("if (-not `$created) { Write-CkLog 'Another instance is already running - exiting' ; exit 0 }")
+$ixTpr = $srcText.IndexOf('$prevRun = Test-PreviousRun $script:runMarker')
+$ixSet = [regex]::Match($srcText, '\$script:runStarted = Get-Date\r?\nWrite-RunMarker').Index
+$ixStarted = $srcText.IndexOf('Write-CkLog "Panel started: v$CB_VERSION, pid $PID"')
+$ixCrash = $srcText.IndexOf('[CkWin]::InstallCrashLog($script:logPath)')
+$ixRun = $srcText.IndexOf('[System.Windows.Forms.Application]::Run($form)')
+Check 'only the instance that holds the mutex checks the marker, writes it, logs its start and installs the crash log - before the message loop' `
+    (($ixMutex -gt 0) -and ($ixTpr -gt $ixMutex) -and ($ixSet -gt $ixTpr) -and ($ixStarted -gt $ixSet) -and ($ixCrash -gt $ixStarted) -and ($ixRun -gt $ixCrash))
+Check 'the message loop logs a crash and, always, the stop - and clears the marker' `
+    ($srcText -match '(?s)try \{\r?\n\s+\[System\.Windows\.Forms\.Application\]::Run\(\$form\)\r?\n\} catch \{\r?\n\s+Write-CkLog "Panel crashed: .{0,120}\r?\n\s+throw\r?\n\} finally \{.{0,120}Write-CkLog ''Panel stopped''\r?\n\s+try \{ Remove-Item -LiteralPath \$script:runMarker')
+Check 'closing logs why (the menu, or the reason Windows gave) and clears the marker' `
+    ($srcText -match '(?s)\$form\.add_FormClosing\(\{.{0,400}\$why = if \(\$script:exitReason\) \{ \$script:exitReason \}\r?\n\s+elseif \(\[CkWin\]::StopReason\) \{ \[CkWin\]::StopReason \}[^\r\n]*\r?\n\s+else \{ "closed by Windows \(\$\(\$_\.CloseReason\)\)" \}\r?\n\s+Write-CkLog "Panel closing: \$why"\r?\n\s+try \{ Remove-Item -LiteralPath \$script:runMarker')
+Check '...and Close panel in the menu names itself as the reason' ($srcText -match [regex]::Escape("`$miClose.add_Click({ `$script:exitReason = 'Close panel chosen in the menu'; `$form.Close() })"))
+Check 'the crash log also covers background-thread exceptions and Windows ending the session' `
+    (($srcText -match 'AppDomain\.CurrentDomain\.UnhandledException \+=') -and ($srcText -match 'SystemEvents\.SessionEnding \+='))
 
 # --- Strips that fell out of the top-most band (1.11.5) ---
 # Measured 2026-11-03: the row strip kept WS_EX_TOPMOST yet sat at z 61 below Claude (z 45) and
